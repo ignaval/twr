@@ -1,5 +1,11 @@
 import type { Appearance } from "./appearance";
 export type Json = any;
+/** How an action's form opens (App's `action`). `fixed`: opened from one thread (its
+ * inspector, its ⋯ menu, a slash command naming it): the form is for that thread and says
+ * so instead of asking. Otherwise a `thread` it is given is only the picker's default. */
+export interface OperationOptions {
+  fixed?: boolean;
+}
 export interface Thread {
   id: string;
   name: string;

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { DesktopAppSettings, UpdateStatus } from "./types";
 import { errorMessage } from "./errors";
 import { Toggle } from "./Toggle";
@@ -26,12 +26,17 @@ export function AppOptions({
       setSettings((old) => (old ? { ...old, update } : old)),
     );
   }, [app]);
+  // Each switch saves when it changes: one change at a time, in the order made, so the
+  // settings each answer brings back land in that order too.
+  const queue = useRef<Promise<unknown>>(Promise.resolve());
   if (!app || !settings) return null;
   const change = (task: () => Promise<DesktopAppSettings>) => {
     setError("");
-    void task()
-      .then(setSettings)
-      .catch((e) => setError(errorMessage(e)));
+    queue.current = queue.current.then(() =>
+      task()
+        .then(setSettings)
+        .catch((e) => setError(errorMessage(e))),
+    );
   };
   const linux = navigator.userAgent.includes("Linux");
   return (

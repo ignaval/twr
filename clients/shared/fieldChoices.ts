@@ -281,8 +281,13 @@ export function resolveField(field: Field, ctx: PickerContext): Field {
   const listed = (method: string, build: (list: Json) => Choice[]): Field => {
     const list = lists[method];
     if (list === undefined) return { ...field, loading: true, choices: [] };
-    if (list === null) return { ...field, type: "text" };
-    return { ...field, choices: withCurrent(build(list), values[field.key]) };
+    if (list === null) return { ...field, type: "text", custom: false };
+    // A custom picker shows a value its list lacks as typed text instead.
+    const choices = build(list);
+    return {
+      ...field,
+      choices: field.custom ? choices : withCurrent(choices, values[field.key]),
+    };
   };
   // A CLI form's fields are the CLI's own: text, with the known runtimes suggested.
   if (command.cli)
@@ -320,24 +325,41 @@ export function resolveField(field: Field, ctx: PickerContext): Field {
         choices: known ? choices : withCurrent(choices, values[field.key]),
       };
     }
-    case "runtime":
+    case "runtime": {
+      const choices = runtimeChoices(info, threads);
       return {
         ...field,
-        choices: withCurrent(runtimeChoices(info, threads), values[field.key]),
+        choices: field.custom
+          ? choices
+          : withCurrent(choices, values[field.key]),
       };
+    }
     case "box":
       return {
         ...field,
         choices: withCurrent(boxChoices(info), values[field.key]),
       };
-    case "permission-mode":
+    case "permission-mode": {
+      // With admin: twr's modes, the runtime's own and Other… for any id it takes. Without,
+      // the narrow ones only (the hub refuses the rest), keeping the current one shown.
+      const runtime =
+        (typeof values.runtime === "string" && values.runtime.trim()) ||
+        findThread(threads, values.thread)?.runtime;
       return {
         ...field,
-        choices: permissionChoices(values[field.key], ctx.admin).map((c) => ({
+        custom: ctx.admin,
+        placeholder: "A mode id the runtime takes, such as on-request",
+        choices: permissionChoices(
+          ctx.admin ? undefined : values[field.key],
+          ctx.admin,
+          runtime,
+        ).map((c) => ({
           value: c.value,
           label: c.label,
+          description: c.description,
         })),
       };
+    }
     case "scopes":
       return {
         ...field,

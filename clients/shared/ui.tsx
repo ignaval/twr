@@ -200,7 +200,9 @@ function isPicker(field: Field) {
 }
 /** A select of `field`'s choices (labelled), or its plain `options`: an empty choice first
  * ("Choose…" when required, else what leaving it empty does), and the current value even
- * when the list doesn't have it, so the form sends what it shows. */
+ * when the list doesn't have it, so the form sends what it shows. A `custom` picker ends
+ * with **Other…** instead, which turns it into a text box (a button turns it back), and
+ * shows a value the list lacks there. */
 function ChoiceSelect({
   id,
   field,
@@ -216,13 +218,55 @@ function ChoiceSelect({
   const choices: NonNullable<Field["choices"]> =
     field.choices ?? (field.options || []).map((o) => ({ value: o, label: o }));
   const listed = current === "" || choices.some((c) => c.value === current);
+  const custom = !!field.custom && !field.loading;
+  const [typing, setTyping] = useState(false);
+  // Where focus goes once the control is swapped: the text box after Other…, the list
+  // after "Choose from the list".
+  const refocus = useRef(false);
+  const control = useRef<HTMLInputElement & HTMLSelectElement>(null);
+  const asText = custom && (typing || !listed);
+  useEffect(() => {
+    if (!refocus.current) return;
+    refocus.current = false;
+    control.current?.focus();
+  }, [asText]);
   const empty = field.required
     ? "Choose…"
     : field.empty || (field.keep ? "Keep current" : "Keep default");
+  if (asText)
+    return (
+      <div className="input-with-button">
+        <input
+          ref={control}
+          id={id}
+          aria-label={field.label}
+          aria-required={field.required || undefined}
+          type="text"
+          value={current}
+          placeholder={field.placeholder}
+          onChange={(e) => onChange(e.target.value)}
+          autoComplete="off"
+          spellCheck={false}
+        />
+        <button
+          type="button"
+          aria-label={`Choose ${field.label.toLowerCase()} from the list`}
+          title="Choose from the list"
+          onClick={() => {
+            refocus.current = true;
+            setTyping(false);
+            onChange("");
+          }}
+        >
+          <List size={16} aria-hidden="true" />
+        </button>
+      </div>
+    );
   // A required field whose value is set and listed needs no empty choice; a form opened
   // with a default (`initial`) keeps its "Choose…" only while it has no value.
   return (
     <select
+      ref={control}
       id={id}
       // Named by the field alone: a wrapping label would add the chosen option's text.
       aria-label={field.label}
@@ -230,7 +274,13 @@ function ChoiceSelect({
       aria-busy={field.loading || undefined}
       disabled={field.loading}
       value={current}
-      onChange={(e) => onChange(e.target.value)}
+      onChange={(e) => {
+        if (e.target.value === CUSTOM) {
+          refocus.current = true;
+          setTyping(true);
+          onChange("");
+        } else onChange(e.target.value);
+      }}
     >
       {field.loading ? (
         <option value={current}>Loading…</option>
@@ -245,6 +295,7 @@ function ChoiceSelect({
             </option>
           ))}
           {!listed && <option value={current}>{current}</option>}
+          {custom && <option value={CUSTOM}>Other…</option>}
         </>
       )}
     </select>

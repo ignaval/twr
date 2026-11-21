@@ -19,7 +19,9 @@ import type { UploadController } from "./uploads";
 import { takesSuggestion, type useAssistance } from "./assistance";
 import { VoiceControl } from "./VoiceControl";
 import { Spinner } from "./ui";
-import { SendAsLoop } from "./LoopViews";
+import { SendAsLoop, useLoops } from "./LoopViews";
+import { startAccess } from "./loops";
+import { announce } from "./a11y";
 import type { DesktopAPI, Json, Thread } from "./types";
 
 /**
@@ -215,8 +217,8 @@ export function Composer({
   send: (event?: FormEvent) => Promise<void>;
   submitSlash: (text: string) => Promise<void>;
   /** Send as implementation loop: the composer's draft is the task. Only while the
-   * destination is a thread. */
-  sendAsLoop?: () => void;
+   * destination is a thread. `started` is called once the hub took the loop. */
+  sendAsLoop?: (started: () => void) => void;
   uploads: UploadController;
   submitVoice: (text: string) => Promise<Json>;
   voiceHint: string[];
@@ -237,15 +239,30 @@ export function Composer({
   const [mentionHidden, setMentionHidden] = useState(memory.mentionHidden);
   const [slashIndex, setSlashIndex] = useState(memory.slashIndex);
   // Run as loop: Send starts an implementation loop with the message as its task. It
-  // goes with the conversation it was turned on in, and turns off once used.
+  // goes with the conversation it was turned on in, and turns off once the loop started
+  // (or you turn it off). Losing the connection leaves it on: Send then waits, so the
+  // task never goes out, or to the outbox, as an ordinary message.
   const [asLoop, setAsLoop] = useState(false);
   useEffect(() => setAsLoop(false), [draftKey]);
+  const loops = useLoops();
   const loopOn = asLoop && !!sendAsLoop && !!target && !target.is_orchestrator;
+  const loopAccess = startAccess(loops.access, target);
+  const loopWhy = !loopAccess.act
+    ? loopAccess.why || "A loop can't start now."
+    : !connected
+      ? "Loop actions need a live connection."
+      : "";
   const submit = (event?: FormEvent) => {
     if (loopOn) {
       event?.preventDefault();
-      setAsLoop(false);
-      sendAsLoop();
+      if (loopWhy) {
+        announce(
+          `${loopWhy} Turn off Run as loop to send it as a message.`,
+          "assertive",
+        );
+        return;
+      }
+      sendAsLoop(() => setAsLoop(false));
       return;
     }
     void send(event);
@@ -583,7 +600,7 @@ export function Composer({
               type="submit"
               disabled={
                 loopOn
-                  ? !operate || !connected || sending
+                  ? !operate || !!loopWhy || sending
                   : !operate ||
                     !draft.trim() ||
                     (!connected &&
@@ -603,7 +620,9 @@ export function Composer({
               }
               title={
                 loopOn
-                  ? "Start an implementation loop with this message as its task"
+                  ? loopWhy
+                    ? `${loopWhy} Turn off Run as loop to send it as a message.`
+                    : "Start an implementation loop with this message as its task"
                   : !connected && spokenDraft
                     ? "Reconnect to send dictated text"
                     : connected

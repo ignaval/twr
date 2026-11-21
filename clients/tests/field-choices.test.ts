@@ -1,6 +1,6 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { commands, parameters, type Command } from "../shared/commands";
 import {
   accountChoices,
@@ -20,6 +20,7 @@ import {
 } from "../shared/fieldChoices";
 import { FieldInput } from "../shared/ui";
 import type { Thread } from "../shared/types";
+import { FakeEvent, installFakeDOM, type FakeElement } from "./fake-dom";
 
 (globalThis as any).window ??= { twr: {} };
 
@@ -81,7 +82,7 @@ describe("command form pickers", () => {
     expect(unknown.choices?.at(-1)).toEqual({ value: "gone", label: "gone" });
   });
 
-  it("offers installed runtimes, the built-ins first, and keeps a custom one", () => {
+  it("offers installed runtimes, the built-ins first, and takes another under Other…", () => {
     expect(
       runtimeChoices({ agents: [{ runtime: "codex" }, { runtime: "pi" }] }, [
         thread({ runtime: "acp:gemini" }),
@@ -90,14 +91,81 @@ describe("command form pickers", () => {
     const set = command("model");
     const runtime = resolveField(
       field(set, "runtime"),
-      context(set, { values: { runtime: "fake" } }),
+      context(set, { values: { runtime: "acp:my-agent" } }),
     );
     expect(runtime.keep).toBe(true);
-    expect(runtime.choices?.at(-1)?.value).toBe("fake");
+    expect(runtime.custom).toBe(true);
+    expect(runtime.choices?.map((c) => c.value)).not.toContain("acp:my-agent");
     const html = renderToStaticMarkup(
       createElement(FieldInput, { field: runtime, value: "", onChange() {} }),
     );
     expect(options(html)[0]).toEqual(["", "Keep current"]);
+    // A one-off acp: runtime: Other…, last, turns the list into a text box.
+    expect(options(html).at(-1)?.[1]).toBe("Other…");
+    // A value the list lacks shows typed, with a way back to the list.
+    const typed = renderToStaticMarkup(
+      createElement(FieldInput, {
+        field: runtime,
+        value: "acp:my-agent",
+        onChange() {},
+      }),
+    );
+    expect(typed).not.toContain("<select");
+    expect(typed).toMatch(
+      /<input[^>]*id="field-runtime"[^>]*aria-label="Runtime"[^>]*value="acp:my-agent"/,
+    );
+    expect(typed).toContain('aria-label="Choose runtime from the list"');
+    // The New thread form's runtime takes one too; the CLI catalog's stays text.
+    expect(
+      resolveField(field(command("new"), "runtime"), context(command("new")))
+        .custom,
+    ).toBe(true);
+  });
+
+  it("takes an account pool or pattern under Other…", () => {
+    const list = {
+      runtimes: {
+        codex: { accounts: [{ name: "work-a" }, { name: "work-b" }] },
+      },
+    };
+    for (const id of ["new", "model"]) {
+      const c = command(id);
+      const account = resolveField(
+        field(c, "account"),
+        context(c, {
+          values: { thread: "t1", runtime: "codex", account: "work-*" },
+          lists: { "account.list": list },
+        }),
+      );
+      expect(account.custom).toBe(true);
+      expect(account.placeholder).toContain("work-a,work-b");
+      expect(account.choices?.map((c) => c.value)).toEqual([
+        "work-a",
+        "work-b",
+      ]);
+      const html = renderToStaticMarkup(
+        createElement(FieldInput, {
+          field: account,
+          value: "work-*",
+          onChange() {},
+        }),
+      );
+      expect(html).toMatch(/<input[^>]*value="work-\*"/);
+    }
+    // While its list loads it is a disabled list showing the value; a failed one is text.
+    const loading = resolveField(
+      field(command("model"), "account"),
+      context(command("model"), { values: { account: "work-a,work-b" } }),
+    );
+    expect(
+      renderToStaticMarkup(
+        createElement(FieldInput, {
+          field: loading,
+          value: "work-a,work-b",
+          onChange() {},
+        }),
+      ),
+    ).toMatch(/<select[^>]*disabled/);
   });
 
   it("puts the local box first", () => {
@@ -215,8 +283,73 @@ describe("command form pickers", () => {
       "dontAsk",
       "manual",
     ]);
+    expect(narrow.custom).toBe(false);
     // New thread's mode is the same labelled picker.
     expect(field(command("new"), "mode").type).toBe("permission-mode");
+  });
+
+  it("offers an admin the runtime's own modes, and any other id under Other…", () => {
+    const mode = command("mode");
+    // api runs on Codex: its own ids follow twr's.
+    const codex = resolveField(
+      field(mode, "mode"),
+      context(mode, { values: { thread: "t1", mode: "auto" } }),
+    );
+    expect(codex.custom).toBe(true);
+    expect(codex.choices?.map((c) => c.value).slice(-5)).toEqual([
+      "untrusted",
+      "on-request",
+      "never",
+      "danger-full-access",
+      "yolo",
+    ]);
+    expect(codex.choices?.find((c) => c.value === "on-request")?.label).toBe(
+      "Codex: on-request",
+    );
+    // web runs on Claude Code: twr's modes only, and a mode its list lacks shows typed.
+    const claude = resolveField(
+      field(mode, "mode"),
+      context(mode, { values: { thread: "t2", mode: "agent" } }),
+    );
+    expect(claude.choices?.map((c) => c.value)).not.toContain("on-request");
+    expect(
+      renderToStaticMarkup(
+        createElement(FieldInput, {
+          field: claude,
+          value: "agent",
+          onChange() {},
+        }),
+      ),
+    ).toMatch(/<input[^>]*id="field-mode"[^>]*value="agent"/);
+    // New thread's mode follows the runtime chosen in the form.
+    const create = command("new");
+    expect(
+      resolveField(
+        field(create, "mode"),
+        context(create, { values: { runtime: "codex" } }),
+      ).choices?.some((c) => c.value === "never"),
+    ).toBe(true);
+    // Without admin: the narrow list and no Other….
+    const narrow = resolveField(
+      field(mode, "mode"),
+      context(mode, { admin: false, values: { thread: "t1", mode: "auto" } }),
+    );
+    expect(narrow.choices?.map((c) => c.value)).toEqual([
+      "plan",
+      "read-only",
+      "dontAsk",
+      "manual",
+      "auto",
+    ]);
+    expect(
+      renderToStaticMarkup(
+        createElement(FieldInput, {
+          field: narrow,
+          value: "auto",
+          onChange() {},
+        }),
+      ),
+    ).not.toContain("Other…");
   });
 
   it("sends pairing access as the scopes list and usage periods the bridge reads", () => {
@@ -311,5 +444,106 @@ describe("More options", () => {
         c.fields.some((f) => /\bID\b/.test(f.label)),
     );
     expect(idOnly.map((c) => c.id)).toEqual([]);
+  });
+});
+
+describe("the inspector's permission mode", () => {
+  const picker = async (t: Thread, admin = true) => {
+    const { PermissionModePicker } = await import("../shared/ThreadActions");
+    return renderToStaticMarkup(
+      createElement(PermissionModePicker, {
+        id: "m",
+        thread: t,
+        admin,
+        editable: true,
+        rpc: async () => ({}),
+        fail() {},
+        onChanged() {},
+      }),
+    );
+  };
+
+  it("offers a Codex thread Codex's own modes, with admin", async () => {
+    const html = await picker(thread({ runtime: "codex", mode: "on-request" }));
+    expect(html).toContain("<select");
+    expect(options(html).map(([value]) => value)).toContain(
+      "danger-full-access",
+    );
+    expect(html).toMatch(
+      /<option value="on-request" selected="">Codex: on-request</,
+    );
+    expect(await picker(thread({ runtime: "codex" }), false)).not.toContain(
+      "on-request",
+    );
+  });
+
+  it("shows the orchestrator's mode as text: the hub fixes it", async () => {
+    const html = await picker(
+      thread({ id: "o", is_orchestrator: true, mode: "dontAsk" }),
+    );
+    expect(html).not.toContain("<select");
+    expect(html).toMatch(/<b id="m"[^>]*>Read only, never ask<\/b>/);
+  });
+});
+
+describe("Other… in a picker, mounted", () => {
+  it("swaps the list for a text box and back, keeping the focus on the field", async () => {
+    vi.resetModules();
+    const document = installFakeDOM();
+    (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+    const { act, createElement: h, useState } = await import("react");
+    const { createRoot } = await import("react-dom/client");
+    const { FieldInput: Input } = await import("../shared/ui");
+    const set = command("model");
+    const changes: string[] = [];
+    function Form() {
+      const [value, setValue] = useState("");
+      const resolved = resolveField(
+        field(set, "runtime"),
+        context(set, { values: { runtime: value } }),
+      );
+      return h(Input, {
+        field: resolved,
+        value,
+        onChange: (next: string) => {
+          changes.push(next);
+          setValue(next);
+        },
+      });
+    }
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container as unknown as Element);
+    await act(async () => root.render(h(Form)));
+    const control = () => document.getElementById("field-runtime") as any;
+    expect(control().tagName).toBe("SELECT");
+    const other = control()
+      .querySelectorAll("option")
+      .find((o: FakeElement) => o.textContent === "Other…");
+    expect(other).toBeDefined();
+    await act(async () => {
+      control().value = other.value;
+      control().dispatchEvent(new FakeEvent("change", { bubbles: true }));
+    });
+    expect(control().tagName).toBe("INPUT");
+    expect(control().getAttribute("aria-label")).toBe("Runtime");
+    expect(document.activeElement).toBe(control());
+    await act(async () => {
+      control().value = "acp:my-agent";
+      control().dispatchEvent(new FakeEvent("input", { bubbles: true }));
+    });
+    expect(changes.at(-1)).toBe("acp:my-agent");
+    const back = document.querySelector(
+      "button[aria-label='Choose runtime from the list']",
+    ) as FakeElement;
+    await act(async () => {
+      back.dispatchEvent(
+        new FakeEvent("click", { bubbles: true, cancelable: true, button: 0 }),
+      );
+    });
+    expect(control().tagName).toBe("SELECT");
+    expect(changes.at(-1)).toBe("");
+    expect(document.activeElement).toBe(control());
+    await act(async () => root.unmount());
   });
 });

@@ -288,3 +288,56 @@ export function speechRateChoices(current?: number | null): Choice[] {
     label: `${n} words a minute`,
   }));
 }
+
+/** What became of one value given to a `latestWrites` writer: written (it was the latest
+ * asked for), failed (the latest, with its `error`), or superseded: a newer value came
+ * before it was written, or while it was, and the newer one's outcome is what counts. */
+export type WriteOutcome =
+  | { status: "saved" }
+  | { status: "failed"; error: unknown }
+  | { status: "superseded" };
+
+/**
+ * One setting's writes (a whole list each time, for `project_roots`), one at a time: a
+ * value asked for while another is being written waits until that one ends, and of those
+ * waiting only the latest is written, so the last change wins however the writes would have
+ * raced. `idle` runs once the last write ends, saved or not (to read the file again then,
+ * not between writes).
+ */
+export function latestWrites<T>(
+  write: (value: T) => Promise<unknown>,
+  idle?: () => void,
+): (value: T) => Promise<WriteOutcome> {
+  type Done = (outcome: WriteOutcome) => void;
+  let running = false;
+  let waiting: { value: T; done: Done } | undefined;
+  const run = async (value: T, done: Done) => {
+    running = true;
+    let outcome: WriteOutcome;
+    try {
+      await write(value);
+      outcome = { status: "saved" };
+    } catch (error) {
+      outcome = { status: "failed", error };
+    }
+    const next = waiting;
+    waiting = undefined;
+    if (next) {
+      done({ status: "superseded" });
+      void run(next.value, next.done);
+      return;
+    }
+    running = false;
+    done(outcome);
+    idle?.();
+  };
+  return (value) =>
+    new Promise<WriteOutcome>((done) => {
+      if (!running) {
+        void run(value, done);
+        return;
+      }
+      waiting?.done({ status: "superseded" });
+      waiting = { value, done };
+    });
+}

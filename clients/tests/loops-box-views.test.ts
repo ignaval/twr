@@ -216,29 +216,48 @@ describe("the inspector's Loops section on a box thread", () => {
 });
 
 describe("Run as loop that can't be used", () => {
-  it("is off and disabled, and says why", async () => {
-    const changed: boolean[] = [];
-    const m = await mount(
+  const sendAsLoop = (on: boolean, changed: boolean[]) =>
+    mount(
       (v, h) =>
         h(v.SendAsLoop, {
           thread: boxThread(),
           phone: false,
           busy: false,
-          on: true,
-          onChange: (on: boolean) => changed.push(on),
+          on,
+          onChange: (next: boolean) => changed.push(next),
         }),
       async () => ({}),
     );
+
+  it("can't be turned on, and says why", async () => {
+    const changed: boolean[] = [];
+    const m = await sendAsLoop(false, changed);
     const toggle = m.find('button[role="switch"]', "Run as loop")!;
     expect(toggle.getAttribute("disabled")).not.toBeNull();
-    // Turned on before the box went away, it turns itself off: Send sends a message.
     expect(toggle.getAttribute("aria-checked")).toBe("false");
-    expect(changed).toEqual([false]);
     const said = m.find(`#${toggle.getAttribute("aria-describedby")}`);
     expect(said?.textContent).toBe(
       "Box devbox is away: a loop can start once it is back.",
     );
     expect(toggle.getAttribute("title")).toBe(said?.textContent);
+    await m.click(toggle);
+    expect(changed).toEqual([]);
+    await m.unmount();
+  });
+
+  it("stays on when turned on before the box went away, and can be turned off", async () => {
+    const changed: boolean[] = [];
+    const m = await sendAsLoop(true, changed);
+    const toggle = m.find('button[role="switch"]', "Run as loop")!;
+    // Never off by itself: Send would then send the task as an ordinary message.
+    expect(changed).toEqual([]);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    expect(toggle.getAttribute("disabled")).toBeNull();
+    expect(
+      m.find(`#${toggle.getAttribute("aria-describedby")}`)?.textContent,
+    ).toBe(
+      "Box devbox is away: a loop can start once it is back. Send waits until a loop can start; turn this off to send your message as an ordinary one.",
+    );
     await m.click(toggle);
     expect(changed).toEqual([false]);
     await m.unmount();

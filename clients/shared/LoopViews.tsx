@@ -1494,8 +1494,11 @@ function SetupCardBody({
  * The composer's other way to send, when its destination is a thread: a switch beside Send,
  * **Run as loop** (a `↻` button on a phone, named the same). While it is on, Send starts an
  * implementation loop whose task is the message (an empty one asks first), and the switch
- * turns off. It needs a live connection and `operate`, as starting any loop does: otherwise
- * it is off and says why. Nothing goes to the outbox.
+ * turns off once the loop is asked for. It needs a live connection and `operate`, as
+ * starting any loop does: otherwise it can't be turned on, and says why. Turned on before
+ * the connection (or the box) went away, it stays on, saying Send waits for a loop to be
+ * able to start, and can still be turned off: the message never goes out, or to the outbox,
+ * as an ordinary one by itself.
  */
 export function SendAsLoop({
   thread,
@@ -1516,31 +1519,34 @@ export function SendAsLoop({
   const access = startAccess(loops.access, thread);
   const why = access.why;
   const what = `${thread.name} plans your message as a task, implements it, and a reviewer model checks the work round by round. The loop commits at the end.`;
-  // A loop that can't start (offline, the box away) turns the switch off: Send sends.
-  useEffect(() => {
-    if (on && !access.act) onChange(false);
-  }, [on, access.act]);
+  const said = !why
+    ? what
+    : on
+      ? `${why} Send waits until a loop can start; turn this off to send your message as an ordinary one.`
+      : why;
   return (
     <div className={`send-as-loop ${phone ? "phone" : ""}`}>
       <button
         type="button"
         role="switch"
         className={phone ? "send-loop-button" : "send-loop-toggle"}
-        aria-checked={on && access.act}
+        aria-checked={on}
         aria-label={phone ? "Run as loop" : undefined}
         aria-describedby={`${ids}-what`}
         title={
           why ||
           "Send starts an implementation loop with your message as its task"
         }
-        disabled={busy || !access.act}
+        // Off, it can't be turned on while a loop can't start; on, it can always be
+        // turned off.
+        disabled={busy || (!on && !access.act)}
         onClick={() => onChange(!on)}
       >
         <RotateCw size={phone ? 18 : 14} aria-hidden="true" />
         {!phone && "Run as loop"}
       </button>
       <span className="visually-hidden" id={`${ids}-what`}>
-        {why || what}
+        {said}
       </span>
     </div>
   );

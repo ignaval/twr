@@ -1,4 +1,5 @@
 import { parseInvitation } from "../shared/connections";
+import { errorMessage } from "../shared/errors";
 
 /** The Pair form's fields (Connections.tsx › Connect to another computer). */
 export interface PairFields {
@@ -48,4 +49,48 @@ export function missingPairFields(fields: PairFields): string | undefined {
       ? missing[0]
       : missing.slice(0, -1).join(", ") + " and " + missing.at(-1)
   }.`;
+}
+
+/** The fields an invitation filled in (`filled`), emptied again: its text was cleared or
+ * changed into something that isn't one. A field changed by hand since is kept. */
+export function withoutInvitation(
+  fields: PairFields,
+  filled: Partial<PairFields> | undefined,
+): PairFields {
+  if (!filled) return fields;
+  const next = { ...fields };
+  for (const key of ["url", "code", "hubName"] as const)
+    if (filled[key] !== undefined && next[key] === filled[key]) next[key] = "";
+  return next;
+}
+
+/** What **Pair and connect** sends. With text in Paste invitation, what that text says now:
+ * text that isn't a valid invitation is refused, whatever an earlier one filled in. Without,
+ * the details entered by hand. `manual`: the error names a detail to enter by hand. */
+export function pairRequest(
+  invitationText: string,
+  fields: PairFields,
+): { fields: PairFields } | { error: string; manual: boolean } {
+  const pasted = !!invitationText.trim();
+  let request = fields;
+  if (pasted) {
+    const again =
+      " Copy it again on the other computer, or clear Paste invitation to enter the details manually.";
+    try {
+      const filled = fieldsFromInvitation(invitationText, fields);
+      if (!filled)
+        return {
+          error: "The pasted text isn't a twr invitation." + again,
+          manual: false,
+        };
+      request = filled;
+    } catch (error) {
+      return {
+        error: `The pasted invitation can't be used: ${errorMessage(error).replace(/\.$/, "")}.${again}`,
+        manual: false,
+      };
+    }
+  }
+  const missing = missingPairFields(request);
+  return missing ? { error: missing, manual: pasted } : { fields: request };
 }

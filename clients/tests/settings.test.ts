@@ -3,6 +3,7 @@ import type { Json } from "../shared/types";
 import {
   focusPart,
   initialSettingsTab,
+  latestWrites,
   managePage,
   navSection,
   runtimeChoices,
@@ -180,6 +181,8 @@ describe("the New thread defaults' choices", () => {
 async function mountManager(
   props: Json,
   rpc: (method: string, params?: Json) => Promise<Json>,
+  /** Settings the config file has besides the defaults below (read each time). */
+  more: Json = {},
 ) {
   vi.resetModules();
   const document = installFakeDOM();
@@ -201,6 +204,7 @@ async function mountManager(
         wake_after_secs: 30,
         orchestrator: { autostart: false },
         codex: { auto: "auto_review" },
+        ...more,
       },
     }),
     configSet,
@@ -255,6 +259,11 @@ async function mountManager(
   return {
     document,
     configSet,
+    /** Runs `task` in act, then lets what it set off settle. */
+    run: async (task: () => void) => {
+      await act(async () => task());
+      await settle();
+    },
     all,
     find: (selector: string, text?: string) => all(selector, text)[0],
     click: (node: FakeElement) =>
@@ -391,6 +400,101 @@ describe("Machines & accounts, mounted", () => {
     await m.key(m.find("[role=menuitem]", "Restart")!, "Escape");
     expect(m.find("[role=menu]")).toBeUndefined();
     expect(m.document.activeElement).toBe(more);
+    await m.unmount();
+  });
+});
+
+describe("a setting saved as it changes", () => {
+  /** A writer whose writes end when the test says so. */
+  const held = () => {
+    const writes: { value: string; end: (error?: Error) => void }[] = [];
+    let idle = 0;
+    const write = latestWrites<string>(
+      (value) =>
+        new Promise<void>((resolve, reject) =>
+          writes.push({
+            value,
+            end: (error) => (error ? reject(error) : resolve()),
+          }),
+        ),
+      () => idle++,
+    );
+    return { writes, write, idle: () => idle };
+  };
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+
+  it("writes one value at a time, the latest of those waiting next", async () => {
+    const { writes, write, idle } = held();
+    const a = write("a");
+    const b = write("b");
+    const c = write("c");
+    // b never starts: c replaced it while a was being written.
+    expect(writes.map((w) => w.value)).toEqual(["a"]);
+    expect(await b).toEqual({ status: "superseded" });
+    writes[0].end();
+    expect(await a).toEqual({ status: "superseded" });
+    await tick();
+    expect(writes.map((w) => w.value)).toEqual(["a", "c"]);
+    expect(idle()).toBe(0);
+    writes[1].end();
+    expect(await c).toEqual({ status: "saved" });
+    // The file is read again once, after the last write.
+    expect(idle()).toBe(1);
+  });
+
+  it("reports the latest write's failure, and an earlier one's not at all", async () => {
+    const { writes, write, idle } = held();
+    const a = write("a");
+    const b = write("b");
+    writes[0].end(new Error("locked"));
+    expect(await a).toEqual({ status: "superseded" });
+    await tick();
+    const failure = new Error("disk full");
+    writes[1].end(failure);
+    expect(await b).toEqual({ status: "failed", error: failure });
+    expect(idle()).toBe(1);
+    // Idle again, the next value is written at once.
+    void write("c");
+    expect(writes.map((w) => w.value)).toEqual(["a", "b", "c"]);
+  });
+
+  it("never lets two quick removals of project folders land out of order", async () => {
+    const file: Json = { project_roots: ["/a", "/b", "/c"] };
+    const m = await mountManager({ section: "settings" }, hubRpc, file);
+    await m.click(m.find("[role=tab]", "Agents"));
+    const writes: { value: string[]; end: () => void }[] = [];
+    (window as any).twr.configSet = (
+      _table: string[],
+      _key: string,
+      value: string[],
+    ) =>
+      new Promise<void>((resolve) =>
+        writes.push({
+          value,
+          end: () => {
+            file.project_roots = value;
+            resolve();
+          },
+        }),
+      );
+    const shown = () =>
+      m.all(".project-folders li code").map((c) => c.textContent);
+    await m.click(m.find("button[aria-label='Remove /a']"));
+    await m.click(m.find("button[aria-label='Remove /b']"));
+    expect(shown()).toEqual(["/c"]);
+    // The second list waits for the first write.
+    expect(writes.map((w) => w.value)).toEqual([["/b", "/c"]]);
+    expect(m.find(".project-folders [role=status]")!.textContent).toBe(
+      "Saving…",
+    );
+    await m.run(() => writes[0].end());
+    expect(writes.map((w) => w.value)).toEqual([["/b", "/c"], ["/c"]]);
+    // No read of the file between the writes puts /b back on screen.
+    expect(shown()).toEqual(["/c"]);
+    await m.run(() => writes[1].end());
+    expect(file.project_roots).toEqual(["/c"]);
+    expect(shown()).toEqual(["/c"]);
+    expect(m.find(".project-folders [role=status]")!.textContent).toBe("Saved");
     await m.unmount();
   });
 });

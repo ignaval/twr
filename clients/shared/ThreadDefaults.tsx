@@ -12,6 +12,7 @@ import {
   TRASH_DAYS_PRESETS,
   WAKE_AFTER_PRESETS,
   hubApplied,
+  latestWrites,
   runtimeChoices,
   runtimeInstalled,
   summaryEveryChoices,
@@ -36,31 +37,51 @@ export function settingValue(loaded: Json, table: string[], key: string) {
   return value?.[key];
 }
 
+type SettingValue = string | number | boolean | string[];
+
 /** Saving one setting on change: the brief "Saved" its row says, and whether a change of
- * a hub setting waits for a restart. A failure goes to `fail` and gives back `false`. */
-function useSave(table: string[], key: string, { fail, saved }: SaveContext) {
+ * a hub setting waits for a restart. Writes go one at a time, the latest change winning
+ * (`latestWrites`), and the file is read again once the last one ends. `save` gives back
+ * `true` once the value is saved, `false` when it failed (the failure goes to `fail`; the
+ * row then shows what the file has), and `undefined` when a newer change replaced it. */
+function useSave(table: string[], key: string, context: SaveContext) {
   const hostApi = useHostAPI();
   const [status, setStatus] = useState("");
   const [restart, setRestart] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
   useEffect(() => () => clearTimeout(timer.current), []);
-  const save = async (value: string | number | boolean | string[]) => {
+  const latest = useRef({ hostApi, table, context });
+  latest.current = { hostApi, table, context };
+  const [write] = useState(() =>
+    latestWrites<SettingValue>(
+      (value) =>
+        latest.current.hostApi.configSet(latest.current.table, key, value),
+      () => latest.current.context.saved(),
+    ),
+  );
+  const save = async (value: SettingValue) => {
     clearTimeout(timer.current);
     setStatus("Saving…");
-    try {
-      await hostApi.configSet(table, key, value);
-    } catch (error) {
+    const outcome = await write(value);
+    if (outcome.status === "superseded") return undefined;
+    if (outcome.status === "failed") {
       setStatus("");
-      fail(error);
+      latest.current.context.fail(outcome.error);
       return false;
     }
     setStatus("Saved");
     if (hubApplied(table)) setRestart(true);
     timer.current = setTimeout(() => setStatus(""), 2500);
-    saved();
     return true;
   };
   return { save, status, restart };
+}
+
+/** The latest value of `value` (a prop), read when a write ends. */
+function useLatest<T>(value: T) {
+  const ref = useRef(value);
+  ref.current = value;
+  return ref;
 }
 
 /** A row's status: "Saved" for a moment (announced), and, once a hub setting changed, that
@@ -107,6 +128,7 @@ export function SettingSwitch({
   const noteId = useId();
   const [value, setValue] = useState(!!initial);
   useEffect(() => setValue(!!initial), [initial]);
+  const file = useLatest(initial);
   const { save, status, restart } = useSave(table, name, context);
   return (
     <Toggle
@@ -119,7 +141,8 @@ export function SettingSwitch({
         setValue(next);
         void save(next).then((ok) => {
           if (ok) onSaved?.(next);
-          else setValue(!next);
+          // Failed: what the file has (read again, should an earlier change have saved).
+          else if (ok === false) setValue(!!file.current);
         });
       }}
     >
@@ -186,6 +209,7 @@ export function SettingSelect({
   const shown = initial == null ? "" : String(initial);
   const [value, setValue] = useState(shown);
   useEffect(() => setValue(shown), [shown]);
+  const file = useLatest(shown);
   const { save, status, restart } = useSave(table, name, context);
   const list =
     value && !choices.some((c) => c.value === value)
@@ -210,11 +234,10 @@ export function SettingSelect({
         onChange={(e) => {
           const next = e.target.value;
           if (confirm && !confirm(next)) return;
-          const previous = value;
           setValue(next);
           void save(number ? Number(next) : next).then((ok) => {
             if (ok) onSaved?.(next);
-            else setValue(previous);
+            else if (ok === false) setValue(file.current);
           });
         }}
       >
@@ -258,16 +281,16 @@ function SettingText({
     setValue(shown);
     last.current = shown;
   }, [shown]);
+  const file = useLatest(shown);
   const { save, status, restart } = useSave(table, name, context);
   const commit = (next: string) => {
     if (next === last.current) return;
-    const previous = last.current;
     last.current = next;
     void save(next).then((ok) => {
       if (ok) onSaved?.(next);
-      else {
-        last.current = previous;
-        setValue(previous);
+      else if (ok === false) {
+        last.current = file.current;
+        setValue(file.current);
       }
     });
   };
@@ -567,13 +590,15 @@ function ProjectFolders({
   const id = useId();
   const [list, setList] = useState<string[] | null>(roots ?? null);
   useEffect(() => setList(roots ?? null), [roots]);
+  const file = useLatest(roots);
+  // Each change writes the whole list: one at a time, the latest winning, so two quick
+  // removals can't land out of order and bring a folder back.
   const { save, status, restart } = useSave([], "project_roots", context);
   const shown = list ?? defaults ?? [];
   const change = (next: string[]) => {
-    const old = list;
     setList(next);
     void save(next).then((ok) => {
-      if (!ok) setList(old);
+      if (ok === false) setList(file.current ?? null);
     });
   };
   return (

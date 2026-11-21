@@ -15,7 +15,8 @@ import {
 import type { Hub } from "../shared/remote";
 import {
   fieldsFromInvitation,
-  missingPairFields,
+  pairRequest,
+  withoutInvitation,
   type PairFields,
 } from "./pairing";
 import "./connections.css";
@@ -121,6 +122,8 @@ export function Connections({
     name: "twr desktop",
   });
   const [invitationText, setInvitationText] = useState("");
+  // What the last invitation loaded filled in, emptied again when its text goes.
+  const loaded = useRef<Partial<PairFields>>(undefined);
   const [manual, setManual] = useState(false);
   const [settings, setSettings] = useState<GatewaySettings>({
     url: "",
@@ -220,20 +223,36 @@ export function Connections({
     setConfirmRestart(false);
     void cancelInvitation().catch((e) => setError(errorMessage(e)));
   }
-  /** Fills the Pair form from pasted invitation text; true when it was one. */
-  function loadInvitation(text: string) {
+  /** Fills the Pair form from pasted invitation text: "loaded", "invalid" for one that is
+   * wrong (said in the error), "none" for text that isn't one at all. */
+  function loadInvitation(text: string): "loaded" | "invalid" | "none" {
     try {
       const filled = fieldsFromInvitation(text, pairFields);
-      if (!filled) return false;
+      if (!filled) return "none";
       setPairFields(filled);
+      loaded.current = {
+        url: filled.url,
+        code: filled.code,
+        hubName: filled.hubName,
+      };
       setError("");
       setNotice(
         `Invitation from ${filled.hubName} loaded. Check the names under Enter details manually if you like, then pair.`,
       );
+      return "loaded";
     } catch (error) {
       setError(errorMessage(error));
+      return "invalid";
     }
-    return true;
+  }
+  /** Paste invitation was cleared, or no longer holds a valid invitation: what the last
+   * one filled in goes with it. */
+  function forgetInvitation(text: string) {
+    const filled = loaded.current;
+    loaded.current = undefined;
+    setPairFields((old) => withoutInvitation(old, filled));
+    if (filled) setNotice("");
+    if (!text.trim()) setError("");
   }
   const pairField = (
     key: keyof PairFields,
@@ -376,24 +395,29 @@ export function Connections({
                 onPaste={(event) => {
                   // An invitation pasted into any of the fields loads it.
                   if (event.target instanceof HTMLTextAreaElement) return;
-                  if (loadInvitation(event.clipboardData.getData("text")))
+                  if (
+                    loadInvitation(event.clipboardData.getData("text")) !==
+                    "none"
+                  )
                     event.preventDefault();
                 }}
                 onSubmit={(event) => {
                   event.preventDefault();
-                  const missing = missingPairFields(pairFields);
-                  if (missing) {
+                  // The invitation as its text is now, never what an earlier one filled.
+                  const request = pairRequest(invitationText, pairFields);
+                  if ("error" in request) {
                     setNotice("");
-                    setError(missing);
-                    if (invitationText.trim()) setManual(true);
+                    setError(request.error);
+                    if (request.manual) setManual(true);
                     return;
                   }
+                  const fields = request.fields;
                   void run(async () => {
                     const hub = await window.twrRemote.pair({
-                      url: pairFields.url,
-                      code: pairFields.code.trim(),
-                      hubName: pairFields.hubName,
-                      name: pairFields.name,
+                      url: fields.url,
+                      code: fields.code.trim(),
+                      hubName: fields.hubName,
+                      name: fields.name,
                     });
                     await refresh();
                     await onSelect(hub);
@@ -415,8 +439,10 @@ export function Connections({
                     autoCorrect="off"
                     placeholder='{"type":"twr-pair", …}'
                     onChange={(e) => {
-                      setInvitationText(e.target.value);
-                      loadInvitation(e.target.value);
+                      const text = e.target.value;
+                      setInvitationText(text);
+                      if (loadInvitation(text) !== "loaded")
+                        forgetInvitation(text);
                     }}
                   />
                 </label>

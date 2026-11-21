@@ -55,23 +55,71 @@ export const NARROW_PERMISSION_MODES = [
   "dontAsk",
 ];
 
+/** The mode ids a runtime takes besides twr's own (docs/runtimes.md#permission-modes, the
+ * adapters' `NATIVE_MODES`). The hub reports no such list, so it is kept here; any other id
+ * a runtime takes (a generic ACP agent's own) is typed in a form's **Other…**. */
+export const RUNTIME_MODES: Record<string, Choice[]> = {
+  codex: [
+    {
+      value: "untrusted",
+      label: "Codex: untrusted",
+      description: "Asks before commands outside its trusted set.",
+    },
+    {
+      value: "on-request",
+      label: "Codex: on-request",
+      description: "Runs inside its sandbox; asks to go beyond it.",
+    },
+    {
+      value: "never",
+      label: "Codex: never",
+      description: "Never asks; stays in its workspace sandbox.",
+    },
+    {
+      value: "danger-full-access",
+      label: "Codex: danger-full-access",
+      description: "Never asks, with no sandbox.",
+    },
+    {
+      value: "yolo",
+      label: "Codex: yolo",
+      description: "Never asks, with no sandbox.",
+    },
+  ],
+};
+
+/** `runtime`'s own modes (`RUNTIME_MODES`), none for a runtime it doesn't list. */
+export function runtimeModes(runtime?: string): Choice[] {
+  return runtime && Object.prototype.hasOwnProperty.call(RUNTIME_MODES, runtime)
+    ? RUNTIME_MODES[runtime]
+    : [];
+}
+
 /** A mode's label, or the id itself for a runtime's own mode twr has no words for. */
 export function permissionLabel(mode?: string | null): string {
   if (!mode) return "";
-  return PERMISSION_MODES.find((m) => m.value === mode)?.label ?? mode;
+  return (
+    PERMISSION_MODES.find((m) => m.value === mode)?.label ??
+    Object.values(RUNTIME_MODES)
+      .flat()
+      .find((m) => m.value === mode)?.label ??
+    mode
+  );
 }
 
-/** The choices for a permission-mode picker: twr's modes (narrowed without `admin`),
- * plus the current value when it is a runtime's own mode, so it still shows. */
+/** The choices for a permission-mode picker: twr's modes (narrowed without `admin`), with
+ * `admin` then `runtime`'s own modes (`RUNTIME_MODES`), plus the current value when it is
+ * none of them, so it still shows. */
 export function permissionChoices(
   current?: string | null,
   admin = true,
+  runtime?: string,
 ): Choice[] {
   const modes = admin
-    ? PERMISSION_MODES
+    ? [...PERMISSION_MODES, ...runtimeModes(runtime)]
     : PERMISSION_MODES.filter((m) => NARROW_PERMISSION_MODES.includes(m.value));
   return current && !modes.some((m) => m.value === current)
-    ? [...modes, { value: current, label: current }]
+    ? [...modes, { value: current, label: permissionLabel(current) }]
     : modes;
 }
 

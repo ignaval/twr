@@ -42,9 +42,11 @@ names, and pair. You can still enter the address and code manually. The scanner
 uses native camera capture; Android keeps its minimum API level at 24.
 
 Under **Connect to another computer**, paste that invitation into **Paste invitation**:
-it fills the hub's address and code, and names the hub after its host. To type them
-instead, open **Enter details manually** (hub name, HTTPS hub URL, one-use code and this
-device's name). The same tab lists your saved hubs, to connect to or forget.
+it fills the hub's address and code, and names the hub after its host. **Pair and
+connect** reads the invitation as the box holds it then: text that isn't a valid
+invitation is refused with what to do, and clearing the box clears the address and code it
+filled. To type them instead, leave the box empty and open **Enter details manually** (hub
+name, HTTPS hub URL, one-use code and this device's name). The same tab lists your saved hubs, to connect to or forget.
 Desktop and mobile use the same remote protocol and shared reconnect/framing
 logic. Tokens stay in native storage: Electron safeStorage with plaintext
 fallback refused, iOS Keychain, or Android Keystore encryption. Tokens never

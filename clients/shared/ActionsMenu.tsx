@@ -25,8 +25,10 @@ export interface MenuItem {
  * A "⋯" (or labelled) disclosure that holds less common actions. Keyboard: Enter, Space or
  * ↓ on the button opens it and focuses the first action; ↑/↓, Home and End move between
  * actions; Escape closes it and returns to the button (App's window handler), as does a
- * pointer press outside it. Choosing an action closes it. `inline` lays the actions out in
- * the flow under the button (the inspector) instead of over the page.
+ * pointer press outside it. Choosing an action gives focus back to the button and closes
+ * it before the action runs, so a dialog the action opens returns focus there. `inline`
+ * lays the actions out in the flow under the button (the inspector) instead of over the
+ * page.
  */
 export function ActionsMenu({
   label,
@@ -89,12 +91,6 @@ export function ActionsMenu({
         onKeyDown={(event) =>
           handleRovingKey(event, event.currentTarget, ":scope > button")
         }
-        onClick={(event) => {
-          if ((event.target as HTMLElement).closest("button"))
-            (
-              event.currentTarget.parentElement as HTMLDetailsElement
-            ).removeAttribute("open");
-        }}
       >
         {items.map((item) => (
           <button
@@ -110,7 +106,14 @@ export function ActionsMenu({
             aria-pressed={item.pressed}
             aria-haspopup={item.dialog ? "dialog" : undefined}
             disabled={item.disabled}
-            onClick={item.onSelect}
+            onClick={(event) => {
+              // Focus leaves the action before the menu hides it: on the button, which a
+              // dialog the action opens then gives focus back to.
+              const menu = event.currentTarget.closest("details");
+              menu?.querySelector("summary")?.focus();
+              menu?.removeAttribute("open");
+              item.onSelect();
+            }}
           >
             {item.icon}
             {item.hint ? (

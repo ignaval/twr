@@ -92,6 +92,7 @@ import type {
   DesktopEvent,
   HubEvent,
   Json,
+  OperationOptions,
   TerminalSession,
   Thread,
   ViewState,
@@ -633,17 +634,22 @@ export default function App({
     }
   }
   const openOperation = useCallback(
-    (command: Command, initialValues: Json = {}) => {
+    (
+      command: Command,
+      initialValues: Json = {},
+      { fixed = false }: OperationOptions = {},
+    ) => {
       setPalette(false);
       setOperation(command);
       const threads = threadsRef.current;
-      // Opened for a thread (the inspector, a row, a slash command naming one): the form
-      // says which in its subtitle instead of asking.
+      // Opened for a thread (the inspector, its ⋯ menu, a slash command naming one): the
+      // form says which in its subtitle instead of asking. Anywhere else (the palette, a
+      // slash command naming no thread) the thread given is only the picker's first choice.
       const given =
         !command.cli &&
         command.fields.some((f) => f.key === "thread") &&
         findThread(threads, initialValues.thread);
-      setFixedThread(given ? given.name : undefined);
+      setFixedThread(fixed && given ? given.name : undefined);
       // Change permission mode opens on the thread's current mode.
       if (command.id === "mode" && given && !initialValues.mode)
         initialValues = { ...initialValues, mode: given.mode };
@@ -706,7 +712,7 @@ export default function App({
     };
   }, [operation, connected]);
   const action = useCallback(
-    (id: string, initialValues: Json = {}) => {
+    (id: string, initialValues: Json = {}, options?: OperationOptions) => {
       const command = commands.find((c) => c.id === id);
       // Choosing the first orchestrator starts from the one the hub would start: its
       // runtime, and the runtime's default model unless one is picked.
@@ -715,7 +721,7 @@ export default function App({
         const runtime = o.configured?.runtime || o.runtime;
         if (runtime) initialValues = { ...initialValues, runtime };
       }
-      if (command) openOperation(command, initialValues);
+      if (command) openOperation(command, initialValues, options);
     },
     [openOperation, commands],
   );
@@ -1811,7 +1817,7 @@ export default function App({
   /** Send as implementation loop: the draft is the task of a loop on the thread whose
    * conversation is shown. Live only, never to the outbox; an empty draft asks first, since
    * the task is then what the conversation already settled. */
-  const sendAsImplementation = () => {
+  const sendAsImplementation = (started: () => void) => {
     const thread = destination
       ? view.threads.find((t) => t.id === destination)
       : undefined;
@@ -1834,8 +1840,10 @@ export default function App({
       try {
         if (
           await startImplement(thread.id, plan.task ? { task: plan.task } : {})
-        )
+        ) {
           drafts.set(key, (old) => (old === draft ? "" : old));
+          started();
+        }
       } finally {
         setSending(false);
         input.current?.focus();
@@ -1982,9 +1990,12 @@ export default function App({
         case "Account": {
           let name = args.account,
             target = args.thread;
+          // A thread named in the command is the form's; the conversation's is a default.
+          let fixed = !!target;
           if (destination && target && !name && !named(target)) {
             name = target;
             target = destination;
+            fixed = false;
           }
           if (!name)
             openOperation(
@@ -1998,17 +2009,23 @@ export default function App({
                 fields: [{ key: "thread", label: "Thread", required: true }],
               },
               { thread: thread(target) },
+              { fixed },
             );
           else
-            action("model", {
-              thread: thread(target),
-              account: name,
-              outside_pin: args.outside_pin,
-            });
+            action(
+              "model",
+              {
+                thread: thread(target),
+                account: name,
+                outside_pin: args.outside_pin,
+              },
+              { fixed },
+            );
           break;
         }
         case "Model": {
           const values = { ...args, thread: thread(args.thread) };
+          const fixed = { fixed: !!args.thread };
           if (!args.model && !args.effort && !args.runtime)
             openOperation(
               {
@@ -2021,15 +2038,24 @@ export default function App({
                 fields: [{ key: "thread", label: "Thread", required: true }],
               },
               values,
+              fixed,
             );
-          else action("model", values);
+          else action("model", values, fixed);
           break;
         }
         case "Mode":
-          action("mode", { ...args, thread: thread(args.thread) });
+          action(
+            "mode",
+            { ...args, thread: thread(args.thread) },
+            { fixed: !!args.thread },
+          );
           break;
         case "Rename":
-          action("rename", { ...args, thread: thread(args.thread) });
+          action(
+            "rename",
+            { ...args, thread: thread(args.thread) },
+            { fixed: !!args.thread },
+          );
           break;
         case "New":
           // `/new <project> --implement <task>`: the form, with its switch on and the task
@@ -2069,6 +2095,7 @@ export default function App({
               } as Record<string, string>
             )[parsed.kind],
             { thread: thread(args) },
+            { fixed: !!args },
           );
           break;
         case "Attach": {
@@ -2141,11 +2168,15 @@ export default function App({
             speaker = args.on || undefined;
           if (cmd.kind === "Status") setSection("speech");
           else if (cmd.kind === "Last")
-            action("read", {
-              last: cmd.args.n,
-              thread: cmd.args.orch ? orchestrator?.id : destination,
-              speaker,
-            });
+            action(
+              "read",
+              {
+                last: cmd.args.n,
+                thread: cmd.args.orch ? orchestrator?.id : destination,
+                speaker,
+              },
+              { fixed: !!cmd.args.orch },
+            );
           else if (cmd.kind === "This") {
             const event = events.findLast(
               (event) => event.kind === "agent.text" && event.data.final,
@@ -2154,12 +2185,12 @@ export default function App({
               throw new Error(
                 "There is no completed message in this conversation to read.",
               );
-            action("read", {
-              thread: target.id,
-              seq: event.seq,
-              last: "",
-              speaker,
-            });
+            // The message read is this thread's: the form is for it.
+            action(
+              "read",
+              { thread: target.id, seq: event.seq, last: "", speaker },
+              { fixed: true },
+            );
           } else
             action("speech-control", {
               op: (
@@ -2916,6 +2947,7 @@ export default function App({
                     action(
                       destination ? "model" : "orch",
                       destination ? { thread: destination } : {},
+                      { fixed: true },
                     ),
                 },
               ]
@@ -2970,7 +3002,7 @@ export default function App({
         hint: hints ? hint : undefined,
         dialog: true,
         danger: id === "delete",
-        onSelect: () => action(id, { thread }),
+        onSelect: () => action(id, { thread }, { fixed: true }),
       }));
   }
   const shell = (
@@ -4035,7 +4067,11 @@ export default function App({
                         aria-haspopup="dialog"
                         aria-label={`Change model of ${selectedThread.name}`}
                         onClick={() =>
-                          action("model", { thread: selectedThread.id })
+                          action(
+                            "model",
+                            { thread: selectedThread.id },
+                            { fixed: true },
+                          )
                         }
                       >
                         Change…

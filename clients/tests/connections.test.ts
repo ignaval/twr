@@ -5,6 +5,8 @@ import {
   fieldsFromInvitation,
   hubNameFor,
   missingPairFields,
+  pairRequest,
+  withoutInvitation,
 } from "../desktop/pairing";
 const now = 1_800_000_000_000;
 const invitation = {
@@ -104,6 +106,53 @@ describe("pasting an invitation into Connect to another computer", () => {
     expect(hubNameFor("https://192.168.1.4:47321")).toBe("192.168.1.4");
     expect(hubNameFor("https://[::1]:47321")).toBe("::1");
     expect(hubNameFor("https://workstation:47321")).toBe("workstation");
+  });
+  it("pairs with what the pasted text says now, never an earlier invitation", () => {
+    const text = encodeInvitation(invitation);
+    const filled = fieldsFromInvitation(text, empty)!;
+    expect(pairRequest(text, filled)).toEqual({ fields: filled });
+    // Replaced with something else: refused, though the fields still hold the old one.
+    const other = pairRequest("not an invitation", filled);
+    expect(other).toMatchObject({ manual: false });
+    expect("error" in other && other.error).toMatch(
+      /^The pasted text isn't a twr invitation\. Copy it again/,
+    );
+    const broken = pairRequest('{"type":"twr-pair"', filled);
+    expect("error" in broken && broken.error).toMatch(
+      /^The pasted invitation can't be used: Scan a twr pairing invitation\. /,
+    );
+    // The invitation in the box wins over an address typed under the manual details.
+    expect(
+      pairRequest(text, { ...filled, url: "https://elsewhere.example" }),
+    ).toEqual({ fields: filled });
+    // Nothing pasted: the details entered by hand.
+    const manual = {
+      hubName: "Lab",
+      url: "https://lab.example:47321",
+      code: "zzzz-1111",
+      name: "laptop",
+    };
+    expect(pairRequest("  ", manual)).toEqual({ fields: manual });
+    expect(pairRequest("", empty)).toEqual({
+      error: missingPairFields(empty),
+      manual: false,
+    });
+    // A valid invitation, but the device's name was cleared: the manual details open.
+    expect(pairRequest(text, { ...filled, name: "" })).toMatchObject({
+      manual: true,
+    });
+  });
+  it("clears what an invitation filled once its text goes, keeping what was typed", () => {
+    const filled = fieldsFromInvitation(encodeInvitation(invitation), empty)!;
+    const loaded = { url: filled.url, code: filled.code, hubName: "hub" };
+    expect(withoutInvitation(filled, loaded)).toEqual({
+      ...empty,
+      name: "twr desktop",
+    });
+    expect(
+      withoutInvitation({ ...filled, hubName: "Studio" }, loaded).hubName,
+    ).toBe("Studio");
+    expect(withoutInvitation(filled, undefined)).toBe(filled);
   });
   it("says what the form still needs", () => {
     expect(missingPairFields(empty)).toBe(

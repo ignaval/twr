@@ -149,7 +149,7 @@ as code with a copy button instead of a link that does nothing.
 | CLI capability | Desktop workflow |
 | --- | --- |
 | Conversations, send, orchestrator selection/reset | Conversation, explicit destination, orchestrator actions |
-| New/list/show, mode/model/runtime/account, rename | New-thread form, sidebar/grid, inspector and typed action forms; the inspector's **Permission mode** is a dropdown of the modes in words that changes the mode at once (narrowed to the safe ones without `admin`), and its **Model** has **Change…**; model and effort are pickers of the runtime's known models and efforts, with the runtime's default first and a custom model id last |
+| New/list/show, mode/model/runtime/account, rename | New-thread form, sidebar/grid, inspector and typed action forms; the inspector's **Permission mode** is a dropdown of the modes in words that changes the mode at once (narrowed to the safe ones without `admin`; with it, the runtime's own modes too, such as Codex's `on-request`), shown as text for the orchestrator, whose mode the hub fixes, and its **Model** has **Change…**; model and effort are pickers of the runtime's known models and efforts, with the runtime's default first and a custom model id last |
 | Stop, park/resume, compact, trim, delete | The inspector shows **Stop…** while a thread works or **Resume…** when it is parked, with **Pin** and **Rename…**; **More** holds **Park…** (stop it and free its worktree; keep the branch), **Trim…** (delete its build output), **Compact…** (summarize its context to free space) and **Move to trash…**; deletion uses the hub's confirmation card |
 | Attention and responses | Needs you and inline request cards; revision-bound answers and notes |
 | Loops (`twr loop`, `/review`, `/implement`, `/loop`, `twr thread new --loop implement`) | The inspector's Loops section, Run as loop beside Send, the Review loop button on a finished turn with changes, the New thread form's switch, the loop chip on a thread's sidebar card, the setup card and Settings › Loops ([Loops](#loops)) |
@@ -173,9 +173,16 @@ dropdowns wherever the hub knows the values: threads by name and status, install
 boxes (local first), the chosen runtime's accounts, permission modes in words (only the
 narrow ones on a device without admin), jobs, trash items, watches, paired devices, memory
 notes, held messages, device access levels and usage periods. A list the hub can't give
-(an older hub, a device not allowed to read it) leaves a text box. A form opened for a
-thread (the inspector's buttons, a slash command naming one) says **For <thread>** under its
-title instead of asking. Less common fields wait under **More options**, which opens by
+(an older hub, a device not allowed to read it) leaves a text box. The runtime, account and
+(with admin) permission mode lists end with **Other…**, which turns the list into a text box
+for what it doesn't name: a one-off `acp:<command>` runtime, an account pool or pattern
+(`work-a,work-b`, `work-*`), a runtime's own mode id; a button beside the box goes back to
+the list, and a value the list lacks opens as typed text. With admin, the mode list also
+names the thread's runtime's own modes (Codex's `untrusted`, `on-request`, `never`,
+`danger-full-access` and `yolo`). A form opened from a thread (the inspector's buttons, its
+**⋯** or **More** menu, a slash command naming one) is for that thread: it says **For
+<thread>** under its title instead of asking. From the command palette, or a slash command
+that names no thread, the form asks, with the conversation's thread chosen first. Less common fields wait under **More options**, which opens by
 itself when one of them holds a value or an error names one; New thread shows Project,
 Name, First prompt and Run as an implementation loop, and keeps the runtime, box, model,
 effort, permission mode, account, aliases, base, checkout and the folder relative project
@@ -213,7 +220,8 @@ history, diagnostics, **Hub & storage**, the config file and the effective confi
 Arrow keys move between the tabs. A device without admin access sees General, Loops, Voice
 (its own voice only) and Advanced (its own offline history). New thread defaults are
 switches and lists of the values the config takes, in words: each saves as you change it and
-says **Saved**; a hub setting adds that it applies after the hub restarts. The rarer ones
+says **Saved** (changes made quickly save one at a time, the last one winning, and the file
+is read again once they end); a hub setting adds that it applies after the hub restarts. The rarer ones
 (log retention and archiving, the background timeout, waking a thread after its background
 work) are under **Advanced**, and Codex's choice for commands its sandbox blocks shows only
 when Codex is installed. On the desktop, **Project folders** lists where New thread looks
@@ -292,10 +300,15 @@ machine.
 
 - **Run as loop.** When you talk to a thread, a **Run as loop** switch sits beside Send (a
   `↻` button on a phone). With it on, Send (**Start implementation loop**) makes what you
-  wrote the task of an implementation loop, and the switch turns off. Sent with nothing
-  written, it asks first, since the task is then what your conversation with the thread
-  already settled. It needs a live connection, like every loop action: without one, or on a
-  read-only device, the switch is off and says why, and nothing is saved for later.
+  wrote the task of an implementation loop, and the switch turns off once the hub takes the
+  loop (it stays on, with your task, when the start fails). Sent with nothing written, it
+  asks first, since the task is then what your conversation with the thread already
+  settled. It needs a live connection, like every loop action: without one, or on a
+  read-only device, the switch can't be turned on and says why, and nothing is saved for
+  later. Turned on before the connection (or the thread's box) went away, it stays on and
+  Send waits, saying why, until a loop can start: the task never goes out, or to the
+  outbox, as an ordinary message unless you turn the switch off. Opening another
+  conversation turns it off.
 - **Start one.** Select a thread: its inspector has a **Loops** section with **Review
   loop** and **Implementation loop…** (which asks for the task, empty meaning what the
   conversation settled), a line under them saying what each does and, under that, the settings a loop would run on (profile,

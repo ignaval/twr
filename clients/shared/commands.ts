@@ -34,6 +34,10 @@ export interface Field {
   advanced?: boolean;
   /** A `boolean` field drawn as a switch (`role="switch"`): it turns a mode on. */
   switch?: boolean;
+  /** A picker that also takes a value its list doesn't have: **Other…**, last, turns it
+   * into a text box (`placeholder` says what it takes), and a value the list lacks shows
+   * there. */
+  custom?: boolean;
 }
 /** Fields drawn as a dropdown of what the hub has (`shared/fieldChoices.ts` builds the
  * choices). Without its list (an older hub, a failed read) a picker is a text box. */
@@ -83,11 +87,21 @@ const f = (key: string, label: string, extra: Partial<Field> = {}): Field => ({
   ...extra,
 });
 const thread = f("thread", "Thread", { type: "thread", required: true });
+/** A runtime field takes a one-off `acp:<command>` (or `pty:`) besides the listed ones. */
+const runtimeOther = {
+  custom: true,
+  placeholder: "A runtime or preset name, or acp:<command>",
+};
 const runtime = f("runtime", "Runtime", {
   type: "runtime",
-  placeholder: "claude-code, codex, grok-build, or a configured runtime",
+  ...runtimeOther,
   required: true,
 });
+/** An account field that takes a pool or pattern (`work-a,work-b`, `work-*`). */
+const accountOther = {
+  custom: true,
+  placeholder: "An account, a pool (work-a,work-b) or a pattern (work-*)",
+};
 const account = f("account", "Account", { type: "account", required: true });
 const cmd = (
   id: string,
@@ -200,6 +214,7 @@ export const commands: Command[] = [
       }),
       f("account", "Account or account pool", {
         type: "account",
+        ...accountOther,
         advanced: true,
         empty: "The runtime's default",
       }),
@@ -234,11 +249,12 @@ export const commands: Command[] = [
     "thread.set_model",
     [
       thread,
-      f("runtime", "Runtime", { type: "runtime", keep: true }),
+      f("runtime", "Runtime", { type: "runtime", ...runtimeOther, keep: true }),
       f("model", "Model", { type: "model", keep: true }),
       f("effort", "Reasoning effort", { type: "effort", keep: true }),
       f("account", "Account or pool", {
         type: "account",
+        ...accountOther,
         keep: true,
         advanced: true,
       }),

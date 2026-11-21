@@ -1603,7 +1603,9 @@ describe("implementation loops from the message box", () => {
       rpc: (method, params) => {
         if (method === "loop.request") {
           asked.push({ method, params });
-          return Promise.resolve(answer);
+          return answer instanceof Error
+            ? Promise.reject(answer)
+            : Promise.resolve(answer);
         }
         if (method === "loop.get")
           return Promise.resolve({ started: null, id: "l1" });
@@ -1708,6 +1710,54 @@ describe("implementation loops from the message box", () => {
     ).toContain("Loop actions need a live connection");
     expect(asked).toEqual([]);
     expect(app().box().value).toBe("add a CSV export");
+  });
+
+  it("stays on when the connection drops: Send waits, and nothing goes to the outbox", async () => {
+    app().host.sendMessage = async () => ({ action: "sent" });
+    await app().talkTo("builder");
+    await app().type("add a CSV export");
+    await app().click(toggle());
+    await app().connection(false);
+    // Still on, and still able to be turned off.
+    expect(toggle().getAttribute("aria-checked")).toBe("true");
+    expect(toggle().hasAttribute("disabled")).toBe(false);
+    expect(
+      app().find(`#${toggle().getAttribute("aria-describedby")}`).textContent,
+    ).toContain("Send waits until a loop can start");
+    const send = app().find(".send-button");
+    expect(send.getAttribute("aria-label")).toBe("Start implementation loop");
+    expect(send.hasAttribute("disabled")).toBe(true);
+    expect(send.getAttribute("title")).toContain(
+      "Turn off Run as loop to send it as a message.",
+    );
+    // Enter neither starts a loop nor saves the task as an ordinary message.
+    await app().press("Enter");
+    expect(asked).toEqual([]);
+    expect(app().all(".outbox-message")).toHaveLength(0);
+    expect(app().box().value).toBe("add a CSV export");
+    // Back online, Send starts the loop: the task never reaches the thread as a message.
+    await app().live("default");
+    expect(toggle().getAttribute("aria-checked")).toBe("true");
+    await app().press("Enter");
+    expect(asked).toEqual([
+      {
+        method: "loop.request",
+        params: { thread: "w1", kind: "implement", task: "add a CSV export" },
+      },
+    ]);
+    expect(app().host.sent).toEqual([]);
+    expect(toggle().getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("stays on, with the task, when the loop doesn't start", async () => {
+    answer = new Error("The hub refused the loop");
+    await app().talkTo("builder");
+    await app().type("add a CSV export");
+    await sendAsLoop();
+    expect(asked).toHaveLength(1);
+    expect(app().box().value).toBe("add a CSV export");
+    expect(toggle().getAttribute("aria-checked")).toBe("true");
+    expect(app().host.sent).toEqual([]);
   });
 
   it("runs /implement in a thread's conversation with every word as the task", async () => {
@@ -1818,5 +1868,81 @@ describe("/access in the message box", () => {
     expect(asked).toEqual([
       { method: "orchestrator.access", params: { access: "limited" } },
     ]);
+  });
+});
+
+/* A thread action's form (docs/desktop.md › forms): opened from a thread (its inspector,
+ * its ⋯ menu, a slash command naming it) it is for that thread and says so; from the
+ * palette it asks which, the conversation's thread first. */
+describe("a thread action's form", () => {
+  beforeEach(async () => {
+    vi.resetModules();
+    mounted = await mount();
+  });
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+  const dialog = () => app().find("[role=dialog]");
+  /** The option a select shows (react-dom marks it `selected`). */
+  const chosen = (select: FakeElement) =>
+    (select.querySelectorAll("option").find((o) => (o as any).selected) as any)
+      ?.value;
+  const fromPalette = async (title: string) => {
+    await app().click(app().find(".sidebar-footer button", "Commands"));
+    await app().click(app().find(".palette-options [role=option]", title));
+  };
+
+  it("asks which thread from the palette, the conversation's first", async () => {
+    await app().talkTo("builder");
+    await fromPalette("Stop thread");
+    const picker = dialog().querySelector("select#field-thread")!;
+    expect(picker).toBeTruthy();
+    expect(chosen(picker)).toBe("w1");
+    expect(dialog().querySelector("header p")?.textContent ?? "").not.toMatch(
+      /^For /,
+    );
+    await app().click(
+      app().find("[role=dialog] button[aria-label='Close dialog']"),
+    );
+    // History search can still look through every thread.
+    await fromPalette("Search saved conversations");
+    const search = dialog().querySelector("select#field-thread")!;
+    expect(chosen(search)).toBe("w1");
+    expect(
+      search.querySelectorAll("option").map((o) => o.textContent),
+    ).toContain("Every thread");
+  });
+
+  it("is for the thread it was opened from, and says so", async () => {
+    await app().talkTo("builder");
+    await app().click(app().find("button[title='Show thread details']"));
+    await app().click(app().find(".inspector-actions button", "Rename…"));
+    expect(dialog().querySelector("select#field-thread")).toBeFalsy();
+    const fixed = dialog().querySelector("input#field-thread") as any;
+    expect(fixed?.type ?? fixed?.getAttribute("type")).toBe("hidden");
+    expect(fixed?.value).toBe("w1");
+    expect(dialog().querySelector("header p")?.textContent).toMatch(
+      /^For builder\./,
+    );
+  });
+
+  it("gives focus back to the More button an action was chosen from", async () => {
+    await app().talkTo("builder");
+    await app().click(app().find("button[title='Show thread details']"));
+    const menu = app().find(".inspector-more");
+    const more = menu.querySelector("summary")!;
+    menu.setAttribute("open", "");
+    const compact = app().find(".inspector-more button", "Compact…");
+    compact.focus();
+    await app().click(compact);
+    // The menu closed with focus on its button, not on the action it hid.
+    expect(menu.hasAttribute("open")).toBe(false);
+    expect(dialog().querySelector("header p")?.textContent).toMatch(
+      /^For builder\./,
+    );
+    await app().click(
+      app().find("[role=dialog] button[aria-label='Close dialog']"),
+    );
+    expect(app().document.activeElement).toBe(more);
   });
 });

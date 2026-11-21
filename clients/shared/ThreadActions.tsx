@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { ChevronDown, Pencil, Pin, Play, Square } from "lucide-react";
 import { ActionsMenu, type MenuItem } from "./ActionsMenu";
 import { permissionChoices, permissionLabel } from "./labels";
-import type { Json, Thread } from "./types";
+import type { Json, OperationOptions, Thread } from "./types";
 import "./inspector.css";
 
 /** Statuses with a turn or background work going: Stop interrupts them. */
@@ -26,7 +26,8 @@ export function ThreadActions({
   has: (id: string) => boolean;
   pinned: boolean;
   onPin: () => void;
-  action: (id: string, initial?: Json) => void;
+  /** Opens an action's form for this thread (`fixed`: the form doesn't ask which). */
+  action: (id: string, initial?: Json, options?: OperationOptions) => void;
   more: MenuItem[];
 }) {
   const stoppable = STOPPABLE.includes(thread.status) && has("stop");
@@ -36,7 +37,7 @@ export function ThreadActions({
       {stoppable && (
         <button
           aria-haspopup="dialog"
-          onClick={() => action("stop", { thread: thread.id })}
+          onClick={() => action("stop", { thread: thread.id }, { fixed: true })}
         >
           <Square size={14} aria-hidden="true" />
           Stop…
@@ -45,7 +46,9 @@ export function ThreadActions({
       {resumable && (
         <button
           aria-haspopup="dialog"
-          onClick={() => action("resume", { thread: thread.id })}
+          onClick={() =>
+            action("resume", { thread: thread.id }, { fixed: true })
+          }
         >
           <Play size={14} aria-hidden="true" />
           Resume…
@@ -58,7 +61,9 @@ export function ThreadActions({
       {has("rename") && (
         <button
           aria-haspopup="dialog"
-          onClick={() => action("rename", { thread: thread.id })}
+          onClick={() =>
+            action("rename", { thread: thread.id }, { fixed: true })
+          }
         >
           <Pencil size={14} aria-hidden="true" />
           Rename…
@@ -78,8 +83,9 @@ export function ThreadActions({
 
 /**
  * The details table's permission mode: a dropdown of the modes in words (narrowed without
- * `admin`, as the hub would refuse wider ones) that changes the thread's mode at once
- * (`thread.set_mode`). Without the right to change it, the mode in words.
+ * `admin`, as the hub would refuse wider ones; with it, the runtime's own modes too) that
+ * changes the thread's mode at once (`thread.set_mode`). Without the right to change it, and
+ * for the orchestrator, whose mode the hub fixes, the mode in words.
  */
 export function PermissionModePicker({
   id,
@@ -102,13 +108,21 @@ export function PermissionModePicker({
   const [pending, setPending] = useState<string>();
   const current: string = thread.mode || "";
   useEffect(() => setPending(undefined), [current, thread.id]);
-  if (!editable)
+  if (!editable || thread.is_orchestrator)
     return (
-      <b id={id} className="inspector-mode">
+      <b
+        id={id}
+        className="inspector-mode"
+        title={
+          thread.is_orchestrator
+            ? "The hub fixes the orchestrator's mode so that it only asks."
+            : undefined
+        }
+      >
         {permissionLabel(current) || "—"}
       </b>
     );
-  const choices = permissionChoices(current, admin);
+  const choices = permissionChoices(current, admin, thread.runtime);
   const value = pending ?? current;
   const chosen = choices.find((c) => c.value === value);
   return (

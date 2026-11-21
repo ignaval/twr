@@ -36,8 +36,22 @@ export async function runMacQA(page, { fixture, hubPids }) {
     const dialog = page.getByRole("dialog").last();
     for (const [key, value] of Object.entries(values)) {
       const field = dialog.locator("#field-" + key);
-      // Less common fields wait under More options.
-      if (!(await field.isVisible()))
+      // A form opened for one thread (the inspector, its ⋯ menu, a slash command naming
+      // it) keeps that thread in a hidden field and names it in its subtitle: check it is
+      // the one meant. The palette's forms ask, the current conversation's thread first.
+      if ((await field.getAttribute("type")) === "hidden") {
+        const [fixed, wanted] = await Promise.all([
+          rpc("thread.get", { thread: await field.inputValue() }),
+          rpc("thread.get", { thread: String(value) }),
+        ]);
+        assert.equal(fixed.id, wanted.id, `the form is for ${value}`);
+        continue;
+      }
+      // Less common fields wait under More options: open it for one of those only.
+      if (
+        !(await field.isVisible()) &&
+        (await dialog.locator(".more-options #field-" + key).count())
+      )
         await dialog.locator(".more-options:not([open]) > summary").click();
       if ((await field.getAttribute("type")) === "checkbox")
         await field.setChecked(value);
@@ -62,14 +76,24 @@ export async function runMacQA(page, { fixture, hubPids }) {
             )?.value,
           String(value),
         );
+        const other = field.locator("option", { hasText: "Other…" });
+        if (option === undefined && (await other.count())) {
+          // A value the list lacks (a pool, an acp: runtime, a runtime's own mode) is
+          // typed under Other….
+          await field.selectOption({ label: "Other…" });
+          await dialog.locator("input#field-" + key).fill(String(value));
+          continue;
+        }
         assert(option !== undefined, `#field-${key} offers ${value}`);
         await field.selectOption(option);
       } else await field.fill(String(value));
     }
     return dialog;
   };
-  const run = async (title, values = {}, confirm = false) => {
-    const dialog = await open(title, values);
+  const run = async (title, values = {}, confirm = false) =>
+    finish(await open(title, values), confirm);
+  /** Submits an open form (confirming when asked), waits for its result and closes it. */
+  const finish = async (dialog, confirm = false) => {
     await dialog.locator('button[type="submit"]').click();
     if (confirm)
       await page
@@ -132,7 +156,17 @@ export async function runMacQA(page, { fixture, hubPids }) {
   );
   console.log("QA: native New shortcut and relative project directory");
 
-  await run("Rename thread", { thread: "packaged", name: "qa-agent" });
+  const rename = await open("Rename thread", {
+    thread: "packaged",
+    name: "qa-agent",
+  });
+  // The palette's forms ask which thread (the current conversation's first); only one
+  // opened from a thread is fixed to it.
+  assert(
+    await rename.locator("select#field-thread").isVisible(),
+    "The palette's Rename asks which thread",
+  );
+  await finish(rename);
   await run("Change permission mode", { thread: "qa-agent", mode: "plan" });
   await talk("qa-agent");
   assert.equal((await rpc("thread.get", { thread: "qa-agent" })).mode, "plan");
