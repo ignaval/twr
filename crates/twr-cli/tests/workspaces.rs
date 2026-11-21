@@ -1332,6 +1332,10 @@ fn hub_stop_all_reports_shutdown_progress_when_the_reply_misses_the_deadline() {
     ok(home, &["ws", "new", "a"]);
     ok(home, &["ws", "new", "idle"]);
     let mut default = start_hub(home, None);
+    // Its first `hub.info` waits for its build id, the hash of the whole executable: over
+    // a second for a debug build on a CPU without SHA instructions. Done before the stop, so
+    // the stop's 2 s deadline measures the stop.
+    ok(home, &["info"]);
     let a = Paths::with_home(home).workspace("a").unwrap();
     std::fs::create_dir_all(a.socket.parent().unwrap()).unwrap();
     let listener = std::os::unix::net::UnixListener::bind(&a.socket).unwrap();

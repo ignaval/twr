@@ -193,3 +193,55 @@ apps' retints). The unchanged script also passed against the CI build of 6850a84
 
 Not covered: a physical GPU, an input method and fractional scaling on real hardware, and a
 real Omarchy session with its shell and retints.
+
+### Omarchy on real hardware
+
+Checked on 2026-11-21 on a MacBook Pro (Ivy Bridge HD 4000 and GeForce GT 650M, 2880×1800
+panel at scale 2) running Omarchy 4.5.0 (package `4.5.0-3`, its shell's bar and tray, uwsm),
+Hyprland 0.56.2 (Lua configuration), kernel 7.2.15, Electron 45.2.3, with the app and a debug
+`twr` built from this repository on the machine. Agents were the user's own `claude`, `codex`
+and `grok`, installed with mise.
+
+- The installed Omarchy's 23 stock themes have the colours `tests/omarchy-themes.ts` holds.
+  (Its `osaka-jade` folder holds only backgrounds, left by another package; it is not a theme.)
+- `node scripts/omarchy-qa.mjs` passed: all 23 themes and the switch back, every text pair
+  at 4.58:1 or more, field edges 3.41:1 or more, focus rings 5.28:1 or more, thread names
+  4.60:1 or more, the app following each switch in 0.1 to 4.4 seconds; broken and missing
+  themes fell back readably. `npm run test:integration` (both suites, `TWR_HYPRLAND_QA=1`) passed. The
+  session's screen was locked for most of these runs: the renderer measurements stand, but
+  the whole-output `grim` captures show the lock screen, so the menu bar colour they report
+  is meaningless there.
+- Hyprland tiles a new window beside those already on the workspace, so on this screen the
+  app opened 699 px wide in its narrow layout, where the scripts' waits fail. The scripts now
+  float the window at 1280×800 (`scripts/hyprland-window.mjs`, Lua dispatchers on Hyprland
+  0.56 and later, the older dispatcher names before), and again after showing a hidden
+  window, which Hyprland maps as a new one.
+- Fixed: the sidebar, which a narrow window closes, stayed closed when Hyprland widened the
+  window again. It now comes back as the wide layout had it.
+- Fixed: a hub the app started (through the bundled `twr`) inherited dozens of
+  Electron's descriptors, the crash reporter's socket among them, so the crash reporter
+  outlived the app, held the app's stdout open, and Playwright's `close()` never returned.
+  Both ways of starting a hub now mark every inherited descriptor above stderr
+  close-on-exec (`twr_core::fork::close_inherited_on_exec`).
+- Fixed: the Omarchy QA's wait for animations to end (`scripts/omarchy-audit.mjs`) had no
+  limit, and an infinite animation never ends. Twice a run stopped for good on a page
+  evaluation that never returned, with the renderer and the main process both answering;
+  this wait is the one evaluation that can do that. It now gives up after 3 s and says so;
+  no run after that stopped.
+- `cargo test --workspace` and clippy pass. Two CLI tests failed here before, from the
+  base commit on: the hub's first `hub.info` hashes its own executable for its build id,
+  1.26 s for the 417 MB debug `twr` on this CPU (no SHA instructions), longer than the 1 s
+  the tests give `twr hub stop --timeout 1` and `twr update`'s look at the running hub. The
+  hub now hashes it as it starts, and those two tests wait for a first `hub.info`.
+- The tray needs no Waybar: the Omarchy shell registers `org.kde.StatusNotifierWatcher`,
+  which is what the app checks. uwsm runs XDG autostart entries, where Launch at login
+  writes its own (not tried at a real login here).
+- With Omarchy's login shell, the app's environment recovery (`bash -ilc`, a launcher's
+  stripped environment) finds the agents through mise's command wrappers in under 0.1 s.
+- On the CLI, a hub in a temporary `TWR_HOME` ran a Claude Code thread that wrote and
+  committed a file, a Claude Code orchestrator that used its twr tools, and one-turn Codex
+  and Grok Build threads; `usage`, `trim`, `park`, `resume`, `delete`, `trash restore` and the
+  TUI's stack and grid views worked.
+
+Not covered here: an input method, the packaged Arch build (not installed, to leave the
+system unchanged) and a session that stayed unlocked throughout.

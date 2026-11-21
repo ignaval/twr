@@ -9091,6 +9091,15 @@ fn spawn_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
         // file named in their environment.
         .env_remove(twr_core::client::TEST_USER_TOKEN_ENV);
     twr_adapters::process::new_session_std(&mut cmd);
+    // It outlives this process, so it keeps none of the descriptors this one inherited (the
+    // desktop app's, when the app runs this `twr`).
+    // SAFETY: close_inherited_on_exec is async-signal-safe and allocates nothing.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(
+            &mut cmd,
+            twr_core::fork::close_inherited_on_exec,
+        );
+    }
     spawn_reaped(&mut cmd).with_context(|| format!("starting the hub ({})", exe.display()))?;
     Ok(())
 }

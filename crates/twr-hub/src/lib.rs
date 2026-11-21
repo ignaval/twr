@@ -43,6 +43,15 @@ pub use job_gate::job_gate_main;
 ///
 /// [`HubOptions::boxes_lock`], when set, is released once the socket is bound.
 pub async fn run(mut opts: HubOptions, socket: PathBuf) -> anyhow::Result<()> {
+    // `hub.info` reports this build's id, the SHA-256 of the whole executable, worked out on
+    // first use: over a second for a debug build on a CPU without SHA instructions, which
+    // the first `hub.info` (the desktop app's, `twr hub stop`'s, whose deadline can be a
+    // second) would wait for. Worked out now, while the hub starts.
+    let _ = std::thread::Builder::new()
+        .name("twr-build-id".into())
+        .spawn(|| {
+            twr_core::build_id();
+        });
     let boxes_lock = opts.boxes_lock.take();
     let lock = hub::lock_data_dir(&opts.db_path, Some(&socket)).await?;
     twr_core::trace::mark("hub: data directory locked");

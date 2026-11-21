@@ -30,3 +30,73 @@ pub fn prepare_fork() {
         });
     }
 }
+
+/// Marks every file descriptor above stderr close-on-exec, for a `pre_exec` closure (between
+/// fork and exec): the program started gets only its stdin, stdout and stderr. A process that
+/// outlives the one that starts it would otherwise keep, for as long as it runs, whatever that
+/// one inherited without close-on-exec. The hub is such a process, and the desktop app runs
+/// the `twr` that starts it with dozens of Electron's descriptors (GPU and profile files,
+/// Chromium's IPC sockets, the crash reporter's socket, which keeps the crash reporter, and
+/// with it the app's stdout, alive after the app quits). Allocates nothing and calls only
+/// async-signal-safe functions; it cannot fail.
+pub fn close_inherited_on_exec() -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        // close_range(2) (Linux 5.11 and later) marks them all in one call.
+        // SAFETY: takes three integers and touches no memory of this process.
+        let marked = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        if marked == 0 {
+            return Ok(());
+        }
+    }
+    // An older kernel, or macOS: each descriptor in turn, up to the limit (at most 65536).
+    // SAFETY: sysconf and fcntl take integers and touch no memory of this process.
+    let limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    let limit = if limit <= 0 { 1024 } else { limit.min(65536) } as libc::c_int;
+    for fd in 3..limit {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::CommandExt;
+
+    /// Whether a child started with `close` sees descriptor `fd`, which this process holds
+    /// open without close-on-exec.
+    fn child_sees(fd: libc::c_int, close: bool) -> bool {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!("[ -e /dev/fd/{fd} ]"));
+        if close {
+            super::prepare_fork();
+            // SAFETY: close_inherited_on_exec is async-signal-safe and allocates nothing.
+            unsafe {
+                cmd.pre_exec(super::close_inherited_on_exec);
+            }
+        }
+        cmd.status().unwrap().success()
+    }
+
+    #[test]
+    fn a_child_gets_no_inherited_descriptor_but_its_stdio() {
+        // A descriptor as Electron leaves them: open across exec.
+        // SAFETY: opens /dev/null; the descriptor is closed below.
+        let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+        assert!(fd > 2);
+        assert!(child_sees(fd, false), "the control child inherits it");
+        assert!(!child_sees(fd, true));
+        // SAFETY: closes the descriptor opened above.
+        unsafe { libc::close(fd) };
+    }
+}

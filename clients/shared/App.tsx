@@ -1240,11 +1240,19 @@ export default function App({
     const timer = setInterval(save, 5000);
     return () => clearInterval(timer);
   }, [journal, workspace, connected]);
+  // Whether the sidebar shows in the wide layout, kept while the window is narrow (where the
+  // sidebar is the More sheet and starts closed) so that widening the window brings back what
+  // the wide layout had. A tiling window manager (Hyprland on Omarchy) narrows and widens the
+  // window each time another one opens or closes beside it.
+  const wideSidebar = useRef(true);
+  useEffect(() => {
+    if (!narrow) wideSidebar.current = sidebar;
+  }, [narrow, sidebar]);
   useEffect(() => {
     const media = window.matchMedia("(max-width:800px)");
     const change = () => {
       setNarrow(media.matches);
-      if (media.matches) setSidebar(false);
+      setSidebar(media.matches ? false : wideSidebar.current);
     };
     media.addEventListener("change", change);
     return () => media.removeEventListener("change", change);

@@ -492,7 +492,7 @@ Choosing an item shows the window, switches to its workspace and opens it in Nee
 The Dock icon (macOS) and Unity-style launchers (Linux) show the same count as a badge.
 The shown workspace's items are live; the others' are read every 15 seconds, as the
 sidebar reads them, also while the window is hidden. A stopped hub is not started to ask it.
-On Linux the icon needs a StatusNotifierItem host: Waybar's `tray` module on Omarchy,
+On Linux the icon needs a StatusNotifierItem host: the tray of Omarchy's bar (the Omarchy shell's on current releases, Waybar's `tray` module on older ones),
 KDE Plasma, or GNOME with the AppIndicator extension. Without one, Settings says so
 and background mode stays off, so the window can always be brought back.
 
