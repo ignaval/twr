@@ -1713,6 +1713,9 @@ export function LoopSettingsForm({
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
   const [tick, setTick] = useState(0);
+  // Customize: the controls past the preset. Open when the settings match no preset (or
+  // there are none, or the hub names a problem); then as the user leaves it.
+  const [customize, setCustomize] = useState<boolean>();
   const readOnly = !loops.access.act;
   const load = useCallback(async () => {
     setLoadError("");
@@ -1761,6 +1764,16 @@ export function LoopSettingsForm({
       live = false;
     };
   }, [load, tick, loops.settingsVersion]);
+  useEffect(() => {
+    if (customize !== undefined || !got || !state) return;
+    const presets = got.presets || [];
+    const problems = card ? card.problems || [] : got.problems || [];
+    setCustomize(
+      !presets.length ||
+        !matchingPreset(state.settings, presets) ||
+        problems.length > 0,
+    );
+  }, [got, state, card, customize]);
   const runtimes: RuntimeInfo[] = got?.runtimes || [];
   const change = (c: EditorChange) => {
     setNotice("");
@@ -1871,6 +1884,10 @@ export function LoopSettingsForm({
   const preset = matchingPreset(s, got.presets || []);
   const warnings = card ? card.warnings || [] : got.warnings || [];
   const problems = card ? card.problems || [] : got.problems || [];
+  const hasPresets = (got.presets || []).length > 0;
+  // A read-only device can't press Customize (the fieldset is disabled): it sees it all.
+  const customizing =
+    !hasPresets || readOnly || problems.length > 0 || (customize ?? !preset);
   const runtimeOptions = (
     role: "implementer" | "reviewer",
     selected?: string,
@@ -1938,260 +1955,293 @@ export function LoopSettingsForm({
           </div>
         </div>
       )}
-      <div
-        className="loop-editor-group"
-        role="group"
-        aria-labelledby={`${ids}-impl-heading`}
-      >
-        <label className="field" htmlFor={`${ids}-impl`}>
-          <span id={`${ids}-impl-heading`}>Implementer</span>
-          <select
-            id={`${ids}-impl`}
-            aria-describedby={`${ids}-impl-hint`}
-            value={s.implementer ? s.implementer.runtime : ""}
-            onChange={(e) =>
-              e.target.value
-                ? change({ kind: "implementer", runtime: e.target.value })
-                : change({ kind: "implementer", own: true })
-            }
+      {hasPresets && (
+        <div className="loop-customize-bar">
+          <button
+            type="button"
+            className="loop-customize-toggle"
+            aria-expanded={customizing}
+            aria-controls={`${ids}-customize`}
+            disabled={problems.length > 0}
+            onClick={() => setCustomize(!customizing)}
           >
-            <option value="">
-              The thread's own
-              {thread
-                ? ` (${modelWords({ runtime: thread.runtime, model: thread.model_actual || thread.model, effort: thread.effort })})`
-                : ""}
-            </option>
-            {runtimeOptions("implementer", s.implementer?.runtime)}
-          </select>
-        </label>
-        <small id={`${ids}-impl-hint`}>
-          A named implementer runs on the thread's own runtime: a thread on
-          another runtime gets the setup card.
-        </small>
-        {s.implementer && (
+            Customize
+          </button>
+          {!customizing && (
+            <small className="loop-customize-summary">
+              {s.implementer
+                ? modelWords(s.implementer)
+                : "The thread's own model"}
+              , reviewed by {modelWords(s.reviewer)} · profile {s.profile}
+            </small>
+          )}
+        </div>
+      )}
+      <div
+        id={`${ids}-customize`}
+        className="loop-customize"
+        hidden={!customizing}
+      >
+        <div
+          className="loop-editor-group"
+          role="group"
+          aria-labelledby={`${ids}-impl-heading`}
+        >
+          <label className="field" htmlFor={`${ids}-impl`}>
+            <span id={`${ids}-impl-heading`}>Implementer</span>
+            <select
+              id={`${ids}-impl`}
+              aria-describedby={`${ids}-impl-hint`}
+              value={s.implementer ? s.implementer.runtime : ""}
+              onChange={(e) =>
+                e.target.value
+                  ? change({ kind: "implementer", runtime: e.target.value })
+                  : change({ kind: "implementer", own: true })
+              }
+            >
+              <option value="">
+                The thread's own
+                {thread
+                  ? ` (${modelWords({ runtime: thread.runtime, model: thread.model_actual || thread.model, effort: thread.effort })})`
+                  : ""}
+              </option>
+              {runtimeOptions("implementer", s.implementer?.runtime)}
+            </select>
+          </label>
+          <small id={`${ids}-impl-hint`}>
+            Choose a model, or let each thread use its own. A chosen model is
+            used only by threads on its runtime; a thread on another runtime
+            asks you with the setup card.
+          </small>
+          {s.implementer && (
+            <div className="loop-editor-row">
+              <label className="field" htmlFor={`${ids}-impl-model`}>
+                <span>Model</span>
+                <ModelSelect
+                  id={`${ids}-impl-model`}
+                  value={s.implementer.model || ""}
+                  onChange={(model) => change({ kind: "implementer", model })}
+                  choices={describe(
+                    s.implementer.runtime,
+                    runtimeOf(s.implementer.runtime)?.models || [],
+                  )}
+                  required
+                />
+              </label>
+              <label className="field" htmlFor={`${ids}-impl-effort`}>
+                <span>Effort</span>
+                <ModelSelect
+                  id={`${ids}-impl-effort`}
+                  value={s.implementer.effort || ""}
+                  onChange={(effort) => change({ kind: "implementer", effort })}
+                  choices={efforts(s.implementer.runtime, s.implementer.effort)}
+                  custom={false}
+                />
+              </label>
+            </div>
+          )}
+        </div>
+        {showWorkers && (
+          <div
+            className="loop-editor-group"
+            role="group"
+            aria-labelledby={`${ids}-workers-heading`}
+            aria-describedby={`${ids}-workers-hint`}
+          >
+            <span className="loop-editor-heading" id={`${ids}-workers-heading`}>
+              Workers
+            </span>
+            <div className="loop-editor-row">
+              <label className="field" htmlFor={`${ids}-workers-model`}>
+                <span>Model</span>
+                <ModelSelect
+                  id={`${ids}-workers-model`}
+                  value={s.workers.model || ""}
+                  onChange={(model) => change({ kind: "workers", model })}
+                  choices={describe(
+                    workersRuntime,
+                    runtimeOf(workersRuntime)?.models || [],
+                  )}
+                />
+              </label>
+              <label className="field" htmlFor={`${ids}-workers-effort`}>
+                <span>Effort</span>
+                <ModelSelect
+                  id={`${ids}-workers-effort`}
+                  value={s.workers.effort || ""}
+                  onChange={(effort) => change({ kind: "workers", effort })}
+                  choices={efforts(workersRuntime, s.workers.effort)}
+                  custom={false}
+                />
+              </label>
+            </div>
+            <small className="muted" id={`${ids}-workers-hint`}>
+              The helpers the implementer starts, when its runtime has them.
+            </small>
+          </div>
+        )}
+        <div
+          className="loop-editor-group"
+          role="group"
+          aria-labelledby={`${ids}-rev-heading`}
+          aria-describedby={`${ids}-rev-hint`}
+        >
+          <span className="loop-editor-heading" id={`${ids}-rev-heading`}>
+            Reviewer
+          </span>
           <div className="loop-editor-row">
-            <label className="field" htmlFor={`${ids}-impl-model`}>
+            <label className="field" htmlFor={`${ids}-rev`}>
+              <span>Runtime</span>
+              <select
+                id={`${ids}-rev`}
+                aria-describedby={[
+                  acpNote ? `${ids}-rev-acp` : "",
+                  skippedReviewers ? `${ids}-rev-skipped` : "",
+                ]
+                  .filter(Boolean)
+                  .join(" ")}
+                value={s.reviewer.runtime}
+                onChange={(e) =>
+                  change({ kind: "reviewer", runtime: e.target.value })
+                }
+              >
+                {!runtimeOf(s.reviewer.runtime) && (
+                  <option value={s.reviewer.runtime}>
+                    {s.reviewer.runtime}
+                  </option>
+                )}
+                {runtimeOptions("reviewer", s.reviewer.runtime)}
+              </select>
+            </label>
+            <label className="field" htmlFor={`${ids}-rev-model`}>
               <span>Model</span>
               <ModelSelect
-                id={`${ids}-impl-model`}
-                value={s.implementer.model || ""}
-                onChange={(model) => change({ kind: "implementer", model })}
+                id={`${ids}-rev-model`}
+                value={s.reviewer.model || ""}
+                onChange={(model) => change({ kind: "reviewer", model })}
                 choices={describe(
-                  s.implementer.runtime,
-                  runtimeOf(s.implementer.runtime)?.models || [],
+                  s.reviewer.runtime,
+                  runtimeOf(s.reviewer.runtime)?.models || [],
                 )}
                 required
               />
             </label>
-            <label className="field" htmlFor={`${ids}-impl-effort`}>
-              <span>Effort</span>
-              <ModelSelect
-                id={`${ids}-impl-effort`}
-                value={s.implementer.effort || ""}
-                onChange={(effort) => change({ kind: "implementer", effort })}
-                choices={efforts(s.implementer.runtime, s.implementer.effort)}
-                custom={false}
-              />
-            </label>
+            {reviewerAccounts.length > 1 && (
+              <label className="field" htmlFor={`${ids}-rev-account`}>
+                <span>Account</span>
+                <select
+                  id={`${ids}-rev-account`}
+                  value={s.reviewer.account || ""}
+                  onChange={(e) =>
+                    change({ kind: "reviewer", account: e.target.value })
+                  }
+                >
+                  <option value="">The runtime's default account</option>
+                  {reviewerAccounts.map((a) => (
+                    <option key={a}>{a}</option>
+                  ))}
+                </select>
+              </label>
+            )}
           </div>
-        )}
-      </div>
-      {showWorkers && (
-        <div
-          className="loop-editor-group"
-          role="group"
-          aria-labelledby={`${ids}-workers-heading`}
-          aria-describedby={`${ids}-workers-hint`}
-        >
-          <span className="loop-editor-heading" id={`${ids}-workers-heading`}>
-            Workers
-          </span>
-          <div className="loop-editor-row">
-            <label className="field" htmlFor={`${ids}-workers-model`}>
-              <span>Model</span>
-              <ModelSelect
-                id={`${ids}-workers-model`}
-                value={s.workers.model || ""}
-                onChange={(model) => change({ kind: "workers", model })}
-                choices={describe(
-                  workersRuntime,
-                  runtimeOf(workersRuntime)?.models || [],
-                )}
-              />
-            </label>
-            <label className="field" htmlFor={`${ids}-workers-effort`}>
-              <span>Effort</span>
-              <ModelSelect
-                id={`${ids}-workers-effort`}
-                value={s.workers.effort || ""}
-                onChange={(effort) => change({ kind: "workers", effort })}
-                choices={efforts(workersRuntime, s.workers.effort)}
-                custom={false}
-              />
-            </label>
-          </div>
-          <small className="muted" id={`${ids}-workers-hint`}>
-            The implementer's subagents, where its runtime has them.
+          <small className="muted" id={`${ids}-rev-hint`}>
+            The profile sets how hard it reviews each round. An ACP agent
+            reviews only in the read-only mode set for it in the config file.
           </small>
-        </div>
-      )}
-      <div
-        className="loop-editor-group"
-        role="group"
-        aria-labelledby={`${ids}-rev-heading`}
-        aria-describedby={`${ids}-rev-hint`}
-      >
-        <span className="loop-editor-heading" id={`${ids}-rev-heading`}>
-          Reviewer
-        </span>
-        <div className="loop-editor-row">
-          <label className="field" htmlFor={`${ids}-rev`}>
-            <span>Runtime</span>
-            <select
-              id={`${ids}-rev`}
-              aria-describedby={[
-                acpNote ? `${ids}-rev-acp` : "",
-                skippedReviewers ? `${ids}-rev-skipped` : "",
-              ]
-                .filter(Boolean)
-                .join(" ")}
-              value={s.reviewer.runtime}
-              onChange={(e) =>
-                change({ kind: "reviewer", runtime: e.target.value })
-              }
+          {acpNote && (
+            <small className="muted loop-editor-acp" id={`${ids}-rev-acp`}>
+              {acpNote}
+            </small>
+          )}
+          {skippedReviewers && (
+            <small
+              className="muted loop-editor-skipped"
+              id={`${ids}-rev-skipped`}
             >
-              {!runtimeOf(s.reviewer.runtime) && (
-                <option value={s.reviewer.runtime}>{s.reviewer.runtime}</option>
-              )}
-              {runtimeOptions("reviewer", s.reviewer.runtime)}
-            </select>
-          </label>
-          <label className="field" htmlFor={`${ids}-rev-model`}>
-            <span>Model</span>
-            <ModelSelect
-              id={`${ids}-rev-model`}
-              value={s.reviewer.model || ""}
-              onChange={(model) => change({ kind: "reviewer", model })}
-              choices={describe(
-                s.reviewer.runtime,
-                runtimeOf(s.reviewer.runtime)?.models || [],
-              )}
-              required
-            />
-          </label>
-          {reviewerAccounts.length > 1 && (
-            <label className="field" htmlFor={`${ids}-rev-account`}>
-              <span>Account</span>
-              <select
-                id={`${ids}-rev-account`}
-                value={s.reviewer.account || ""}
-                onChange={(e) =>
-                  change({ kind: "reviewer", account: e.target.value })
-                }
-              >
-                <option value="">The runtime's default account</option>
-                {reviewerAccounts.map((a) => (
-                  <option key={a}>{a}</option>
-                ))}
-              </select>
-            </label>
+              {skippedReviewers}
+            </small>
           )}
         </div>
-        <small className="muted" id={`${ids}-rev-hint`}>
-          Its effort is each round's, from the profile. An ACP agent reviews
-          only in the read-only mode its preset names.
-        </small>
-        {acpNote && (
-          <small className="muted loop-editor-acp" id={`${ids}-rev-acp`}>
-            {acpNote}
-          </small>
-        )}
-        {skippedReviewers && (
-          <small
-            className="muted loop-editor-skipped"
-            id={`${ids}-rev-skipped`}
-          >
-            {skippedReviewers}
-          </small>
-        )}
-      </div>
-      <div className="loop-editor-row">
-        <label className="field" htmlFor={`${ids}-profile`}>
-          <span>Profile</span>
-          <select
-            id={`${ids}-profile`}
-            value={s.profile}
-            onChange={(e) =>
-              change({ kind: "profile", profile: e.target.value })
-            }
-          >
-            {!(got.profiles || []).includes(s.profile) && (
-              <option value={s.profile}>{s.profile}</option>
-            )}
-            {(got.profiles || []).map((p) => (
-              <option key={p}>{p}</option>
-            ))}
-          </select>
-        </label>
-        <label className="field" htmlFor={`${ids}-plan-check`}>
-          <span>Plan check</span>
-          <select
-            id={`${ids}-plan-check`}
-            value={s.plan_check || ""}
-            onChange={(e) =>
-              change({ kind: "plan_check", value: e.target.value })
-            }
-          >
-            <option value="">The profile's</option>
-            <option value="never">Never</option>
-            <option value="contracts">When the plan touches contracts</option>
-            <option value="always">Always</option>
-          </select>
-        </label>
-        <label className="field" htmlFor={`${ids}-impl-commit`}>
-          <span>Implementation commits</span>
-          <select
-            id={`${ids}-impl-commit`}
-            value={s.commit || "end"}
-            onChange={(e) => change({ kind: "commit", value: e.target.value })}
-          >
-            <option value="end">One commit at the end</option>
-            <option value="per-round">A commit per round</option>
-            <option value="none">No commit</option>
-          </select>
-        </label>
-        <label className="field" htmlFor={`${ids}-sweep`}>
-          {/* Named by its own word: the hint in the label is its description. */}
-          <span id={`${ids}-sweep-label`}>Sweep</span>
-          <select
-            id={`${ids}-sweep`}
-            value={s.sweep || "thread"}
-            aria-labelledby={`${ids}-sweep-label`}
-            aria-describedby={`${ids}-sweep-hint`}
-            onChange={(e) => change({ kind: "sweep", value: e.target.value })}
-          >
-            <option value="thread">The thread audits the rules</option>
-            <option value="runs">A reviewer run per rule</option>
-          </select>
-          <small id={`${ids}-sweep-hint`} className="muted">
-            {s.sweep === "runs"
-              ? "One read-only reviewer call per rule, a few at once; the thread verifies their reports."
-              : "The thread audits each rule itself, with its own subagents where it has them."}
-          </small>
-        </label>
-        <label className="field" htmlFor={`${ids}-commit`}>
-          <span>Review commits</span>
-          <select
-            id={`${ids}-commit`}
-            value={s.review_commit || "match"}
-            onChange={(e) =>
-              change({ kind: "review_commit", value: e.target.value })
-            }
-          >
-            <option value="match">Like the thread (commit if it was)</option>
-            <option value="none">Leave fixes uncommitted</option>
-          </select>
-        </label>
+        <div className="loop-editor-row">
+          <label className="field" htmlFor={`${ids}-profile`}>
+            <span>Profile</span>
+            <select
+              id={`${ids}-profile`}
+              value={s.profile}
+              onChange={(e) =>
+                change({ kind: "profile", profile: e.target.value })
+              }
+            >
+              {!(got.profiles || []).includes(s.profile) && (
+                <option value={s.profile}>{s.profile}</option>
+              )}
+              {(got.profiles || []).map((p) => (
+                <option key={p}>{p}</option>
+              ))}
+            </select>
+          </label>
+          <label className="field" htmlFor={`${ids}-plan-check`}>
+            <span>Plan check</span>
+            <select
+              id={`${ids}-plan-check`}
+              value={s.plan_check || ""}
+              onChange={(e) =>
+                change({ kind: "plan_check", value: e.target.value })
+              }
+            >
+              <option value="">The profile's</option>
+              <option value="never">Never</option>
+              <option value="contracts">When the plan touches contracts</option>
+              <option value="always">Always</option>
+            </select>
+          </label>
+          <label className="field" htmlFor={`${ids}-impl-commit`}>
+            <span>Implementation commits</span>
+            <select
+              id={`${ids}-impl-commit`}
+              value={s.commit || "end"}
+              onChange={(e) =>
+                change({ kind: "commit", value: e.target.value })
+              }
+            >
+              <option value="end">One commit at the end</option>
+              <option value="per-round">A commit per round</option>
+              <option value="none">No commit</option>
+            </select>
+          </label>
+          <label className="field" htmlFor={`${ids}-sweep`}>
+            {/* Named by its own word: the hint in the label is its description. */}
+            <span id={`${ids}-sweep-label`}>Sweep</span>
+            <select
+              id={`${ids}-sweep`}
+              value={s.sweep || "thread"}
+              aria-labelledby={`${ids}-sweep-label`}
+              aria-describedby={`${ids}-sweep-hint`}
+              onChange={(e) => change({ kind: "sweep", value: e.target.value })}
+            >
+              <option value="thread">The thread audits the rules</option>
+              <option value="runs">A reviewer run per rule</option>
+            </select>
+            <small id={`${ids}-sweep-hint`} className="muted">
+              {s.sweep === "runs"
+                ? "One read-only reviewer call per rule, a few at once; the thread verifies their reports."
+                : "The thread audits each rule itself, with its own subagents where it has them."}
+            </small>
+          </label>
+          <label className="field" htmlFor={`${ids}-commit`}>
+            <span>Review commits</span>
+            <select
+              id={`${ids}-commit`}
+              value={s.review_commit || "match"}
+              onChange={(e) =>
+                change({ kind: "review_commit", value: e.target.value })
+              }
+            >
+              <option value="match">Like the thread (commit if it was)</option>
+              <option value="none">Leave fixes uncommitted</option>
+            </select>
+          </label>
+        </div>
       </div>
       {(source.kind === "card" || source.project) && (
         <div className="field">

@@ -395,3 +395,72 @@ describe("a setup card shown in two places on a phone", () => {
     await act(async () => root.unmount());
   });
 });
+
+describe("the settings editor's preset and Customize", () => {
+  const preset = {
+    id: "opus",
+    label: "Opus",
+    implementer: {
+      runtime: "claude-code",
+      model: "claude-opus-5-5",
+      effort: "xhigh",
+    },
+    workers: { model: "claude-opus-5-5", effort: "medium" },
+    reviewer: { runtime: "claude-code", model: "claude-opus-5-5" },
+  };
+  const editor = (settings: Json, presets: Json[] = [preset]) =>
+    mount(
+      (v, h) =>
+        h(v.LoopSettingsForm, { source: { kind: "saved" }, inline: true }),
+      async (method) => {
+        if (method === "loop.settings.get")
+          return {
+            settings,
+            source: "workspace",
+            first_card: settings,
+            projects: [],
+            presets,
+            profiles: ["low", "medium", "high"],
+            runtimes,
+            warnings: [],
+            problems: [],
+          };
+        throw new Error(`unexpected ${method}`);
+      },
+    );
+
+  it("shows the preset alone when the settings are one, the rest behind Customize", async () => {
+    const m = await editor({
+      profile: "low",
+      implementer: preset.implementer,
+      workers: preset.workers,
+      reviewer: preset.reviewer,
+    });
+    const toggle = m.find("button", "Customize")!;
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    const region = m.find(`#${toggle.getAttribute("aria-controls")}`)!;
+    expect(region.hasAttribute("hidden")).toBe(true);
+    expect(region.textContent).toContain("Implementer");
+    expect(m.find(".loop-customize-summary")?.textContent).toContain(
+      "reviewed by",
+    );
+    await m.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(region.hasAttribute("hidden")).toBe(false);
+    await m.unmount();
+  });
+
+  it("opens Customize when the settings match no preset", async () => {
+    const m = await editor({
+      profile: "low",
+      implementer: null,
+      workers: preset.workers,
+      reviewer: preset.reviewer,
+    });
+    expect(m.find("button", "Customize")!.getAttribute("aria-expanded")).toBe(
+      "true",
+    );
+    expect(m.find(".loop-customize-summary")).toBeUndefined();
+    await m.unmount();
+  });
+});
