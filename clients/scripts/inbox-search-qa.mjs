@@ -389,8 +389,9 @@ archive.commit()
   await expect(context.locator(".search-event.selected")).toContainText(
     "ARCHIVED_RESULT_MARKER exact tool output",
   );
+  // An event reads by who it came from and when, not by its sequence number.
   await expect(context.locator(".search-event.selected")).toContainText(
-    "#9999",
+    "Tool",
   );
   await expect(context).toContainText("This computer / default");
   await context
