@@ -4008,7 +4008,10 @@ fn notice_text(lines: &[String], left: usize, dropped: usize) -> String {
              the work is done (read the reply when the excerpt leaves doubt) and you have not \
              done it already; if it says work is still running, call watch_thread again to \
              wait for the next report. A watch without repeat is now used up. A note never \
-             answers a permission or question.\n",
+             answers a permission or question. repeat=true marks a repeating watch: one whose \
+             note asks for a review or a loop but doesn't quote the user's standing request \
+             (\"from now on ...\") may come from a one-off request: don't start it; ask the \
+             user once whether it stands.\n",
         );
     }
     out.push_str(
@@ -5201,7 +5204,16 @@ mod tests {
         let standing = set_watch(&hub, "*", true);
         finish(&hub, "api", 1, Grade::Success);
         let (text, _) = notice_now(&hub).unwrap();
-        assert!(text.contains(&format!("watch={standing} ")), "{text}");
+        assert!(
+            text.contains(&format!("watch={standing} repeat=true note=")),
+            "{text}"
+        );
+        // The legend says what a repeating review watch needs before it is acted on.
+        assert!(
+            text.contains("repeat=true marks a repeating watch")
+                && text.contains("doesn't quote the user's standing request"),
+            "{text}"
+        );
 
         // The review pass's report.
         let loop_report = |turn: u64| {
@@ -6010,6 +6022,12 @@ mod tests {
         assert!(p.contains("runs only when the user asks for a loop by name"));
         assert!(p.contains("covers\nonly the work it came with"));
         assert!(p.contains("never\ncall a one-off request a user preference"));
+        // A repeating review or loop watch acts only on the user's standing request, quoted in
+        // its note; one without (an older orchestrator's, from a one-off request) is
+        // reconfirmed with the user, and unwatched unless they confirm.
+        assert!(p.contains("A repeating watch's note quotes the user's standing\nrequest"));
+        assert!(p.contains("but quotes no such request may come from a one-off request: don't start\nit; ask the user once whether it stands"));
+        assert!(p.contains("otherwise unwatch it"));
         // Deleting goes on the user's card; the trash is read-only to it.
         assert!(p.contains("delete_thread") && p.contains("list_trash is read-only"));
         // A cut transcript line is read in full by its seq.
@@ -6396,6 +6414,11 @@ mod tests {
         assert_eq!(
             report.text(&[&w1]),
             "- report watch=w1 note=\"note w1\" thread_id=t1"
+        );
+        // A repeating watch says so, for the rule on repeating review watches.
+        assert_eq!(
+            report.text(&[&w1, &watch_on("w2", true)]),
+            "- report watch=w1 note=\"note w1\" watch=w2 repeat=true note=\"note w2\" thread_id=t1"
         );
         let kept = report.without_watches().unwrap();
         assert_eq!(kept.text(&[]), "- report thread_id=t1");

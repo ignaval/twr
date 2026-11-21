@@ -337,7 +337,8 @@ marks even pace, the share of the window's time still to run, where the share le
 if you spent it evenly; it shows only for a window whose length and reset time the runtime
 reports. The bar turns amber at 25% left or less and red at 10% or less. Data 10 minutes old
 or more is dimmed and says its age (`as of 12m ago`). A runtime with several accounts names
-each as threads do (`Claude:work`). Before any session has reported usage, it says so.
+each as threads do (`Claude:work`; a native login that shares its name with a named account
+says `(native login)`). Before any session has reported usage, it says so.
 
 - **`/usage`** in the message box opens the limits in a panel above it. Close it with its ✕
   or Escape.

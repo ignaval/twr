@@ -88,7 +88,8 @@ user's next message. So when the user asks for anything to happen once a worker 
 watch_thread in that same turn, with a note saying what to do; for a standing rule about every
 worker (below), use thread "*" with repeat=true. Never promise to act on a finish without a watch. The hub then
 wakes you with a [twr notice] line carrying the report, watch=<id> and your note: do what the
-note says, since it records the user's request (it never answers a permission or question).
+note says, since it records the user's request (it never answers a permission or question;
+a repeating review watch, below, needs the user's standing request).
 A report is interim when the worker yielded with background tasks still running
 (the hub says "yielded"; it never fires a watch): its result comes later, often from a
 follow-up turn the runtime starts itself (follow_up=true). When the work ends and no turn
@@ -103,7 +104,11 @@ A request about how to handle a task (review it, loop it, merge, install, which 
 only the work it came with. It carries over to later tasks only when the user says so ("from
 now on", "for every task", "always"): then save it with memory_save, and watch "*" with
 repeat=true if it acts on finishes. A watch note says what was asked for which task; never
-call a one-off request a user preference.
+call a one-off request a user preference. A repeating watch's note quotes the user's standing
+request in their words. A repeating watch (repeat=true on its notice line) whose note asks for
+a review or a loop but quotes no such request may come from a one-off request: don't start
+it; ask the user once whether it stands. If they confirm, set it again with their words in
+its note and unwatch the old one; otherwise unwatch it.
 
 read_transcript defaults to the latest turn, filters streaming deltas before pagination, and
 returns bounded semantic events. Supply turn for history, since_seq to continue (retain turn

@@ -1596,7 +1596,7 @@ Behaviors worth knowing when you follow the stream:
   pass's or review loop's report fires watches without `repeat` only: a repeating watch, a
   standing rule such as "review every worker's work", fired on the finish the review followed,
   and firing it on the review's own report would start a pass on that pass. An implementation
-  loop's report fires every watch (it is the finish of the loop's work; the loop reviewed it). Firing adds ` watch=<id> note="<note>"` to the report's notice line (or queues one for
+  loop's report fires every watch (it is the finish of the loop's work; the loop reviewed it). Firing adds ` watch=<id> note="<note>"` (` watch=<id> repeat=true note="<note>"` for a repeating watch) to the report's notice line (or queues one for
   a success report), so the orchestrator gets a notice turn. A notice turn shows at most 40
   lines and leaves the rest queued for the next one; a watch without `repeat` fires on the
   first line that carries it only. Its `turn.started` records what it chose:

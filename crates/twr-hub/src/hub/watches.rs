@@ -83,11 +83,20 @@ pub(super) struct Watch {
     pub(super) repeat: bool,
 }
 
-/// ` watch=<id> note="..."` for each of `watches`, as a notice line carries them.
+/// ` watch=<id> note="..."` for each of `watches`, as a notice line carries them, with
+/// ` repeat=true` after the id of one that repeats: the orchestrator acts on a repeating
+/// review or loop watch only when its note quotes the user's standing request.
 pub(super) fn hit_text(watches: &[&Watch]) -> String {
     watches
         .iter()
-        .map(|w| format!(" watch={} note={}", w.id, quoted(&w.note)))
+        .map(|w| {
+            format!(
+                " watch={}{} note={}",
+                w.id,
+                if w.repeat { " repeat=true" } else { "" },
+                quoted(&w.note)
+            )
+        })
         .collect()
 }
 
