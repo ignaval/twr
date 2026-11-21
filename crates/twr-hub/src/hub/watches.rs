@@ -22,9 +22,10 @@
 //! the orchestrator or a user. A rewrite of an interim report stays interim while the turn's
 //! tasks run (`Hub::write_report`), so the worker going idle still fires. A loop's steps fire
 //! nothing, on their reports or idle: the loop's report (`ext.twr.loop` with `step: report`)
-//! is the finish. A review loop's or pass's report fires only watches without `repeat`: a
-//! standing rule ("review every worker's work") fired on the finish the review followed, and
-//! firing it on the review's own report would start a pass on that pass. An implementation
+//! is the finish. A review loop's or pass's report that changed nothing fires only watches
+//! without `repeat`: a standing rule ("review every worker's work") fired on the finish the
+//! review followed, and firing it on the review's own report would start a pass on that pass.
+//! One that fixed findings (`fixed` in its mark) or made commits fires them all. An implementation
 //! loop's report is the finish of the work it did and fires every watch; its notice line says
 //! `kind=implement`, so a standing review rule knows the loop reviewed it.
 //!

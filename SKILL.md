@@ -1592,10 +1592,12 @@ Behaviors worth knowing when you follow the stream:
   and a report the orchestrator or a user wrote, fire nothing (an idle worker fires only after
   a turn that completed; a rewrite of an interim report stays interim while the turn's tasks
   run). A loop's steps fire nothing, on their reports or idle; its report (the loop ended:
-  its notice line says `loop=<id> kind=<review|implement> ended`) is the finish. A review
-  pass's or review loop's report fires watches without `repeat` only: a repeating watch, a
-  standing rule such as "review every worker's work", fired on the finish the review followed,
-  and firing it on the review's own report would start a pass on that pass. An implementation
+  its notice line says `loop=<id> kind=<review|implement> ended`, then ` fixed=<n>` when its
+  triage fixed findings) is the finish. A review pass's or review loop's report that changed
+  nothing (no finding fixed, no commit) fires watches without `repeat` only: a repeating watch,
+  a standing rule such as "review every worker's work", fired on the finish the review
+  followed, and firing it on the review's own report would start a pass on that pass; one that
+  changed the work fires every watch. An implementation
   loop's report fires every watch (it is the finish of the loop's work; the loop reviewed it). Firing adds ` watch=<id> note="<note>"` (` watch=<id> repeat=true note="<note>"` for a repeating watch) to the report's notice line (or queues one for
   a success report), so the orchestrator gets a notice turn. A notice turn shows at most 40
   lines and leaves the rest queued for the next one; a watch without `repeat` fires on the

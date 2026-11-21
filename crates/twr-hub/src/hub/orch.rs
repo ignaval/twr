@@ -399,8 +399,16 @@ fn asked_by_orchestrator(v: &ThreadView, id: &str) -> bool {
     by == twr_core::loops::ControlBy::Orchestrator
 }
 
-/// The kind of the loop whose report carries `mark` (`ext.twr.loop`): its `kind`, else (a log
-/// from before the mark said it) the thread's loop of that id, running or last, else review.
+/// Whether a loop's report says it changed the work: its triage fixed findings (its mark's
+/// `fixed`) or it made commits. False for a mark without either (one from before `fixed` was
+/// recorded, or a review that changed nothing).
+fn loop_changed(mark: Option<&Value>) -> bool {
+    mark.is_some_and(|m| {
+        m["fixed"].as_u64().unwrap_or(0) > 0
+            || m["commits"].as_array().is_some_and(|c| !c.is_empty())
+    })
+}
+
 fn loop_kind(v: &ThreadView, mark: &Value) -> LoopKind {
     if let Some(kind) = mark.get("kind").and_then(|k| LoopKind::deserialize(k).ok()) {
         return kind;
@@ -2360,9 +2368,12 @@ impl Core {
                 }
                 // The hub's report of a turn that completed is a finish: it fires the thread's
                 // watches (`hub::watches`). A failed turn's error card notifies anyway. A
-                // review loop's or pass's report fires no repeating watch: a standing rule such
-                // as "review every worker's work" fired on the finish the review followed, and
-                // firing again on the review's own end would start a pass on that pass. An
+                // review loop's or pass's report that changed nothing fires no repeating watch: a
+                // standing rule such as "review every worker's work" fired on the finish the
+                // review followed, and firing again on the review's own end would start a pass on
+                // that pass. One whose triage fixed findings (`fixed=N` on its line) or that made
+                // commits changed the work, so a standing rule like "send each finished branch to
+                // the integrator" fires again (the prompt starts no pass on a pass's report). An
                 // implementation loop's report is the finish of the work it did (its steps'
                 // reports fired nothing, above): it fires every watch, and its line says the
                 // kind, so a standing review rule knows the loop reviewed that work.
@@ -2371,7 +2382,7 @@ impl Core {
                 let hits =
                     if p.written_by == "hub" && watch::turn_completed(view, p.turn.or(ev.turn)) {
                         let mut hits = self.matching_watches(&ev.thread);
-                        if kind == Some(LoopKind::Review) {
+                        if kind == Some(LoopKind::Review) && !loop_changed(loop_mark) {
                             hits.retain(|w| !w.repeat);
                         }
                         hits
@@ -2393,7 +2404,13 @@ impl Core {
                     .map_or(String::new(), |s| format!(" {}={s}", report::REPLY_SEQ_KEY));
                 let ended = loop_id.map_or(String::new(), |id| {
                     let kind = kind.unwrap_or_default().as_str();
-                    format!(" loop={id} kind={kind} ended")
+                    let fixed = loop_mark.and_then(|l| l["fixed"].as_u64()).unwrap_or(0);
+                    let fixed = if fixed > 0 {
+                        format!(" fixed={fixed}")
+                    } else {
+                        String::new()
+                    };
+                    format!(" loop={id} kind={kind} ended{fixed}")
                 });
                 let excerpt = twr_ext(&p.ext)
                     .and_then(|t| t.get("reply_excerpt"))
@@ -5254,6 +5271,45 @@ mod tests {
         );
         assert!(!text.contains(&format!("watch={standing} ")), "{text}");
 
+        // A pass whose triage fixed findings changed the work: the standing watch fires
+        // again ("send each finished branch to the integrator"), and the line says so.
+        hub.append(
+            "api",
+            Some(5),
+            Source::Hub,
+            EventBody::TurnStarted(TurnStarted::default()),
+            None,
+        )
+        .unwrap();
+        hub.append(
+            "api",
+            Some(5),
+            Source::Hub,
+            EventBody::TurnEnded(TurnEnded::default()),
+            None,
+        )
+        .unwrap();
+        hub.append(
+            "api",
+            Some(5),
+            Source::Hub,
+            EventBody::ReportReady(ReportReady {
+                summary: "review pass: 2 fixed".into(),
+                grade: Grade::Success,
+                turn: Some(5),
+                written_by: "hub".into(),
+                ext: twr_ext_map(
+                    json!({ LOOP_REPORT_KEY: {"id": "L1", "step": "report", "fixed": 2} }),
+                ),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        let (text, _) = notice_now(&hub).unwrap();
+        assert!(text.contains("loop=L1 kind=review ended fixed=2"), "{text}");
+        assert!(text.contains(&format!("watch={standing} ")), "{text}");
+
         // New work's finish fires the standing watch again.
         finish(&hub, "api", 4, Grade::Success);
         let (text, _) = notice_now(&hub).unwrap();
@@ -6028,6 +6084,15 @@ mod tests {
         assert!(p.contains("A repeating watch's note quotes the user's standing\nrequest"));
         assert!(p.contains("but quotes no such request may come from a one-off request: don't start\nit; ask the user once whether it stands"));
         assert!(p.contains("otherwise unwatch it"));
+        // So does a memory note asking for a review or loop on every task, an older one too.
+        assert!(p.contains(
+            "The same goes for a memory note that\nasks for a review or a loop on every task"
+        ));
+        // A review's report that changed the work fires repeating watches; never a pass on it.
+        assert!(p.contains(
+            "fires a\nrepeating watch only when it changed the work (fixed=N, or commits)"
+        ));
+        assert!(p.contains("never start another pass on a pass's\nreport"));
         // Deleting goes on the user's card; the trash is read-only to it.
         assert!(p.contains("delete_thread") && p.contains("list_trash is read-only"));
         // A cut transcript line is read in full by its seq.

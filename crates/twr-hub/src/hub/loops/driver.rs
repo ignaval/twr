@@ -2072,6 +2072,7 @@ impl Core {
                         "kind": state.kind,
                         "step": "report",
                         "outcome": outcome,
+                        "fixed": state.fixed,
                         "report_path": shown,
                         "commits": committed.commits,
                         "commit_problem": committed.problem,

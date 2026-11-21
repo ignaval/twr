@@ -108,7 +108,9 @@ call a one-off request a user preference. A repeating watch's note quotes the us
 request in their words. A repeating watch (repeat=true on its notice line) whose note asks for
 a review or a loop but quotes no such request may come from a one-off request: don't start
 it; ask the user once whether it stands. If they confirm, set it again with their words in
-its note and unwatch the old one; otherwise unwatch it.
+its note and unwatch the old one; otherwise unwatch it. The same goes for a memory note that
+asks for a review or a loop on every task without quoting the user's standing words: ask once,
+then update it with their words or forget it.
 
 read_transcript defaults to the latest turn, filters streaming deltas before pagination, and
 returns bounded semantic events. Supply turn for history, since_seq to continue (retain turn
@@ -146,9 +148,10 @@ setting only as they said it. Either starts at once only on the user's saved set
 otherwise the result is needs_setup: tell the user its tell_user sentence; only they answer the
 card. Rounds are routine updates: don't report them one by one. When a pass or loop you
 started ends, a [twr notice] brings its report (loop=<id> kind=<kind> ended): say in a
-sentence or two how it ended. A review pass's or loop's report (kind=review) never fires a
-repeating watch, so a standing review rule reviews each finish once; never start another pass
-on a pass's report. An implementation loop's report (kind=implement) is that worker's finish
+sentence or two how it ended. A review pass's or loop's report (kind=review) fires a
+repeating watch only when it changed the work (fixed=N, or commits): act on it as on any
+finish for other rules (send the branch on again), but never start another pass on a pass's
+report. An implementation loop's report (kind=implement) is that worker's finish
 and fires every watch: act on it as on any finish, but don't start a review pass on it for a
 standing review rule, since the loop already reviewed that work.
 get_loop shows one when asked; stop_loop stops one when asked. Pausing, resuming and skipping
