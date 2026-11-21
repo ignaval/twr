@@ -216,7 +216,10 @@ switches and lists of the values the config takes, in words: each saves as you c
 says **Saved**; a hub setting adds that it applies after the hub restarts. The rarer ones
 (log retention and archiving, the background timeout, waking a thread after its background
 work) are under **Advanced**, and Codex's choice for commands its sandbox blocks shows only
-when Codex is installed. **Edit config file…** unfolds the complete TOML editor. Writes
+when Codex is installed. On the desktop, **Project folders** lists where New thread looks
+for a project you give by name (`project_roots`; the built-in folders until you change it),
+with **Add folder…** and a remove button per folder; a list spread over several lines in the
+file is left to edit by hand. **Edit config file…** unfolds the complete TOML editor. Writes
 reuse the TUI's comment-preserving, locked, crash-recoverable writer. Full-text saves check
 the text's hash and the merged `boxes.toml`, so an unseen change is not overwritten. Unsaved
 editor drafts stay in memory across navigation, not in browser storage. Closing/reloading

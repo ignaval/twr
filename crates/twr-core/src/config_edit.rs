@@ -31,6 +31,9 @@ pub enum Scalar {
     /// A finite float (one that is not is refused by [`set_key`]).
     Float(f64),
     Str(String),
+    /// A list of strings, written on one line (`["~/code", "~/src"]`). Read back only by
+    /// [`set_key`]'s check: [`Scalar::of`] still takes no array.
+    Strs(Vec<String>),
 }
 
 impl Scalar {
@@ -41,6 +44,9 @@ impl Scalar {
             Scalar::Int(i) => toml::Value::Integer(*i),
             Scalar::Float(f) => toml::Value::Float(*f),
             Scalar::Str(s) => toml::Value::String(s.clone()),
+            Scalar::Strs(v) => {
+                toml::Value::Array(v.iter().cloned().map(toml::Value::String).collect())
+            }
         }
     }
 
@@ -52,6 +58,13 @@ impl Scalar {
             Scalar::Int(i) => i.to_string(),
             Scalar::Float(f) => format!("{f:?}"),
             Scalar::Str(s) => basic_string(s),
+            Scalar::Strs(v) => format!(
+                "[{}]",
+                v.iter()
+                    .map(|s| basic_string(s))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
     }
 
@@ -1059,6 +1072,21 @@ terminal = \"bell\"
             Some(Scalar::Float(0.25))
         );
         assert_eq!(Scalar::of(&toml::Value::Array(vec![])), None);
+        // A list of strings goes on one line, and replaces one that is on one line.
+        let roots = Scalar::Strs(vec!["~/code".into(), "/srv/a \"b\"".into()]);
+        let new = set_key("", &[], "project_roots", &roots).unwrap();
+        assert_eq!(new, "project_roots = [\"~/code\", \"/srv/a \\\"b\\\"\"]\n");
+        let new = set_key(&new, &[], "project_roots", &Scalar::Strs(vec![])).unwrap();
+        assert_eq!(new, "project_roots = []\n");
+        // One spread over several lines is the user's to edit.
+        let err = set_key(
+            "project_roots = [\n  \"~/code\",\n]\n",
+            &[],
+            "project_roots",
+            &Scalar::Strs(vec!["~/src".into()]),
+        )
+        .unwrap_err();
+        assert!(err.contains("several lines"), "{err}");
     }
 
     #[test]

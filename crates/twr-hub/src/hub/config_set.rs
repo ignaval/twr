@@ -359,6 +359,7 @@ pub(super) fn scalar_json(s: &Scalar) -> Value {
         Scalar::Int(i) => json!(i),
         Scalar::Float(f) => json!(f),
         Scalar::Str(s) => json!(s),
+        Scalar::Strs(v) => json!(v),
     }
 }
 

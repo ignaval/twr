@@ -44,7 +44,7 @@ function useSave(table: string[], key: string, { fail, saved }: SaveContext) {
   const [restart, setRestart] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
   useEffect(() => () => clearTimeout(timer.current), []);
-  const save = async (value: string | number | boolean) => {
+  const save = async (value: string | number | boolean | string[]) => {
     clearTimeout(timer.current);
     setStatus("Saving…");
     try {
@@ -387,6 +387,13 @@ export function ThreadDefaults({
         models={models.length ? models : undefined}
         context={context}
       />
+      {document.documentElement.dataset.mobile !== "true" && (
+        <ProjectFolders
+          roots={loaded?.project_roots}
+          defaults={loaded?.default_project_roots}
+          context={context}
+        />
+      )}
       <SettingSwitch
         table={["threads"]}
         name="worktree"
@@ -542,5 +549,93 @@ export function ThreadDefaults({
         )}
       </details>
     </section>
+  );
+}
+
+/** `project_roots`: the folders New thread looks in for a project given by name. Unset is
+ * the built-in list (shown as such); the first change writes the whole list. */
+function ProjectFolders({
+  roots,
+  defaults,
+  context,
+}: {
+  roots?: string[] | null;
+  defaults?: string[];
+  context: SaveContext;
+}) {
+  const hostApi = useHostAPI();
+  const id = useId();
+  const [list, setList] = useState<string[] | null>(roots ?? null);
+  useEffect(() => setList(roots ?? null), [roots]);
+  const { save, status, restart } = useSave([], "project_roots", context);
+  const shown = list ?? defaults ?? [];
+  const change = (next: string[]) => {
+    const old = list;
+    setList(next);
+    void save(next).then((ok) => {
+      if (!ok) setList(old);
+    });
+  };
+  return (
+    <div
+      className="setting-field project-folders"
+      role="group"
+      aria-labelledby={`${id}-label`}
+      aria-describedby={`${id}-hint`}
+      title="project_roots"
+    >
+      <div className="project-folders-head">
+        <span id={`${id}-label`}>Project folders</span>
+        <small id={`${id}-hint`}>
+          New thread finds a project you name in these folders.
+          {list === null && shown.length > 0 && " These are the defaults."}
+        </small>
+      </div>
+      {shown.length ? (
+        <ul>
+          {shown.map((root) => (
+            <li key={root}>
+              <code>{root}</code>
+              <button
+                type="button"
+                className="icon-button"
+                aria-label={`Remove ${root}`}
+                title="Remove"
+                onClick={() => change(shown.filter((r) => r !== root))}
+              >
+                ×
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="muted">None: name projects by their full path.</p>
+      )}
+      <div className="manager-actions">
+        <button
+          type="button"
+          onClick={() =>
+            void hostApi.pickDirectory().then((path) => {
+              if (path && !shown.includes(path)) change([...shown, path]);
+            })
+          }
+        >
+          Add folder…
+        </button>
+        {list !== null && (
+          <button
+            type="button"
+            onClick={() => {
+              // Back to the built-in list: the closest the one-key writer gets to unsetting.
+              if (defaults) change([...defaults]);
+            }}
+            disabled={!defaults}
+          >
+            Use defaults
+          </button>
+        )}
+      </div>
+      <Feedback status={status} restart={restart} noteId={`${id}-note`} />
+    </div>
   );
 }

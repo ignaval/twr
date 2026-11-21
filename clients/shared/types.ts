@@ -213,7 +213,7 @@ export interface DesktopAPI {
   configSet(
     table: string[],
     key: string,
-    value: string | number | boolean,
+    value: string | number | boolean | string[],
   ): Promise<void>;
   exportText(name: string, content: string): Promise<void>;
   onEvent(callback: (event: DesktopEvent) => void): () => void;
