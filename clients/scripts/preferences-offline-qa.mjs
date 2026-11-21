@@ -626,9 +626,11 @@ async function exerciseRemoteForget(page, history) {
     .getByRole("button", { name: "Hubs and remote access", exact: true })
     .click();
   let dialog = page.getByRole("dialog", {
-    name: "Hubs and remote access",
+    name: "Computers",
     exact: true,
   });
+  // The address and code go in by hand (no invitation to paste).
+  await dialog.getByText("Enter details manually", { exact: true }).click();
   await dialog
     .getByLabel("Hub name", { exact: true })
     .fill("Disposable forget QA");
@@ -681,7 +683,7 @@ async function exerciseRemoteForget(page, history) {
     .getByRole("button", { name: "Hubs and remote access", exact: true })
     .click();
   dialog = page.getByRole("dialog", {
-    name: "Hubs and remote access",
+    name: "Computers",
     exact: true,
   });
   await dialog
@@ -695,7 +697,7 @@ async function exerciseRemoteForget(page, history) {
     .getByRole("button", { name: "Hubs and remote access", exact: true })
     .click();
   dialog = page.getByRole("dialog", {
-    name: "Hubs and remote access",
+    name: "Computers",
     exact: true,
   });
   await dialog
@@ -732,7 +734,7 @@ async function exerciseRemoteForget(page, history) {
     .getByRole("button", { name: "Hubs and remote access", exact: true })
     .click();
   dialog = page.getByRole("dialog", {
-    name: "Hubs and remote access",
+    name: "Computers",
     exact: true,
   });
   await dialog
@@ -746,7 +748,7 @@ async function exerciseRemoteForget(page, history) {
     .getByRole("button", { name: "Hubs and remote access", exact: true })
     .click();
   dialog = page.getByRole("dialog", {
-    name: "Hubs and remote access",
+    name: "Computers",
     exact: true,
   });
   await dialog

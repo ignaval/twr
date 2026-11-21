@@ -127,6 +127,12 @@ export interface InboxSource {
   cached?: boolean;
   error?: string;
 }
+/** What a file dialog offers: its title, and the kinds of file to show (each with "All
+ * files" after them). */
+export interface FilePickRequest {
+  title?: string;
+  filters?: { name: string; extensions: string[] }[];
+}
 export interface DesktopAPI {
   sendMessage?(message: import("./offline").DurableMessage): Promise<Json>;
   inboxSources?(): Promise<InboxSource[]>;
@@ -192,6 +198,9 @@ export interface DesktopAPI {
     id: string,
   ): Promise<{ data: string; sequence: number; exited?: boolean }>;
   pickDirectory(): Promise<string | null>;
+  /** Choose a file (the desktop app's own dialog): its path, or null when cancelled.
+   * Absent where there is no file dialog (the phone, a remote hub's view). */
+  pickFile?(request?: FilePickRequest): Promise<string | null>;
   openExternal(url: string): Promise<void>;
   reveal(path: string): Promise<void>;
   configRead(): Promise<{

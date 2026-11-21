@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { encodeInvitation, parseInvitation } from "../shared/connections";
 import { gatewayUrl } from "../desktop/remote-transport";
+import {
+  fieldsFromInvitation,
+  hubNameFor,
+  missingPairFields,
+} from "../desktop/pairing";
 const now = 1_800_000_000_000;
 const invitation = {
   url: "https://hub.example:47321",
@@ -70,5 +75,47 @@ describe("native gateway URL boundary", () => {
     );
     expect(gatewayUrl("http://[::1]:1234", true)).toBe("http://[::1]:1234");
     expect(() => gatewayUrl("http://192.168.1.4:1234", true)).toThrow();
+  });
+});
+
+describe("pasting an invitation into Connect to another computer", () => {
+  const empty = { hubName: "", url: "", code: "", name: "twr desktop" };
+  it("fills the address and code, and names the hub after its host", () => {
+    expect(fieldsFromInvitation(encodeInvitation(invitation), empty)).toEqual({
+      hubName: "hub",
+      url: "https://hub.example:47321",
+      code: "abcdef-123456",
+      name: "twr desktop",
+    });
+    expect(
+      fieldsFromInvitation(" " + encodeInvitation(invitation) + "\n", {
+        ...empty,
+        hubName: "Studio",
+      })?.hubName,
+    ).toBe("Studio");
+  });
+  it("leaves typing alone and refuses a broken invitation", () => {
+    expect(fieldsFromInvitation("https://hub", empty)).toBeUndefined();
+    expect(() => fieldsFromInvitation('{"type":"other"}', empty)).toThrow(
+      "Scan a twr pairing invitation",
+    );
+  });
+  it("names an IP address hub by its address", () => {
+    expect(hubNameFor("https://192.168.1.4:47321")).toBe("192.168.1.4");
+    expect(hubNameFor("https://[::1]:47321")).toBe("::1");
+    expect(hubNameFor("https://workstation:47321")).toBe("workstation");
+  });
+  it("says what the form still needs", () => {
+    expect(missingPairFields(empty)).toBe(
+      "Paste an invitation, or enter the hub's address, its one-use code and a hub name.",
+    );
+    expect(
+      missingPairFields({
+        hubName: "a",
+        url: "https://a",
+        code: "c",
+        name: "d",
+      }),
+    ).toBeUndefined();
   });
 });
