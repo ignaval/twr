@@ -161,19 +161,23 @@
   font-weight: 600;
 }
 
-/* The header's gauge: the same limits in a popover under it. */
+/* The header's gauge: the same limits in a popover under the header, at its right edge and
+ * never wider than its column (the conversation column clips what leaves it). Aligned to the
+ * gauge itself, the buttons after it pushed the popover's left edge out of a narrow window. */
 .usage-popover-anchor {
-  position: relative;
   display: flex;
+}
+.conversation-heading:has(> .conversation-actions .usage-popover) {
+  position: relative;
 }
 .usage-popover {
   position: absolute;
-  top: calc(100% + 6px);
-  right: 0;
+  top: calc(100% - 12px);
+  right: 16px;
   z-index: 40;
   display: grid;
   gap: 12px;
-  width: min(320px, calc(100vw - 32px));
+  width: min(320px, calc(100% - 32px));
   max-height: min(420px, 70vh);
   overflow-y: auto;
   padding: 14px;

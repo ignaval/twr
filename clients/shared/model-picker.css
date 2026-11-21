@@ -76,11 +76,16 @@
   bottom: calc(100% + 6px);
   z-index: 20;
   display: grid;
-  grid-template-columns: minmax(120px, 150px) minmax(220px, 1fr) minmax(
-      150px,
+  /* Their least widths fit the composer of a 420-pixel window, and the one row is the
+   * popup's height at most, so each column scrolls its own rows rather than running past
+   * the popup's edge, which clips. */
+  grid-template-columns: minmax(88px, 150px) minmax(150px, 1fr) minmax(
+      120px,
       180px
     );
-  width: min(640px, calc(100vw - 32px));
+  grid-template-rows: minmax(0, 1fr);
+  /* The composer's width at most: past it the column clips the popup (a sidebar beside). */
+  width: min(640px, calc(100% - 16px));
   max-height: min(420px, 60vh);
   background: var(--raised);
   border: 1px solid var(--border-strong);
@@ -283,6 +288,9 @@
 [data-mobile="true"] .model-picker-rail,
 [data-mobile="true"] .model-picker-models,
 [data-mobile="true"] .model-picker-efforts {
+  /* Each its full height, which the sheet scrolls through: shrunk, their rows ran over the
+   * next section's. */
+  flex-shrink: 0;
   overflow: visible;
   border: 0;
 }

@@ -221,3 +221,29 @@ describe("usage limits rendering", () => {
     expect(render(undefined, "Not connected")).toContain("Not connected");
   });
 });
+
+describe("the header's usage popover", () => {
+  it("sits at the header's right edge, no wider than the conversation column", async () => {
+    // Aligned to the gauge, the five buttons after it pushed the popover's left edge out of
+    // a 420-pixel window, and the conversation column clipped the account names and bars.
+    const { readFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const css = readFileSync(
+      join(import.meta.dirname, "..", "shared", "usage.css"),
+      "utf8",
+    );
+    const rule = (selector: string) => {
+      const at = css.indexOf(selector + " {");
+      expect(at, selector).toBeGreaterThan(-1);
+      return css.slice(at, css.indexOf("}", at));
+    };
+    expect(rule(".usage-popover-anchor")).not.toContain("position");
+    expect(
+      rule(".conversation-heading:has(> .conversation-actions .usage-popover)"),
+    ).toContain("position: relative");
+    const popover = rule(".usage-popover");
+    expect(popover).toContain("position: absolute");
+    expect(popover).toContain("right: 16px");
+    expect(popover).toContain("width: min(320px, calc(100% - 32px))");
+  });
+});

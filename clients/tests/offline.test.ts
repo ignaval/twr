@@ -8,6 +8,7 @@ import {
   appendDraft,
   appendMessage,
   isCommandDraft,
+  messageText,
   recordSize,
 } from "../shared/offline";
 import { MessageReceipts } from "../desktop/message-receipts";
@@ -149,7 +150,7 @@ describe("encrypted offline recovery", () => {
     expect(after.historyError).toBe("");
     expect(after.snapshot.outbox).toHaveLength(1);
   });
-  it("preserves concurrent typing and escaped draft syntax on pending replies", async () => {
+  it("keeps concurrent typing and the message's own text on pending replies", async () => {
     const disk = storage();
     const journal = new OfflineJournal(
       {
@@ -166,8 +167,10 @@ describe("encrypted offline recovery", () => {
     );
     await journal.drafts({ "work:orchestrator": "new typing" });
     const result = await journal.deliver(message);
+    // The draft's `//` kept `/literal` a message at the start of the box; after other
+    // text the message goes as it is, so Send sends `/literal`, not `//literal`.
     const merged = appendDraft("new typing", result.restored_draft.text);
-    expect(merged).toBe("new typing\n\n//literal");
+    expect(merged).toBe("new typing\n\n/literal");
     expect(journal.snapshot.drafts["work:orchestrator"]).toBe(merged);
     expect(appendDraft(merged, result.restored_draft.text)).toBe(merged);
   });
@@ -182,6 +185,23 @@ describe("encrypted offline recovery", () => {
     expect(appendDraft("hello", "x")).toBe("hello\n\nx");
     expect(isCommandDraft("/usage")).toBe(true);
     expect(isCommandDraft("//usage")).toBe(false);
+  });
+  it("adds a draft after other text as the message it sends", () => {
+    // Send decodes escapes only at the start of the box: kept after other text, the
+    // saved `\!important` would send its backslash.
+    expect(appendDraft("typed", "\\!important")).toBe("typed\n\n!important");
+    expect(appendDraft("typed", "//usage")).toBe("typed\n\n/usage");
+    expect(appendDraft("typed", "\\\\!x")).toBe("typed\n\n\\!x");
+    // Alone it stays the draft that sends that message.
+    expect(appendDraft("", "\\!important")).toBe("\\!important");
+    // Added twice, it is there once.
+    const once = appendDraft("typed", "\\!important");
+    expect(appendDraft(once, "\\!important")).toBe(once);
+    // A message as sent goes as it is after text, and escaped at the start, every one.
+    for (const message of ["!x", "\\!x", "/x", "//x", "\\x", "plain"]) {
+      expect(appendMessage("typed", message)).toBe("typed\n\n" + message);
+      expect(messageText(appendMessage(undefined, message))).toBe(message);
+    }
   });
   it("moves a queued message to a draft before it can be edited and resent", async () => {
     const disk = storage();
@@ -271,6 +291,32 @@ describe("encrypted offline recovery", () => {
     });
     expect(journal.snapshot.drafts["work:w1"]).toBe("");
     expect(journal.snapshot.draftFiles).toEqual({});
+  });
+  it("moves a saved literal message into a typed draft as the message it sends", async () => {
+    // Saved as `\!important` (so it sent `!important`, not a shell line), with a file; moved
+    // after typed text, it must still send `!important`, not its escape.
+    const disk = storage();
+    const journal = new OfflineJournal(
+      { ...disk, sendMessage: async () => ({}) } as unknown as DesktopAPI,
+      "move-literal",
+    );
+    const prompt = withAttachments("!important", [
+      { name: "a.txt", path: "/w/.twr-uploads/q/a.txt" },
+    ]);
+    const message = await journal.enqueue(
+      "work",
+      "thread.send",
+      { thread: "w1", prompt },
+      "\\" + prompt,
+    );
+    await journal.drafts({ "work:w1": "another line" });
+    await journal.moveToDraft(message.id);
+    expect(journal.snapshot.drafts["work:w1"]).toBe(
+      "another line\n\n!important",
+    );
+    expect(journal.snapshot.draftFiles).toEqual({
+      "work:w1": [{ name: "a.txt", path: "/w/.twr-uploads/q/a.txt" }],
+    });
   });
   it("keeps every file a message moved back puts on its draft, over a restart", async () => {
     const disk = storage();

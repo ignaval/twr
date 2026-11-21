@@ -14,13 +14,19 @@ export interface OutboxMessage extends DurableMessage {
   state: "queued" | "sending" | "review";
   error?: string;
 }
+/**
+ * `text`, a draft (a saved one, one taken back), added to the box's `current` draft. After
+ * other text it goes as the message it sends ([`messageText`]): Send reads escapes only at
+ * the start of the box, so a `\!` or `//` that kept it a message there would be sent too.
+ */
 export function appendDraft(current: string | undefined, text: string) {
   if (!current) return text;
-  if (current === text || current.endsWith("\n\n" + text)) return current;
+  const message = messageText(text);
+  if (current === text || current.endsWith("\n\n" + message)) return current;
   // A draft that is a `/` command or a `!` shell line would send none of the text added
   // after it (Send runs the command and clears the box): it becomes a message too.
   const head = isCommandDraft(current) ? literalDraft(current) : current;
-  return head + "\n\n" + text;
+  return head + "\n\n" + message;
 }
 /** A draft Send runs as a `/` command or a `!` shell line rather than sending it. */
 export function isCommandDraft(draft: string) {
@@ -52,7 +58,7 @@ export function literalDraft(message: string) {
 /** [`appendDraft`] for a message as sent: escaped ([`literalDraft`]) when it starts the
  * draft, where a `/` or `!` would make it a command; as it is after other text. */
 export function appendMessage(current: string | undefined, message: string) {
-  return appendDraft(current, current ? message : literalDraft(message));
+  return appendDraft(current, literalDraft(message));
 }
 export function messageDraft(message: OutboxMessage) {
   if (typeof message.draft === "string") return message.draft;

@@ -1035,6 +1035,58 @@ describe("the picker on a phone", () => {
     expect(sheet).toContain("position: fixed");
     expect(sheet).toContain("bottom: 0");
   });
+
+  it("keeps each section its full height, which the sheet scrolls through", async () => {
+    // Shrunk to the capped sheet, a section's rows (a long catalog, a short phone) ran over
+    // the next section's and competed for its taps.
+    const { readFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const css = readFileSync(
+      join(import.meta.dirname, "..", "shared", "model-picker.css"),
+      "utf8",
+    );
+    const selector =
+      '[data-mobile="true"] .model-picker-rail,\n[data-mobile="true"] .model-picker-models,\n[data-mobile="true"] .model-picker-efforts {';
+    const at = css.indexOf(selector);
+    expect(at).toBeGreaterThan(-1);
+    const sections = css.slice(at, css.indexOf("}", at));
+    expect(sections).toContain("flex-shrink: 0");
+    expect(sections).toContain("overflow: visible");
+    const sheet = css.slice(
+      css.indexOf('[data-mobile="true"] .model-picker-popup {'),
+    );
+    expect(sheet.slice(0, sheet.indexOf("}"))).toContain("overflow: auto");
+  });
+});
+
+describe("the picker in a narrow window", () => {
+  it("fits its columns in the composer and lets each scroll inside the popup", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const css = readFileSync(
+      join(import.meta.dirname, "..", "shared", "model-picker.css"),
+      "utf8",
+    );
+    const at = css.indexOf(".model-picker-popup {");
+    const popup = css.slice(at, css.indexOf("}", at));
+    // The composer's width, not the window's: beside a sidebar the window's ran the popup
+    // past the conversation column, which clips it.
+    expect(popup).toContain("width: min(640px, calc(100% - 16px))");
+    expect(popup).toContain("right: 8px");
+    // One row, the popup's height at most: an auto row grew with a long model list, the
+    // popup clipped the columns, and Done went out of reach.
+    expect(popup).toContain("grid-template-rows: minmax(0, 1fr)");
+    // The columns' least widths fit the composer of the smallest window (420 px; the
+    // composer is 32 px narrower there, the popup 16 px narrower than that, less its border).
+    const columns = /grid-template-columns:([^;]+);/.exec(popup)![1];
+    const least = [...columns.matchAll(/minmax\(\s*(\d+)px/g)].map((m) =>
+      Number(m[1]),
+    );
+    expect(least).toHaveLength(3);
+    expect(least.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(
+      420 - 32 - 16 - 2,
+    );
+  });
 });
 
 describe("the popup without a catalog", () => {

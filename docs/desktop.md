@@ -73,9 +73,11 @@ The orchestrator conversation is primary. Selecting a thread opens its conversat
 composer always names its destination. Mentions reference threads without changing it.
 Enter sends, Shift-Enter inserts a line, `/` offers commands, and `//` sends a literal slash.
 A line that starts with `!` runs a shell command; start it with `\!` to send a message that
-begins with `!`, as in the TUI. A message you take back from the queue, put back after an
-orchestrator switch, or take as a suggestion comes back escaped this way when it starts the
-box, so Send sends it as a message again, never as a command. When the box already holds a
+begins with `!`, as in the TUI. A message you take back from the queue, move back from the
+device's saved messages, put back after an orchestrator switch, or take as a suggestion
+comes back escaped this way when it starts the box, so Send sends it as a message again,
+never as a command. After text already in the box it comes back unescaped, as it was sent:
+Send reads `//` and `\!` only at the start of the box. When the box already holds a
 `/` command or a `!` line, that line is escaped too, so Send sends both as one message
 rather than running the command and clearing the text that came back.
 
@@ -265,8 +267,10 @@ every column. Esc or **Cancel** closes the picker with nothing changed and
 puts the focus back in the message box; so does a click outside, leaving the focus where you
 clicked. Esc works wherever the focus is in the picker, **Done** and **Cancel** too. On a
 `pty` thread there is no search: the focus starts on its runtime in the rail and follows the
-highlight, so ↑, ↓ and Enter pick another runtime. On a phone the picker is a sheet
-at the bottom of the screen, its columns stacked, every row a full-size touch target.
+highlight, so ↑, ↓ and Enter pick another runtime. In a narrow window the columns narrow
+to fit the message box and each scrolls its own rows. On a phone the picker is a sheet
+at the bottom of the screen, its columns stacked at their full height, which the sheet
+scrolls through, every row a full-size touch target.
 
 Only what changed is sent. For a thread on its own runtime that is `thread.set_model` with
 the model, the effort, or both; picking the runtime's default sends `default`. Another
@@ -324,7 +328,8 @@ each as threads do (`Claude:work`). Before any session has reported usage, it sa
 - **`/usage`** in the message box opens the limits in a panel above it. Close it with its ✕
   or Escape.
 - **The gauge** in the conversation's header, beside the read-aloud and tool-call buttons,
-  opens them in a popover. On a phone, **Usage limits** in the conversation's menu opens the
+  opens them in a popover under the header's right edge, kept inside the conversation however
+  narrow the window. On a phone, **Usage limits** in the conversation's menu opens the
   panel.
 - **The Usage page** in the side navigation shows them in full, with the usage by thread,
   project or runtime. The panel and the popover link to it.
