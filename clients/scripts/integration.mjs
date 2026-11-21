@@ -1,5 +1,6 @@
 // Real Electron + real Rust hub + twr's deterministic test adapter. No provider account,
 // user's config, network agent, or existing workspace is touched.
+import { floatTestWindow } from "./hyprland-window.mjs";
 import { performanceAudit } from "./performance.mjs";
 import { stopFixture } from "./fixture-cleanup.mjs";
 import { _electron as electron, chromium } from "@playwright/test";
@@ -229,6 +230,7 @@ try {
       timeout: 60000,
     });
   applicationProcess = packagedProcess || application.process();
+  await floatTestWindow(applicationProcess.pid);
   const page = await application.firstWindow();
   page.on("pageerror", (error) => errors.push(error.message));
   await page
@@ -465,11 +467,11 @@ try {
   await deny.click();
   await longRequest.waitFor({ state: "hidden" });
   await page.setViewportSize(fullViewport);
-  const showSidebar = page.getByRole("button", {
-    name: "Show sidebar",
-    exact: true,
-  });
-  if (await showSidebar.isVisible()) await showSidebar.click();
+  // Widening the window brings back the sidebar the wide layout had (a tiling window
+  // manager narrows and widens a window as others open and close beside it).
+  await page
+    .getByRole("button", { name: "Hide sidebar", exact: true })
+    .waitFor({ timeout: 5000 });
   console.log(
     "PASS: long inline requests preserve a visible composer in narrow windows",
   );
@@ -878,11 +880,9 @@ try {
       );
   }
   await page.setViewportSize(fullViewport);
-  const sidebarBack = page.getByRole("button", {
-    name: "Show sidebar",
-    exact: true,
-  });
-  if (await sidebarBack.isVisible()) await sidebarBack.click();
+  await page
+    .getByRole("button", { name: "Hide sidebar", exact: true })
+    .waitFor({ timeout: 5000 });
   await page
     .getByRole("button", { name: "Settings", exact: true })
     .first()

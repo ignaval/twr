@@ -47,7 +47,7 @@ export function AppOptions() {
           detail={
             settings.tray.available
               ? "Shows how many items need you, with quick links to them."
-              : "No system tray was found. On Omarchy, Waybar's tray module provides one; on GNOME, the AppIndicator extension."
+              : "No system tray was found. On Omarchy, the bar's tray provides one; on GNOME, the AppIndicator extension."
           }
           checked={settings.tray.enabled && settings.tray.available}
           disabled={!settings.tray.available}

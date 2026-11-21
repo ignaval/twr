@@ -16,6 +16,7 @@
 // those stock themes. Writes test-results/omarchy-qa.json,
 // test-results/omarchy-themes.json and test-results/omarchy-themes/ (a screenshot of each
 // theme, one taken right after each switch, and every measured pair).
+import { floatTestWindow } from "./hyprland-window.mjs";
 import { _electron as electron, expect } from "@playwright/test";
 import { stopFixture } from "./fixture-cleanup.mjs";
 import { auditScreen, focusRing, shortfalls } from "./omarchy-audit.mjs";
@@ -1100,6 +1101,7 @@ try {
     colorScheme: null,
     timeout: 60000,
   });
+  await floatTestWindow(application.process().pid);
   for (const stream of [
     application.process().stdout,
     application.process().stderr,

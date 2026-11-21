@@ -329,6 +329,14 @@ fn start_hub(home: &Path) -> HubProc {
     start_hub_with(home, &[])
 }
 
+/// Waits for the hub's first `hub.info`, which waits for the hub's build id (the SHA-256 of
+/// the whole executable, hashed as it starts): over a second for a debug build on a CPU
+/// without SHA instructions. A test that gives a command a one-second deadline for its own
+/// `hub.info` calls this first, so the deadline measures what the test is about.
+fn warm_info(home: &Path) {
+    ok(home, &["info"]);
+}
+
 /// [`start_hub`] with `env` added to the hub's environment.
 fn start_hub_with(home: &Path, env: &[(&str, &str)]) -> HubProc {
     let log = std::fs::File::create(home.join("hub-test.log")).unwrap();
@@ -1737,6 +1745,7 @@ fn hub_stop_timeout_reports_a_runtime_still_shutting_down() {
     let project = home.join("proj");
     std::fs::create_dir(&project).unwrap();
     let mut hub = start_hub(home);
+    warm_info(home);
     let script = home.join("ignore-hup.sh");
     std::fs::write(
         &script,
@@ -2118,6 +2127,7 @@ fn update_reinstalls_the_running_executable() {
 
     // The real installer replaces bin/twr; the running hub is named as still on the old version.
     let _hub = start_hub(&home);
+    warm_info(&home);
     let out = update(&bin.join("twr"), &real);
     let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
     assert!(out.status.success(), "{stdout}\n{stderr}");

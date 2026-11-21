@@ -258,7 +258,7 @@ export class AppServices {
         "tray",
         "No StatusNotifier host yet; checking again while the session starts.",
       );
-      // At login, uwsm can start twr before Waybar registers its tray.
+      // At login, uwsm can start twr before the bar (the Omarchy shell, Waybar) registers its tray.
       void this.waitForTray();
     }
     this.applyTray();

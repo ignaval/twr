@@ -87,7 +87,7 @@ twr say "create a thread for ~/code/web and make the footer links relative"
 
 `say` routes a message in this order. `@api ...` or `on api, ...` goes to that thread. If there is only one worker, it goes there. `new <project>: ...` starts a thread. Anything else goes to the orchestrator. With no orchestrator runtime, the hub asks you which thread should get it, on a `twr asks` card.
 
-In the TUI, a typed line goes through `say` too. Start it with `>` to send it to the focused thread.
+The TUI doesn't route what you type: a line goes to the orchestrator, or, while you talk to a thread (`Enter` twice on its card, or `/open <thread>`), to that thread ([tui.md](tui.md#talking-to-a-worker-directly)).
 
 ## Wait for threads
 

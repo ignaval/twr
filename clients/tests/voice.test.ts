@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
 import {
   PAUSE_MS,
   VAD_DEFAULTS,
@@ -474,11 +474,12 @@ describe("desktop voice host", async () => {
   });
   it("downloads the speech model once with `twr voice setup`, then reports it ready", async () => {
     const { DesktopVoice } = await import("../desktop/voice");
-    const { mkdtempSync, writeFileSync, chmodSync, readFileSync } =
+    const { mkdtempSync, writeFileSync, chmodSync, readFileSync, rmSync } =
       await import("node:fs");
     const { join } = await import("node:path");
     const { tmpdir } = await import("node:os");
     const dir = mkdtempSync(join(tmpdir(), "twr-voice-"));
+    onTestFinished(() => rmSync(dir, { recursive: true, force: true }));
     const log = join(dir, "log");
     const model = join(dir, "model");
     const twr = join(dir, "twr");

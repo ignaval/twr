@@ -268,6 +268,38 @@ function measure({ screen, focusOnly }) {
   return { text, fields, focus };
 }
 
+/** Waits two frames and for the transitions and finite animations on screen to end, at
+ * most 3 s: an infinite animation (a spinner, a working dot) never ends, and a window the
+ * compositor isn't presenting (a locked session) can hold its frames back. */
+const settle = async (page) => {
+  const late = await page.evaluate(async () => {
+    let frames = 0;
+    const ended = new Promise((done) =>
+      requestAnimationFrame(() => requestAnimationFrame(done)),
+    ).then(() => {
+      frames = 2;
+      return Promise.all(
+        document
+          .getAnimations()
+          .filter((a) => a.effect?.getTiming().iterations !== Infinity)
+          .map((a) => a.finished.catch(() => {})),
+      );
+    });
+    const done = await Promise.race([
+      ended.then(() => true),
+      new Promise((resolve) => setTimeout(() => resolve(false), 3000)),
+    ]);
+    if (done) return null;
+    return frames < 2
+      ? "no animation frame"
+      : document
+          .getAnimations()
+          .map((a) => a.animationName || a.transitionProperty)
+          .join(", ");
+  });
+  if (late) console.log(`NOTE settle gave up after 3 s: ${late}`);
+};
+
 /** Every text and field pair on screen now, once transitions have ended and a request's
  * options on screen answer (they are dimmed for their first 600 ms). */
 export async function auditScreen(page, screen) {
@@ -281,27 +313,13 @@ export async function auditScreen(page, screen) {
       { timeout: 5000 },
     )
     .catch(() => {});
-  await page.evaluate(async () => {
-    await new Promise((done) =>
-      requestAnimationFrame(() => requestAnimationFrame(done)),
-    );
-    await Promise.all(
-      document.getAnimations().map((a) => a.finished.catch(() => {})),
-    );
-  });
+  await settle(page);
   return page.evaluate(measure, { screen, focusOnly: false });
 }
 
 /** The ring of the focused element (after a keyboard move, so :focus-visible applies). */
 export async function focusRing(page, screen) {
-  await page.evaluate(async () => {
-    await new Promise((done) =>
-      requestAnimationFrame(() => requestAnimationFrame(done)),
-    );
-    await Promise.all(
-      document.getAnimations().map((a) => a.finished.catch(() => {})),
-    );
-  });
+  await settle(page);
   return (await page.evaluate(measure, { screen, focusOnly: true })).focus;
 }
 
