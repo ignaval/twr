@@ -1,0 +1,233 @@
+/* Settings' tabs and rows, the merged Manage pages, and the "⋯" menu. */
+
+.settings-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  margin-bottom: 24px;
+  max-width: 100%;
+  width: fit-content;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--raised);
+}
+.settings-tabs > [role="tab"] {
+  flex: none;
+  background: none;
+  border: 1px solid transparent;
+  padding: 6px 14px;
+  min-height: 32px;
+  font-size: 1rem;
+  color: var(--muted);
+}
+.settings-tabs > [role="tab"]:hover {
+  color: var(--text);
+}
+.settings-tabs > [role="tab"][aria-selected="true"] {
+  background: var(--overlay);
+  border-color: var(--field-border);
+  color: var(--text);
+}
+[data-mobile="true"] .settings-tabs > [role="tab"] {
+  padding-inline: 10px;
+}
+
+.settings-section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+/* A setting with a select or a text field: name and hint, the control, then its status. */
+.setting-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(140px, 260px);
+  column-gap: 12px;
+  align-items: center;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+.setting-field > label {
+  font-size: 1rem;
+}
+.setting-field small {
+  display: block;
+  margin-top: 4px;
+  font-size: 0.923077rem;
+  color: var(--muted);
+}
+.setting-field select,
+.setting-field input[type="text"] {
+  width: 100%;
+  min-width: 0;
+  font-size: 0.923077rem;
+  padding: 8px;
+}
+.setting-text {
+  min-width: 0;
+}
+.setting-feedback {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px 12px;
+  font-size: 0.923077rem;
+}
+.setting-feedback > [role="status"] {
+  color: var(--success);
+}
+.setting-feedback > [role="status"]:not(:empty),
+.setting-feedback > .setting-note {
+  margin-top: 6px;
+}
+.setting-feedback .setting-note {
+  display: inline;
+  margin: 6px 0 0;
+  color: var(--muted);
+}
+.app-option > .setting-feedback {
+  margin-top: -6px;
+}
+.setting-advanced {
+  margin-top: 16px;
+}
+.setting-advanced > summary {
+  cursor: pointer;
+  color: var(--muted);
+  padding: 8px 0;
+}
+.setting-advanced[open] > summary {
+  color: var(--text);
+}
+@media (max-width: 520px) {
+  .setting-field {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 8px;
+  }
+}
+
+/* Layout & text's size pickers. */
+.layout-size {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.layout-size > select {
+  margin-inline-start: auto;
+}
+
+/* Settings › Agents › Orchestrator: runtime and model side by side, then Apply. */
+.orchestrator-pick {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+}
+.orchestrator-pick > .field {
+  flex: 1 1 180px;
+  min-width: 0;
+}
+.orchestrator-pick select,
+.orchestrator-pick input {
+  width: 100%;
+}
+.orchestrator-settings > p[role="status"]:empty {
+  display: none;
+}
+
+/* Settings › Voice › Speakers. */
+.speaker-card .card-actions {
+  margin-top: 12px;
+}
+.speaker-card .card-actions svg {
+  vertical-align: -2px;
+}
+.speaker-card > .app-option,
+.speaker-card > .setting-field {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.config-file {
+  margin-top: 16px;
+}
+
+/* Merged Manage pages: a part per heading. */
+.manage-part {
+  margin-bottom: 32px;
+}
+.manage-part > h2 {
+  font-size: 1.153846rem;
+  scroll-margin-top: 16px;
+}
+.manage-part > h2:focus {
+  outline: none;
+}
+.manage-part > h2:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+.manage-part > .manager-actions {
+  margin-top: 12px;
+}
+
+/* The "⋯" menu of a card's other actions. */
+.menu-button {
+  position: relative;
+  display: inline-flex;
+}
+.menu-popup {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 190px;
+  max-width: min(280px, calc(100vw - 32px));
+  padding: 4px;
+  background: var(--overlay);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: var(--shadow-pop);
+}
+.menu-popup > [role="menuitem"] {
+  justify-content: flex-start;
+  text-align: start;
+  background: none;
+  border: 0;
+  padding: 8px 10px;
+  font-size: 0.923077rem;
+}
+.menu-popup > [role="menuitem"]:hover,
+.menu-popup > [role="menuitem"]:focus-visible {
+  background: var(--active);
+}
+
+/* Loop settings: the preset first, the rest behind Customize. */
+.loop-customize-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+.loop-customize-summary {
+  color: var(--muted);
+  font-size: 0.923077rem;
+}
+.loop-customize {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.loop-customize[hidden] {
+  display: none;
+}
+.offline-details {
+  margin-bottom: 12px;
+}

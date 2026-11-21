@@ -85,7 +85,7 @@ A phone can't run `twr speak`, so the gateway runs a speaker for it on the hub's
 
 ### Voices
 
-**Settings › Read-aloud voice** picks the voice of the phone's speaker for English and for
+**Settings › Voice › Read-aloud voice** picks the voice of the phone's speaker for English and for
 Spanish; each reply is read with the voice of its language:
 
 - **The phone's own voices.** iOS lists its voices, Premium and Enhanced first (download more in

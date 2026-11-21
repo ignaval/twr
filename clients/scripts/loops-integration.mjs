@@ -199,6 +199,17 @@ const twr = (...args) =>
   });
 const twrJson = (...args) => JSON.parse(twr(...args, "--json"));
 const thread = (name) => twrJson("thread", "list").find((t) => t.name === name);
+/** Unfolds a loop settings editor's Customize, the controls past the preset (folded when
+ * its settings are a preset's), once the editor in `scope` has loaded. */
+async function customize(scope) {
+  await scope.locator("fieldset.loop-editor").first().waitFor();
+  const toggle = scope.locator(".loop-customize-toggle");
+  if (
+    (await toggle.count()) &&
+    (await toggle.getAttribute("aria-expanded")) === "false"
+  )
+    await toggle.click();
+}
 async function until(check, message, ms = 30000) {
   const deadline = Date.now() + ms;
   for (;;) {
@@ -860,6 +871,7 @@ try {
   const editor = page.getByRole("dialog", { name: "Loop settings · api" });
   await editor.waitFor();
   await editor.getByText("Loading loop settings…").waitFor({ state: "hidden" });
+  await customize(editor);
   const presets = editor.getByRole("group", { name: "Preset" });
   assert.equal(await presets.getByRole("button").count(), 4);
   const field = (name, group) =>
@@ -875,7 +887,7 @@ try {
         document.getElementById(n.getAttribute("aria-describedby"))
           ?.textContent || "",
     ),
-    /^A named implementer runs on the thread's own runtime/,
+    /^Choose a model, or let each thread use its own\./,
   );
   await field("Runtime", "Reviewer").waitFor();
   await field("Model", "Reviewer").waitFor();
@@ -892,6 +904,7 @@ try {
   await page.keyboard.press("Enter");
   await editor.waitFor();
   await editor.getByText("Loading loop settings…").waitFor({ state: "hidden" });
+  await customize(editor);
   // A preset names the implementer: its model and effort pickers and its workers show.
   await presets.getByRole("button").first().click();
   assert.equal(
@@ -1306,6 +1319,7 @@ try {
   await projectEditor
     .getByText("Loading loop settings…")
     .waitFor({ state: "hidden" });
+  await customize(projectEditor);
   await projectEditor
     .getByRole("group", { name: "Save for" })
     .getByRole("button", { name: "demo only" })
@@ -1342,6 +1356,7 @@ try {
     .getByRole("button", { name: "Settings", exact: true })
     .first()
     .click();
+  await page.getByRole("tab", { name: "Loops", exact: true }).click();
   const panel = page
     .locator(".settings-section")
     .filter({ has: page.getByRole("heading", { name: "Loops", exact: true }) });
@@ -1357,6 +1372,7 @@ try {
   });
   await projects.getByRole("button", { name: "Open" }).click();
   await panel.getByRole("heading", { name: "demo's settings" }).waitFor();
+  await customize(panel);
   await panel
     .getByRole("combobox", { name: "Profile", exact: true })
     .selectOption("high");
@@ -1934,6 +1950,7 @@ try {
   await sweepEditor
     .getByText("Loading loop settings…")
     .waitFor({ state: "hidden" });
+  await customize(sweepEditor);
   const sweepField = sweepEditor.getByRole("combobox", {
     name: "Sweep",
     exact: true,
@@ -2382,6 +2399,7 @@ exit 1
   await boxEditor
     .getByText("Loading loop settings…")
     .waitFor({ state: "hidden" });
+  await customize(boxEditor);
   await boxEditor
     .getByText("Runtimes as found on box lab: its reviewer runs there.")
     .waitFor();
@@ -2818,6 +2836,7 @@ exit 1
   await acpEditor
     .getByText("Loading loop settings…")
     .waitFor({ state: "hidden" });
+  await customize(acpEditor);
   const cardReviewer = await pickers(acpEditor, "The card's editor");
   await cardReviewer.focus();
   await cardReviewer.selectOption("ex");
@@ -2907,10 +2926,12 @@ exit 1
     .getByRole("button", { name: "Settings", exact: true })
     .first()
     .click();
+  await page.getByRole("tab", { name: "Loops", exact: true }).click();
   const loopsPanel = page
     .locator(".settings-section")
     .filter({ has: page.getByRole("heading", { name: "Loops", exact: true }) });
   await loopsPanel.waitFor();
+  await customize(loopsPanel);
   await loopsPanel
     .getByRole("group", { name: "Reviewer" })
     .waitFor({ timeout: 15000 });
@@ -2930,6 +2951,7 @@ exit 1
   await demoEditor
     .getByText("Loading loop settings…")
     .waitFor({ state: "hidden" });
+  await customize(demoEditor);
   await pickers(demoEditor, "A project's editor");
   await capture("54-acp-project", demoEditor, { narrow: false });
   await page.keyboard.press("Escape");

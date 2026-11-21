@@ -50,7 +50,8 @@ export function VoicePicker({
   const install = model ? installs[model.name] : undefined;
   const downloading =
     install?.phase === "downloading" || install?.phase === "installing";
-  const hint = chosenId ? undefined : suggestion(listing, lang);
+  // The best voice for the language, marked in the list.
+  const hint = suggestion(listing, lang);
   const label = voiceLanguageLabels[lang];
   const id = `read-aloud-voice-${lang}`;
   const playing =
@@ -80,6 +81,7 @@ export function VoicePicker({
                     ? ""
                     : ` · ${qualityLabel[v.quality]}`}
                   {v.network ? " · online" : ""}
+                  {hint?.voice.id === v.id ? " (recommended)" : ""}
                 </option>
               ))}
             </optgroup>
@@ -93,6 +95,7 @@ export function VoicePicker({
                     {v.name}
                     {m && !m.installed ? ` · download ${m.size}` : ""}
                     {m?.fast === false ? " · slow there" : ""}
+                    {hint?.voice.id === v.id ? " (recommended)" : ""}
                   </option>
                 );
               })}
@@ -136,17 +139,6 @@ export function VoicePicker({
           onClick={() => onDownload(model)}
         >
           Download {model.title} · {model.size}
-        </button>
-      ) : null}
-      {hint ? (
-        <button
-          type="button"
-          disabled={disabled}
-          onClick={() => onChoose(hint.voice.id)}
-        >
-          {hint.download
-            ? `Suggested: ${hint.voice.name} (download ${hint.download.size})`
-            : `Suggested: ${hint.voice.name}`}
         </button>
       ) : null}
     </div>

@@ -766,6 +766,9 @@ export async function loopQA(driver, fixture, options) {
   await run.until("async (a, lq) => !!lq.find('[role=dialog] .loop-presets')");
   const editor = await run.ev(`async (a, lq) => {
     const d = [...document.querySelectorAll('[role=dialog]')].at(-1);
+    // The controls past the preset sit behind Customize.
+    for (const b of d.querySelectorAll('.loop-customize-toggle[aria-expanded=false]')) b.click();
+    await lq.settle();
     const presets = lq.all('.loop-presets button', d).map((b) => ({ name: lq.nameOf(b), pressed: b.getAttribute('aria-pressed') }));
     const group = d.querySelector('.loop-presets')?.getAttribute('role');
     const fields = lq.all('label.field > span:first-child, .field > span:first-child, .loop-editor-heading', d).map(lq.text);
@@ -1978,6 +1981,7 @@ export async function revokeInApp(driver) {
 async function openSettingsLoops(run) {
   await run.tab("More");
   await run.tap("#twr-sidebar button, .sidebar button", { re: "^Settings" });
+  await run.tap("[role=tab]", "Loops");
   await run.until(
     "async (a, lq) => !!lq.all('.settings-section h2').find((h) => lq.text(h) === 'Loops')",
     {},
@@ -2352,6 +2356,9 @@ const LOOPS = `async (a, lq) => {
  * (the top dialog, or Settings › Loops). */
 const PICKERS = `async (a, lq) => {
   const root = a.root === 'dialog' ? [...document.querySelectorAll('[role=dialog]')].at(-1) : lq.all('.settings-section').find((s) => lq.text(s.querySelector('h2')) === 'Loops');
+  if (!root) return false;
+  for (const b of root.querySelectorAll('.loop-customize-toggle[aria-expanded=false]')) b.click();
+  await lq.settle();
   const group = [...root.querySelectorAll('.loop-editor-group')].find((g) => lq.text(g.querySelector('.loop-editor-heading')) === 'Reviewer');
   if (!group) return false;
   const [runtime, model] = group.querySelectorAll('select');

@@ -347,7 +347,8 @@ final class RemoteHubTests: XCTestCase {
           const visible=e=>e.getClientRects().length>0;
           const settings=()=>[...document.querySelectorAll('button')].find(e=>visible(e)&&e.textContent.trim()==='Settings');
           if(!settings())[...document.querySelectorAll('.mobile-tabs button')].find(e=>visible(e)&&e.textContent==='More')?.click();
-          await new Promise(r=>setTimeout(r,300));settings().click();return true;
+          await new Promise(r=>setTimeout(r,300));settings().click();
+          await new Promise(r=>setTimeout(r,300));[...document.querySelectorAll('[role=tab]')].find(e=>e.textContent==='Agents')?.click();return true;
           """)
         let group = "document.querySelector('.orchestrator-access [role=group]')"
         let pressed = "[...\(group).querySelectorAll('button')].find(e=>e.getAttribute('aria-pressed')==='true')?.textContent"

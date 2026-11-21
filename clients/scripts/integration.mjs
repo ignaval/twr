@@ -756,19 +756,18 @@ try {
     .getByRole("button", { name: "Settings", exact: true })
     .first()
     .click();
-  const suggestionSetting = page.getByRole("checkbox", {
+  // Settings › Agents › New thread defaults: a switch saves as it changes.
+  await page.getByRole("tab", { name: "Agents", exact: true }).click();
+  const suggestionSetting = page.getByRole("switch", {
     name: "Suggest next messages",
     exact: true,
   });
   await suggestionSetting.uncheck();
-  const suggestionRow = page
-    .locator(".setting-row")
-    .filter({ has: suggestionSetting });
-  await suggestionRow
-    .getByRole("button", { name: "Save", exact: true })
-    .click();
-  await suggestionRow
-    .getByRole("button", { name: "Saved", exact: true })
+  await page
+    .locator(".app-option")
+    .filter({ has: suggestionSetting })
+    .getByRole("status")
+    .filter({ hasText: "Saved" })
     .waitFor();
   await page
     .locator(".thread-list .thread-card")
@@ -793,8 +792,9 @@ try {
     .getByRole("button", { name: "Settings", exact: true })
     .first()
     .click();
-  const interfaceText = page.getByRole("slider", { name: "Interface text" });
-  await interfaceText.fill("22");
+  await page.getByRole("tab", { name: "General", exact: true }).click();
+  const interfaceText = page.getByRole("combobox", { name: "Interface text" });
+  await interfaceText.selectOption({ label: "Extra large" });
   await page.waitForFunction(
     () =>
       getComputedStyle(document.documentElement)
@@ -890,7 +890,7 @@ try {
     .getByRole("button", { name: "Settings", exact: true })
     .first()
     .click();
-  await interfaceText.fill("13");
+  await interfaceText.selectOption({ label: "Default" });
   await page
     .locator(".thread-list .thread-card")
     .filter({ hasText: "api" })

@@ -32,11 +32,17 @@ export function OfflineOptions() {
     <section className="settings-section">
       <h2>Offline history</h2>
       <p>
-        Recent conversations and message drafts are encrypted on this device.
-        History expires after seven days. Saved messages retry with their
-        original IDs for up to 23 hours; uncertain delivery always needs your
-        review. Permission answers require a live request.
+        Recent conversations and drafts are kept encrypted on this device for
+        seven days.
       </p>
+      <details className="offline-details">
+        <summary>How messages sent offline work</summary>
+        <p className="muted">
+          Saved messages retry with their original IDs for up to 23 hours; if
+          delivery is uncertain, you review them. Permission answers need a live
+          request.
+        </p>
+      </details>
       {error && (
         <>
           <p role="status">{error}</p>
