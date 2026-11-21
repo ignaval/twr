@@ -2266,6 +2266,18 @@ describe("usage limits", () => {
     expect(app().find(".usage-cards").textContent).toContain("20% left");
   });
 
+  it("closes the popover with Esc from the gauge too", async () => {
+    const gauge = app().find(
+      '.conversation-actions button[aria-label="Usage limits"]',
+    );
+    await app().click(gauge);
+    expect(app().all(".usage-popover")).toHaveLength(1);
+    // Shift-Tab from the popover lands on the gauge, which the focus check leaves alone.
+    await app().act(async () => void press(gauge, "Escape"));
+    expect(app().all(".usage-popover")).toHaveLength(0);
+    expect(gauge.getAttribute("aria-expanded")).toBe("false");
+  });
+
   it("closes the popover when the focus moves outside it", async () => {
     const gauge = app().find(
       '.conversation-actions button[aria-label="Usage limits"]',

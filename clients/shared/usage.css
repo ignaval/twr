@@ -127,11 +127,15 @@
   text-decoration: underline;
 }
 
-/* `/usage`: a dismissible panel above the message box. */
+/* `/usage`: a dismissible panel above the message box. It gives way before the message box
+ * does: in a short window (a phone with its keyboard open) it shrinks, its rows scrolling
+ * inside it, so Send stays on screen. */
 .usage-panel {
   display: grid;
+  align-content: start;
   gap: 12px;
-  flex-shrink: 0;
+  flex-shrink: 1;
+  min-height: 0;
   width: calc(100% - 48px);
   max-width: var(--content-width);
   max-height: min(320px, 40vh);

@@ -322,7 +322,18 @@ export function UsageButton({
     opener.current?.focus();
   };
   return (
-    <div className="usage-popover-anchor">
+    <div
+      className="usage-popover-anchor"
+      // Esc closes it from the gauge too: Shift-Tab from the popover lands there, and the
+      // focus check leaves the gauge out (a click on it toggles the popover).
+      onKeyDown={(event) => {
+        if (open && event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          close();
+        }
+      }}
+    >
       <button
         type="button"
         ref={opener}
@@ -345,13 +356,6 @@ export function UsageButton({
           role="dialog"
           aria-label="Usage limits"
           tabIndex={-1}
-          onKeyDown={(event) => {
-            if (event.key === "Escape") {
-              event.preventDefault();
-              event.stopPropagation();
-              close();
-            }
-          }}
         >
           <h2>Usage limits</h2>
           <UsageBody

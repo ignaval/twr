@@ -341,10 +341,13 @@ each as threads do (`Claude:work`; a native login that shares its name with a na
 says `(native login)`). Before any session has reported usage, it says so.
 
 - **`/usage`** in the message box opens the limits in a panel above it. Close it with its ✕
-  or Escape.
+  or Escape. In a short window the panel gives way before the message box: it shrinks and
+  its rows scroll inside it, so Send stays on screen. On a phone with very little height
+  left (300 points or less, the keyboard open) it steps aside while you type and comes back
+  when the keyboard closes.
 - **The gauge** in the conversation's header, beside the read-aloud and tool-call buttons,
   opens them in a popover under the header's right edge, kept inside the conversation however
-  narrow the window. Escape, a click outside it or the focus leaving it closes it. On a phone, **Usage limits** in the conversation's menu opens the
+  narrow the window. Escape (in the popover or on the gauge), a click outside it or the focus leaving it closes it. On a phone, **Usage limits** in the conversation's menu opens the
   panel.
 - **The Usage page** in the side navigation shows them in full, with the usage by thread,
   project or runtime. The panel and the popover link to it.

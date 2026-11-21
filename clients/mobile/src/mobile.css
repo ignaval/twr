@@ -742,6 +742,12 @@ select {
 :root[data-mobile="true"].short-content .latest-user-message {
   display: none;
 }
+/* The `/usage` panel shrinks before the message box (shared/usage.css), down to its padding:
+   in a tiny viewport with the keyboard open even that would push the message box down, so
+   the panel steps aside while you type and comes back when the keyboard closes. */
+:root[data-mobile="true"].tiny-content[data-keyboard="true"] .usage-panel {
+  display: none;
+}
 :root[data-mobile="true"].tiny-content .toast {
   top: calc(max(env(safe-area-inset-top), var(--occlusion-top, 0px)) + 8px);
   max-height: 44px;
@@ -987,6 +993,11 @@ select {
 [data-mobile="true"] .composer-attachments > ul {
   max-height: clamp(52px, calc(var(--viewport-height, 100dvh) - 220px), 128px);
   padding: 8px 8px 0;
+}
+/* With the `/usage` panel open, the panel's least height (its padding and margin, 34
+   points) comes off the strip's room too. */
+:root[data-mobile="true"]:has(.usage-panel) .composer-attachments > ul {
+  max-height: clamp(52px, calc(var(--viewport-height, 100dvh) - 254px), 128px);
 }
 [data-mobile="true"] .attachment-remove {
   width: 44px;

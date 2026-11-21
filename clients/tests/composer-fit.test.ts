@@ -174,9 +174,45 @@ describe("where the attachment strip stops growing", () => {
       /max-height: clamp\(\s*52px,\s*calc\(var\(--viewport-height, 100dvh\) - 220px\),\s*128px\s*\)/,
     );
   });
+  it("leaves room for the /usage panel's least height on a phone", () => {
+    expect(
+      rule(
+        mobile,
+        ':root[data-mobile="true"]:has(.usage-panel) .composer-attachments > ul',
+      ),
+    ).toMatch(
+      /max-height: clamp\(\s*52px,\s*calc\(var\(--viewport-height, 100dvh\) - 254px\),\s*128px\s*\)/,
+    );
+  });
   it("gives it what the window leaves on a computer, at least one row of chips", () => {
     expect(rule(attachments, ".composer-attachments > ul")).toMatch(
       /max-height: clamp\(44px, calc\(100dvh - 440px\), 168px\)/,
     );
+  });
+});
+
+/* `/usage` opens a panel above the message box: it gives way before the message box does,
+ * so Send stays on screen in a short window (measured in a browser: a phone at 390×250 to
+ * 390×844 and 844×200, with eight files attached and the keyboard open). */
+describe("the /usage panel in a short window", () => {
+  const usage = readFileSync(join(root, "shared/usage.css"), "utf8");
+  const mobile = readFileSync(join(root, "mobile/src/mobile.css"), "utf8");
+  const rule = (css: string, selector: string) => {
+    const at = css.lastIndexOf(selector + " {");
+    return css.slice(at, css.indexOf("}", at));
+  };
+  it("shrinks, its rows scrolling inside it, instead of holding its height", () => {
+    const panel = rule(usage, ".usage-panel");
+    expect(panel).toMatch(/flex-shrink: 1;/);
+    expect(panel).toMatch(/min-height: 0;/);
+    expect(panel).toMatch(/overflow-y: auto;/);
+  });
+  it("steps aside while you type in a tiny phone viewport", () => {
+    expect(
+      rule(
+        mobile,
+        ':root[data-mobile="true"].tiny-content[data-keyboard="true"] .usage-panel',
+      ),
+    ).toMatch(/display: none;/);
   });
 });
