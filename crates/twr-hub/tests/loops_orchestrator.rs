@@ -1160,8 +1160,27 @@ async fn the_orchestrator_runs_one_review_pass_in_the_thread_itself() {
         text.contains("## Single pass") && !text.contains("## Sweep"),
         "{text}"
     );
-    // No review again before the thread has done more work: the hub refuses the
-    // orchestrator's (a standing review rule fired by the pass's own report), not the user's.
+    // On a notice (a standing review rule fired by the pass's own report), no review again
+    // before the thread has done more work: the hub refuses the orchestrator's.
+    let o = hub.orchestrator_thread().unwrap();
+    until(&hub, "the orchestrator's notice turn to end", |h| {
+        h.thread_view(&o).unwrap().current_turn.is_none()
+    })
+    .await;
+    let next = hub.thread_view(&o).unwrap().turns + 1;
+    let mut notice = TurnStarted {
+        prompt: "[twr notice] watch=w1 repeat=true".into(),
+        ..Default::default()
+    };
+    notice.ext = Some(serde_json::from_value(json!({"twr": {"notice": true}})).unwrap());
+    hub.append(
+        &o,
+        Some(next),
+        Source::Hub,
+        EventBody::TurnStarted(notice),
+        None,
+    )
+    .unwrap();
     let e = request(&hub, &t, json!({"once": true}), &orch())
         .await
         .unwrap_err();
@@ -1171,6 +1190,20 @@ async fn the_orchestrator_runs_one_review_pass_in_the_thread_itself() {
         "{}",
         e.message
     );
+    hub.append(
+        &o,
+        Some(next),
+        Source::Hub,
+        EventBody::TurnEnded(TurnEnded::default()),
+        None,
+    )
+    .unwrap();
+    // A turn the user's message started ("review it again") is the user's request: it goes.
+    let again = request(&hub, &t, json!({"once": true}), &orch())
+        .await
+        .unwrap();
+    assert_eq!(again["status"], "started", "{again}");
+    ended(&hub, &t).await;
     // An implementation loop runs no single pass.
     let e = hub
         .loop_request(

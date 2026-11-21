@@ -2542,11 +2542,12 @@ impl Core {
             .apply(&base, kind)
             .map_err(|e| rpc(codes::BAD_REQUEST, e))?;
         let user = !caller.is_orchestrator();
-        // The orchestrator never reviews a thread again before it has done more work: a review
-        // whose report fired a standing review rule (one that fixed findings fires repeating
-        // watches, for rules like "send each finished branch on") would otherwise review that
-        // review, round after round. The user's own request is theirs.
-        if !user && kind == LoopKind::Review {
+        // On a hub notice (a fired watch), the orchestrator never reviews a thread again before
+        // it has done more work: a review whose report fired a standing review rule (one that
+        // fixed findings fires repeating watches, for rules like "send each finished branch
+        // on") would otherwise review that review, round after round. A turn the user's
+        // message started ("review it again") goes, as the user's own request does.
+        if !user && kind == LoopKind::Review && self.orch_in_notice_turn() {
             if let Some(last) = view
                 .last_loop
                 .as_ref()
@@ -2563,8 +2564,8 @@ impl Core {
                     return Err(rpc(
                         codes::CONFLICT,
                         format!(
-                            "{}'s work was reviewed and it has done nothing since: a new review \
-                             needs new work, or the user's own request",
+                            "{}'s work was reviewed and it has done nothing since: on a \
+                             notice, a new review needs new work; the user can still ask for one",
                             view.name
                         ),
                     ));

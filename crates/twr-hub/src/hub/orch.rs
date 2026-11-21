@@ -1420,6 +1420,11 @@ impl Inner {
 }
 
 impl Core {
+    /// Whether the orchestrator's running turn is one of the hub's notices (a fired watch, a
+    /// report), not a message of the user's.
+    pub(in crate::hub) fn orch_in_notice_turn(&self) -> bool {
+        self.orch.turn.as_ref().is_some_and(|t| t.notice)
+    }
     pub(super) fn command_mode_seen(&self, thread: &str, seen: u64) -> bool {
         self.orch
             .user_modes
