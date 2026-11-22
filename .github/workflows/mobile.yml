@@ -45,6 +45,12 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
+      # rust-cache deletes the files sherpa-onnx-sys downloaded into target/sherpa-onnx-prebuilt
+      # but keeps their directories, and its build script takes an existing lib/ directory
+      # for an extracted download: after a dependency change it linked against an empty one.
+      - name: Remove the emptied sherpa-onnx download
+        shell: bash
+        run: rm -rf target/sherpa-onnx-prebuilt
       - name: Build shared engine and mobile UI
         run: |
           cargo build --locked -p twr-cli -p twr-app

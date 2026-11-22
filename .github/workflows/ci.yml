@@ -78,6 +78,12 @@ jobs:
           rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy --no-self-update
           rustc --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # rust-cache deletes the files sherpa-onnx-sys downloaded into target/sherpa-onnx-prebuilt
+      # but keeps their directories, and its build script takes an existing lib/ directory
+      # for an extracted download: after a dependency change it linked against an empty one.
+      - name: Remove the emptied sherpa-onnx download
+        shell: bash
+        run: rm -rf target/sherpa-onnx-prebuilt
       - name: Install Git LFS (the LFS tests of twr-runner skip without it)
         shell: bash
         run: |
@@ -135,6 +141,12 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: twr-ps
+      # rust-cache deletes the files sherpa-onnx-sys downloaded into target/sherpa-onnx-prebuilt
+      # but keeps their directories, and its build script takes an existing lib/ directory
+      # for an extracted download: after a dependency change it linked against an empty one.
+      - name: Remove the emptied sherpa-onnx download
+        shell: bash
+        run: rm -rf target/sherpa-onnx-prebuilt
       - run: cargo test -p twr-runner --locked --no-fail-fast
 
   deny:
@@ -253,6 +265,12 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: real-systemd
+      # rust-cache deletes the files sherpa-onnx-sys downloaded into target/sherpa-onnx-prebuilt
+      # but keeps their directories, and its build script takes an existing lib/ directory
+      # for an extracted download: after a dependency change it linked against an empty one.
+      - name: Remove the emptied sherpa-onnx download
+        shell: bash
+        run: rm -rf target/sherpa-onnx-prebuilt
       - id: manager
         name: Start a systemd user manager
         shell: bash

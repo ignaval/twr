@@ -99,6 +99,12 @@ jobs:
           cache-dependency-path: clients/package-lock.json
       - if: ${{ !inputs.release }}
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # rust-cache deletes the files sherpa-onnx-sys downloaded into target/sherpa-onnx-prebuilt
+      # but keeps their directories, and its build script takes an existing lib/ directory
+      # for an extracted download: after a dependency change it linked against an empty one.
+      - name: Remove the emptied sherpa-onnx download
+        shell: bash
+        run: rm -rf target/sherpa-onnx-prebuilt
       - name: Install desktop dependencies
         working-directory: clients
         run: npm ci
@@ -254,6 +260,12 @@ jobs:
           cache-dependency-path: clients/package-lock.json
       - if: ${{ !inputs.release }}
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # rust-cache deletes the files sherpa-onnx-sys downloaded into target/sherpa-onnx-prebuilt
+      # but keeps their directories, and its build script takes an existing lib/ directory
+      # for an extracted download: after a dependency change it linked against an empty one.
+      - name: Remove the emptied sherpa-onnx download
+        shell: bash
+        run: rm -rf target/sherpa-onnx-prebuilt
       # For THIRD-PARTY-LICENSES.html (clients/scripts/notices.mjs), as in the Mac job.
       - name: Install cargo-about (release binary, checksum pinned)
         run: |
