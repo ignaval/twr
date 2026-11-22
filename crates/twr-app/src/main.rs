@@ -240,7 +240,13 @@ async fn run_call(
                 Value::Bool(v) => Scalar::Bool(*v),
                 Value::String(v) => Scalar::Str(v.clone()),
                 Value::Number(v) => Scalar::Int(v.as_i64().context("Setting must be an integer")?),
-                _ => anyhow::bail!("Setting must be a scalar"),
+                Value::Array(items) => Scalar::Strs(
+                    items
+                        .iter()
+                        .map(|v| v.as_str().map(str::to_owned).context("A list setting takes only strings"))
+                        .collect::<anyhow::Result<_>>()?,
+                ),
+                _ => anyhow::bail!("Setting must be a scalar or a list of strings"),
             };
             let table: Vec<&str> = table.iter().map(String::as_str).collect();
             twr_core::config_edit::write_key(&paths.config_file, &table, key, &value).map_err(anyhow::Error::msg)?;
@@ -259,7 +265,8 @@ async fn run_call(
                     "default_runtime":c.default_runtime,
                     "threads":{"default_mode":c.threads.default_mode,"worktree":c.threads.worktree,"model":c.threads.model,"thinking":c.threads.thinking,"idle_compaction":c.threads.idle_compaction},
                     "trash":{"keep_days":c.trash.keep_days},"log":{"retention_days":c.log.retention_days,"archive":c.log.archive},
-                    "stall_after_secs":c.stall_after_secs,"background_timeout_secs":c.background_timeout_secs,"tui":{"card_order":c.tui.card_order,"suggest":c.tui.suggest,"suggest_model":c.tui.suggest_model,"summaries":c.tui.summaries,"summary_every_secs":c.tui.summary_every().as_secs(),"summary_every":c.tui.summary_every_span}
+                    "stall_after_secs":c.stall_after_secs,"background_timeout_secs":c.background_timeout_secs,"wake_after_secs":c.wake_after_secs,"project_roots":c.project_roots,"default_project_roots":twr_core::config::DEFAULT_PROJECT_ROOTS,
+                    "orchestrator":{"autostart":c.orchestrator.autostart},"codex":{"auto":c.codex.auto},"tui":{"card_order":c.tui.card_order,"suggest":c.tui.suggest,"suggest_model":c.tui.suggest_model,"summaries":c.tui.summaries,"summary_every_secs":c.tui.summary_every().as_secs(),"summary_every":c.tui.summary_every_span}
                 })});
                 return Ok(json!({"content":content,"hash":hex::encode(Sha256::digest(content.as_bytes())),"path":paths.config_file,"settings":settings}));
             }

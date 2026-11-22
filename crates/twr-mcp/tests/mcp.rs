@@ -314,7 +314,9 @@ async fn conn(mock: Arc<Mock>, stream: UnixStream, n: usize) {
                     {"name": "work", "native": false, "dir": "/home/u/.twr/accounts/w"}]}} }),
             ),
             "attention.respond" | "attention.annotate" | "context.read" | "context.set"
-            | "thread.delete" | "config.show" => Ok(json!({ "ok": true, "method": req.method })),
+            | "thread.delete" | "config.show" | "config.set" => {
+                Ok(json!({ "ok": true, "method": req.method }))
+            }
             // As the hub answers the orchestrator (`hub::loops`).
             "loop.request" if p["thread"] == "api" => Ok(json!({
                 "status": "started", "thread": "T1", "thread_name": "api",
@@ -536,6 +538,7 @@ const TOOLS: &[&str] = &[
     "read_docs",
     "hub_info",
     "show_config",
+    "set_config",
     "list_project_files",
     "read_project_file",
     "search_project",
@@ -624,6 +627,14 @@ async fn hello_and_tool_list() {
     // No `quote` any more: the hub reads the user's message itself.
     assert_eq!(required("respond_attention"), ["attn_id"]);
     assert_eq!(required("annotate_attention"), ["attn_id", "note"]);
+    assert_eq!(props("set_config"), ["key", "value"]);
+    assert_eq!(required("set_config"), ["key", "value"]);
+    // A scalar only: a boolean, an integer, a number or a string.
+    let value = schema("set_config").to_string();
+    for t in ["boolean", "integer", "number", "string"] {
+        assert!(value.contains(&format!("\"{t}\"")), "{value}");
+    }
+    assert!(!value.contains("\"array\""), "{value}");
     assert_eq!(props("set_mode"), ["mode", "thread"]);
     assert_eq!(required("set_mode"), ["mode", "thread"]);
     // An account by name; never `outside_pin` (the orchestrator cannot leave a pin).
@@ -679,6 +690,22 @@ async fn hello_and_tool_list() {
     assert!(desc("respond_attention").contains(twr_mcp::RELAY_RULE));
     assert!(desc("annotate_attention").contains(twr_mcp::RELAY_RULE));
     assert!(desc("set_mode").contains(twr_mcp::MODE_RULE));
+    assert!(desc("set_config").contains(twr_mcp::CONFIG_RULE));
+    assert!(desc("set_config").contains("show_config"));
+    for want in [
+        "latest message",
+        "once per key",
+        "never change twr's config files any other way",
+        "needs_confirmation",
+        "confirm card",
+        "I've put that on a card for you to confirm.",
+        "never retry",
+        "secret",
+        "transcript",
+        "takes effect",
+    ] {
+        assert!(twr_mcp::CONFIG_RULE.contains(want), "{want:?}");
+    }
     assert!(instructions.contains("orchestrator system prompt"));
     // The rules: a short command is applied, anything else goes on the user's confirm card.
     for want in [
@@ -1107,6 +1134,30 @@ async fn each_tool_sends_the_expected_request() {
         ("hub_info", json!({}), vec![("hub.info", json!({}))]),
         ("show_config", json!({}), vec![("config.show", json!({}))]),
         (
+            "set_config",
+            json!({ "key": "tui.suggest", "value": false }),
+            vec![(
+                "config.set",
+                json!({ "key": "tui.suggest", "value": false }),
+            )],
+        ),
+        (
+            "set_config",
+            json!({ "key": "speech.volume", "value": 0.8 }),
+            vec![(
+                "config.set",
+                json!({ "key": "speech.volume", "value": 0.8 }),
+            )],
+        ),
+        (
+            "set_config",
+            json!({ "key": "threads.default_mode", "value": "plan" }),
+            vec![(
+                "config.set",
+                json!({ "key": "threads.default_mode", "value": "plan" }),
+            )],
+        ),
+        (
             "list_project_files",
             json!({ "project": "api", "path": "src" }),
             vec![("project.files", json!({ "project": "api", "path": "src" }))],
@@ -1308,6 +1359,7 @@ const OTHER_TOOLS: &[&str] = &[
     "read_docs",
     "hub_info",
     "show_config",
+    "set_config",
     "list_project_files",
     "read_project_file",
     "search_project",
@@ -2553,6 +2605,7 @@ async fn loop_tools() {
             "commit",
             "implementer",
             "kind",
+            "once",
             "plan_check",
             "profile",
             "reviewer",
@@ -2598,6 +2651,9 @@ async fn loop_tools() {
         assert!(twr_mcp::LOOP_RULE.contains(want), "{want:?}");
     }
     assert!(desc("start_loop").contains("Never on your own initiative"));
+    // A review asked for, not a loop: one pass on that thread, never another thread's review.
+    assert!(desc("start_loop").contains("with once: true on that thread itself"));
+    assert!(desc("start_loop").contains("Never review a thread's work from another thread"));
     assert!(desc("stop_loop").contains("cannot pause, resume or skip"));
     assert!(tools
         .iter()
@@ -2628,12 +2684,27 @@ async fn loop_tools() {
     let v: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["status"], "started");
     assert_eq!(v["loop"], "L1");
+    assert!(v.get("once").is_none(), "{v}");
     assert_eq!(v["line"], "high · scope");
     assert_eq!(v["settings_of"], "api");
     assert_eq!(
         v["settings"],
         "profile high · implementer the thread's own · workers claude-opus-5-5 high · \
          reviewer codex gpt-6.1-sol · commit match"
+    );
+    // `once`: a single pass, passed through.
+    h.mock.clear();
+    h.call(
+        "start_loop",
+        json!({"thread": "api", "kind": "review", "once": true}),
+    )
+    .await;
+    assert_eq!(
+        h.mock.calls(),
+        [(
+            "loop.request".to_string(),
+            json!({"thread": "api", "kind": "review", "once": true})
+        )]
     );
     // Overrides as named, and `setup`: the card, and what to tell the user.
     h.mock.clear();

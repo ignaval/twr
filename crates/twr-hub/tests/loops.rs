@@ -1852,6 +1852,54 @@ async fn a_change_during_the_last_round_keeps_the_verification() {
     hub.shutdown().await;
 }
 
+/// A loop whose only fixes came in verification still changed the work: its report's mark
+/// counts every round's fixes (`fixed`), so a standing watch fires on it (`hub::orch`).
+#[tokio::test]
+async fn a_loop_report_counts_the_fixes_verification_made() {
+    let env = Env::drive();
+    // m1: one finding, dismissed; v1 (`low`'s one verification round): one, fixed.
+    env.answer(1, findings(1));
+    env.answer(2, findings(1));
+    {
+        let mut b = env.brain.lock().unwrap();
+        b.replies.push((
+            "triage m1]".into(),
+            triage_reply(&[("m1.1", "dismissed:it is intended")], "pass"),
+        ));
+        b.replies.push((
+            "triage v1]".into(),
+            triage_reply(&[("v1.1", "fixed:new-class:bounds")], "pass"),
+        ));
+    }
+    let hub = env.hub().await;
+    let t = looping(&env, &hub, "api", settings("low", "codex/gpt-6.1-sol")).await;
+    ended(&hub, &t).await;
+    let g = get(&hub, &t);
+    let ids: Vec<&str> = g["rounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["m1", "v1"], "{g}");
+    let mark = events(&hub, &t)
+        .into_iter()
+        .rev()
+        .find_map(|e| match e.body {
+            EventBody::ReportReady(p) => p
+                .ext
+                .as_ref()
+                .and_then(|x| x.get("twr"))
+                .and_then(|t| t.get("loop"))
+                .cloned(),
+            _ => None,
+        })
+        .expect("the loop's report");
+    assert_eq!(mark["step"], "report", "{mark}");
+    assert_eq!(mark["fixed"], 1, "{mark}");
+    hub.shutdown().await;
+}
+
 /// Findings are triaged (fixed, dismissed with a reason, a duplicate of the ledger) until the
 /// tiers converge; the sweep runs (something was fixed) and its accepted residual joins the
 /// ledger; the reviewer reads the ledger by path; the triage prompt wraps the findings.

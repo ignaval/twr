@@ -55,6 +55,8 @@ pub struct SpeakerOpts {
     pub voice: Option<String>,
     /// A rate that beats the saved one and `[speech] rate` (`--rate`).
     pub rate: Option<u32>,
+    /// Voices per language that beat `[speech] voices`' (`--voice-for LANG=VOICE`).
+    pub voices: std::collections::BTreeMap<String, String>,
     /// The device's state file.
     pub state: StateStore,
     /// Where notes go; `None`: the log (`tracing`).
@@ -65,6 +67,62 @@ pub struct SpeakerOpts {
     pub tty_keys_once_attached: bool,
     /// Told what it plays ([`StateObserver`]); `None`: nobody.
     pub observe: Option<StateObserver>,
+    /// Where its voices come from while it runs ([`VoicesSource`]); `None`: `config`'s, as
+    /// they were when it started.
+    pub voices_source: Option<VoicesSource>,
+}
+
+/// The voices a speaker reads with, as a settings screen chose them: the voice of any
+/// language (`[speech] voice`) and one per language (`[speech] voices`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Voices {
+    pub voice: Option<String>,
+    pub voices: std::collections::BTreeMap<String, String>,
+}
+
+/// Asked each second while a speaker runs, and once as it starts: the voices as they are now
+/// (`None`: unchanged, or unreadable). A change applies from the next chunk on, so a voice
+/// chosen in the desktop app's settings is heard on the speaker already running (the TUI's
+/// own, `twr speak`). `--voice` and `--voice-for` still beat it; a saved `/read voice` beats
+/// its `voice`, as it beats `[speech] voice`.
+pub type VoicesSource = Arc<dyn Fn() -> Option<Voices> + Send + Sync>;
+
+/// A [`VoicesSource`] over the config file at `file`: read again only when its modification
+/// time or size changes. A file that doesn't parse leaves the voices as they were.
+pub fn config_voices(file: std::path::PathBuf) -> VoicesSource {
+    let seen: Mutex<Option<(Option<std::time::SystemTime>, u64)>> = Mutex::new(None);
+    Arc::new(move || {
+        let meta = std::fs::metadata(&file).ok();
+        let stamp = (
+            meta.as_ref().and_then(|m| m.modified().ok()),
+            meta.as_ref().map_or(0, |m| m.len()),
+        );
+        let mut last = seen.lock().unwrap_or_else(|p| p.into_inner());
+        if last.as_ref() == Some(&stamp) {
+            return None;
+        }
+        *last = Some(stamp);
+        let speech = match meta {
+            None => SpeechConfig::default(),
+            Some(_) => {
+                let text = std::fs::read_to_string(&file).ok()?;
+                speech_table(&text)?
+            }
+        };
+        Some(Voices {
+            voice: (!speech.voice.is_empty()).then_some(speech.voice),
+            voices: speech.voices,
+        })
+    })
+}
+
+/// `[speech]` of a config file's text, its other tables ignored; `None` if it doesn't parse.
+fn speech_table(text: &str) -> Option<SpeechConfig> {
+    let value: toml::Table = toml::from_str(text).ok()?;
+    match value.get("speech") {
+        None => Some(SpeechConfig::default()),
+        Some(v) => v.clone().try_into().ok(),
+    }
 }
 
 impl std::fmt::Debug for SpeakerOpts {
@@ -74,6 +132,7 @@ impl std::fmt::Debug for SpeakerOpts {
             .field("voice", &self.voice)
             .field("rate", &self.rate)
             .field("state", &self.state)
+            .field("voices", &self.voices)
             .finish_non_exhaustive()
     }
 }
@@ -177,12 +236,29 @@ pub async fn run(
     let store = opts.state.clone();
     let state = store.load()?;
     let cfg = &opts.config;
+    // The voices as chosen now: the source's, else `[speech]`'s.
+    let chosen = opts
+        .voices_source
+        .as_ref()
+        .and_then(|source| source())
+        .unwrap_or_else(|| Voices {
+            voice: (!cfg.voice.is_empty()).then(|| cfg.voice.clone()),
+            voices: cfg.voices.clone(),
+        });
+    // Voices per language: `--voice-for` beats the chosen ones.
+    let per_language = |chosen: &Voices| {
+        let mut v = chosen.voices.clone();
+        v.extend(opts.voices.clone());
+        v
+    };
     let prefs = Prefs {
         voice: opts
             .voice
             .clone()
             .or_else(|| state.voice.clone())
-            .or_else(|| (!cfg.voice.is_empty()).then(|| cfg.voice.clone())),
+            .or_else(|| chosen.voice.clone()),
+        voices: per_language(&chosen),
+        lang: None,
         rate: opts.rate.or(state.rate).unwrap_or(cfg.rate),
         volume: cfg.volume,
     };
@@ -195,7 +271,7 @@ pub async fn run(
         state,
         voice: prefs.voice.clone(),
         voice_flag: opts.voice.clone(),
-        cfg_voice: (!cfg.voice.is_empty()).then(|| cfg.voice.clone()),
+        cfg_voice: chosen.voice.clone(),
         unsaved: Vec::new(),
     }));
     let params: ParamsFn = {
@@ -376,7 +452,27 @@ pub async fn run(
                 }
             }
             _ = player.next_done() => {}
-            _ = tick.tick() => player.machine.tick(),
+            _ = tick.tick() => {
+                player.machine.tick();
+                // Voices chosen meanwhile (the desktop app's settings, a phone's): from the
+                // next chunk on.
+                if let Some(chosen) = opts.voices_source.as_ref().and_then(|source| source()) {
+                    let voice = {
+                        let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
+                        s.cfg_voice = chosen.voice.clone();
+                        let state = s.state.clone();
+                        s.adopt(state);
+                        s.voice.clone()
+                    };
+                    if player.machine.prefs().voice != voice {
+                        player.machine.set_voice(voice);
+                    }
+                    let voices = per_language(&chosen);
+                    if player.machine.prefs().voices != voices {
+                        player.machine.set_voices(voices);
+                    }
+                }
+            }
         }
         // Saved before the engine is waited on: `sync` may wait for `after_stop` (`spd-say
         // -C`, up to 2 s), and a speaker aborted meanwhile (the TUI's, on quit) would lose
@@ -730,10 +826,12 @@ mod tests {
         SpeakerOpts {
             tty_keys_once_attached: false,
             observe: None,
+            voices_source: None,
             name: "test speaker".into(),
             config: SpeechConfig::default(),
             voice: None,
             rate: None,
+            voices: Default::default(),
             state: store.clone(),
             report: Some(Arc::new(move |n: &str| {
                 notes.lock().unwrap().push(n.to_string())
@@ -741,13 +839,23 @@ mod tests {
         }
     }
 
-    fn start(store: &StateStore, (engine, fake): (FakeEngine, FakeHandle)) -> Rig {
+    fn start(store: &StateStore, engine: (FakeEngine, FakeHandle)) -> Rig {
+        start_with(store, engine, |_| {})
+    }
+
+    fn start_with(
+        store: &StateStore,
+        (engine, fake): (FakeEngine, FakeHandle),
+        change: impl FnOnce(&mut SpeakerOpts),
+    ) -> Rig {
         let (link, hub) = manual();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let (keys, key_rx) = mpsc::channel(8);
         let notes = Arc::new(Mutex::new(Vec::new()));
+        let mut opts = opts(store, &notes);
+        change(&mut opts);
         let task = tokio::spawn(run(
-            opts(store, &notes),
+            opts,
             LinkSpec::Manual(link),
             Box::new(engine),
             Some(key_rx),
@@ -1102,6 +1210,96 @@ mod tests {
             e => panic!("{e:?}"),
         }
         r.shut().await;
+    }
+
+    /// Voices chosen while a speaker runs (the desktop app's settings, a phone's) are read
+    /// with from the next message on; a saved `/read voice` still beats the chosen `voice`.
+    #[tokio::test(start_paused = true)]
+    async fn voices_chosen_while_it_runs_are_heard_next() {
+        let (_d, store) = store();
+        live_on(&store, "w1");
+        let next: Arc<Mutex<Option<Voices>>> = Arc::new(Mutex::new(Some(Voices {
+            voice: Some("Ava".into()),
+            voices: [("es".to_string(), "kokoro/ef_dora".to_string())].into(),
+        })));
+        let source = next.clone();
+        let mut r = start_with(&store, FakeEngine::timed(Duration::from_millis(100)), |o| {
+            o.config.voice = "Ignored".into();
+            o.voices_source = Some(Arc::new(move || source.lock().unwrap().take()));
+        });
+        let p = r.connect("w1", None, 0).await;
+        assert_eq!(p.voice.as_deref(), Some("Ava"), "the source's at start");
+        r.item("w1", msg(1, "Hi.", Origin::Live));
+        until("said", || r.fake.finished().len() == 1).await;
+        *next.lock().unwrap() = Some(Voices {
+            voice: Some("Zoe".into()),
+            voices: Default::default(),
+        });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        r.item("w1", msg(2, "Hello.", Origin::Live));
+        until("said again", || r.fake.finished().len() == 2).await;
+        r.item("w1", ctl(CtlOp::Voice, Some(json!("Samantha"))));
+        until("saved", || r.state().voice.as_deref() == Some("Samantha")).await;
+        *next.lock().unwrap() = Some(Voices {
+            voice: Some("Zoe".into()),
+            voices: [("en".to_string(), "kokoro/af_heart".to_string())].into(),
+        });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        r.item("w1", msg(3, "Bye.", Origin::Live));
+        until("said a third time", || r.fake.finished().len() == 3).await;
+        let said: Vec<_> = r
+            .fake
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                FakeEvent::Speak { prefs, .. } => Some((prefs.voice, prefs.voices)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(said[0].0.as_deref(), Some("Ava"));
+        assert_eq!(
+            said[0].1.get("es").map(String::as_str),
+            Some("kokoro/ef_dora")
+        );
+        assert_eq!(said[1].0.as_deref(), Some("Zoe"));
+        assert!(said[1].1.is_empty());
+        assert_eq!(
+            said[2].0.as_deref(),
+            Some("Samantha"),
+            "/read voice beats it"
+        );
+        assert_eq!(
+            said[2].1.get("en").map(String::as_str),
+            Some("kokoro/af_heart")
+        );
+        r.shut().await;
+    }
+
+    #[test]
+    fn config_voices_reads_the_file_again_only_when_it_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        let source = config_voices(file.clone());
+        // No file: no voices.
+        assert_eq!(source(), Some(Voices::default()));
+        assert_eq!(source(), None);
+        std::fs::write(
+            &file,
+            "[orchestrator]\nautostart = false\n\n[speech]\nrate = 200\nvoice = \"Ava (Premium)\"\nvoices = { es = \"kokoro/ef_dora\" }\n",
+        )
+        .unwrap();
+        let v = source().expect("changed");
+        assert_eq!(v.voice.as_deref(), Some("Ava (Premium)"));
+        assert_eq!(
+            v.voices.get("es").map(String::as_str),
+            Some("kokoro/ef_dora")
+        );
+        assert_eq!(source(), None, "unchanged");
+        // A file that doesn't parse leaves the voices as they were.
+        std::fs::write(&file, "[speech\nvoice = ").unwrap();
+        assert_eq!(source(), None);
+        std::fs::write(&file, "[speech]\nvoice = \"\"\n").unwrap();
+        assert_eq!(source(), Some(Voices::default()));
     }
 
     /// A save that fails (the state's directory unwritable, as a full disk) keeps its changes:

@@ -333,6 +333,53 @@ final class RemoteHubTests: XCTestCase {
         }
     }
 
+    /// The hub's level and config.toml's `[orchestrator] access`, read on the host.
+    private func hostAccess() async throws -> [String?] {
+        let (data, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47423/orchestrator-access")!)
+        let levels = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        return [levels["hub"] as? String, levels["config"] as? String]
+    }
+
+    /// Settings › Orchestrator's access level: Full asks first and Cancel changes nothing;
+    /// confirming applies it on the hub and in config.toml; Limited applies without asking.
+    private func orchestratorAccess() async throws {
+        _ = try await js("""
+          const visible=e=>e.getClientRects().length>0;
+          const settings=()=>[...document.querySelectorAll('button')].find(e=>visible(e)&&e.textContent.trim()==='Settings');
+          if(!settings())[...document.querySelectorAll('.mobile-tabs button')].find(e=>visible(e)&&e.textContent==='More')?.click();
+          await new Promise(r=>setTimeout(r,300));settings().click();
+          await new Promise(r=>setTimeout(r,300));[...document.querySelectorAll('[role=tab]')].find(e=>e.textContent==='Agents')?.click();return true;
+          """)
+        let group = "document.querySelector('.orchestrator-access [role=group]')"
+        let pressed = "[...\(group).querySelectorAll('button')].find(e=>e.getAttribute('aria-pressed')==='true')?.textContent"
+        // The choices stay disabled (aria-busy) until the hub's answer is read back: a tap
+        // before then does nothing.
+        let settled = "!\(group).hasAttribute('aria-busy') && ![...\(group).querySelectorAll('button')].some(e=>e.disabled)"
+        let press = { (label: String) in "[...\(group).querySelectorAll('button')].find(e=>e.textContent==='\(label)').click();return true" }
+        let dialogButton = { (label: String) in "[...document.querySelectorAll('[role=dialog] button')].find(e=>e.textContent==='\(label)').click();return true" }
+        try await until("return \(group) && \(pressed)==='Limited'")
+        try await until("return \(settled)")
+        _ = try await js(press("Full"))
+        try await until("return document.querySelector('[role=dialog]')?.textContent.includes('Give the orchestrator full access?')")
+        _ = try await js(dialogButton("Cancel"))
+        try await until("return !document.querySelector('[role=dialog]') && \(pressed)==='Limited'")
+        let cancelled = try await hostAccess()
+        XCTAssertEqual(cancelled[0], "limited", "Cancel must leave the hub at Limited")
+        try await until("return \(settled)")
+        _ = try await js(press("Full"))
+        try await until("return !!document.querySelector('[role=dialog]')")
+        _ = try await js(dialogButton("Give full access"))
+        try await until("return \(pressed)==='Full' && document.querySelector('.orchestrator-access [role=status]').textContent.includes('full access')")
+        let full = try await hostAccess()
+        XCTAssertEqual(full, ["full", "full"], "Full must apply on the hub and in config.toml")
+        try await until("return \(settled)")
+        _ = try await js(press("Limited"))
+        try await until("return !document.querySelector('[role=dialog]') && \(pressed)==='Limited' && document.querySelector('.orchestrator-access [role=status]').textContent.includes('limited access')")
+        let limited = try await hostAccess()
+        XCTAssertEqual(limited, ["limited", "limited"], "Limited must apply on the hub and in config.toml")
+        print("PASS: Settings › Orchestrator changes the access level live on the hub and in config.toml, and Full asks first")
+    }
+
     func testRemoteHubEndToEnd() async throws {
         continueAfterFailure = false
         for _ in 0..<100 {
@@ -445,6 +492,7 @@ final class RemoteHubTests: XCTestCase {
           catch(error) { return error.code==='REQUEST_TOO_LARGE' }
           """) as? Bool
         XCTAssertEqual(sizeGuard, true, "Native requests must be bounded by UTF-8 bytes without closing the socket")
+        try await orchestratorAccess()
         // Back to the conversation: the Chat tab on a phone, the open workspace's Orchestrator
         // entry in the sidebar's workspace list on a wide layout.
         _ = try await js("[...document.querySelectorAll('.mobile-tabs button,.workspace-entry.current .workspace-orchestrator,.primary-nav button')].find(e=>e.getClientRects().length&&(e.textContent==='Chat'||e.textContent.includes('Orchestrator'))).click();return true")

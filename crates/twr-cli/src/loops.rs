@@ -57,7 +57,8 @@ pub(super) enum LoopCmd {
     /// longer holds, the thread's settings card comes first: on a terminal you answer it here
     /// (1 start and save, 2 change… in your editor, 3 cancel); without one it stays open, this
     /// prints the `twr respond` line that starts it, and exits 2. No flag starts a first loop
-    /// without that card.
+    /// without that card. With --once it is a single pass: one review, the thread's triage of
+    /// what it found, then the report.
     Review {
         /// Thread id, name, alias or unique prefix.
         thread: String,
@@ -65,6 +66,10 @@ pub(super) enum LoopCmd {
         /// what it shows.
         #[arg(long)]
         setup: bool,
+        /// A single pass: one review run at the profile's strongest tier, the thread's triage
+        /// of its findings, then the report. No second round, sweep or verification.
+        #[arg(long)]
+        once: bool,
         /// What to review: branch (the default when the thread has commits of its own),
         /// uncommitted (else), since:<ref> or last:<n> (also written "since <ref>" in quotes,
         /// or since=<ref>).
@@ -455,6 +460,7 @@ pub(super) async fn run(cmd: LoopCmd, socket: &Path) -> anyhow::Result<ExitCode>
         LoopCmd::Review {
             thread,
             setup,
+            once,
             scope,
             profile,
             reviewer,
@@ -479,6 +485,9 @@ pub(super) async fn run(cmd: LoopCmd, socket: &Path) -> anyhow::Result<ExitCode>
             let mut params = json!({ "thread": thread, "kind": "review" });
             if setup {
                 params["setup"] = json!(true);
+            }
+            if once {
+                params["once"] = json!(true);
             }
             if let Some(s) = scope {
                 params["scope"] = json!(s);
@@ -1616,6 +1625,7 @@ fn outcome_words(outcome: &str) -> &str {
         "clean" => "clean",
         "ledger_fixed_point" => "at a ledger fixed point (every finding already ledgered)",
         "cap_expired" => "its verification cap spent with findings still arriving",
+        "triaged" => "with its single pass's findings triaged",
         "stopped" => "stopped",
         "failed" => "failed",
         other => other,
@@ -1717,6 +1727,15 @@ fn kind_words(kind: &Value) -> &'static str {
     }
 }
 
+/// [`kind_words`], or `single review pass` for a loop `started` (`loop.get`'s) as one.
+fn loop_words(kind: &Value, started: &Value) -> &'static str {
+    if started["once"] == true {
+        "single review pass"
+    } else {
+        kind_words(kind)
+    }
+}
+
 /// The command that starts a loop of `kind` (`review`, `implement`).
 fn kind_command(kind: &Value) -> &'static str {
     match kind.as_str() {
@@ -1797,7 +1816,7 @@ fn started_text(d: &Value) -> String {
     };
     let mut out = vec![format!(
         "{name}: {} started ({})",
-        kind_words(kind),
+        loop_words(kind, started),
         d["line"].as_str().unwrap_or("-")
     )];
     out.push(format!(
@@ -1905,7 +1924,7 @@ fn show_text(d: &Value) -> String {
     } else {
         out.push(format!(
             "{name}: {} {} (ended: {})",
-            kind_words(&d["kind"]),
+            loop_words(&d["kind"], &d["started"]),
             str_of(&d["id"]),
             outcome_words(d["outcome"].as_str().unwrap_or("-"))
         ));
@@ -2349,6 +2368,7 @@ mod tests {
             "review",
             "api",
             "--setup",
+            "--once",
             "--scope",
             "since:main",
             "--profile",
@@ -2366,6 +2386,7 @@ mod tests {
             LoopCmd::Review {
                 thread,
                 setup,
+                once,
                 scope,
                 profile,
                 reviewer,
@@ -2375,7 +2396,7 @@ mod tests {
                 json,
             } => {
                 assert_eq!(thread, "api");
-                assert!(setup && json);
+                assert!(setup && once && json);
                 assert_eq!(scope.as_deref(), Some("since main"));
                 assert_eq!(profile.as_deref(), Some("low"));
                 assert_eq!(reviewer.as_deref(), Some("claude-code/claude-opus-5-5"));
@@ -2390,6 +2411,10 @@ mod tests {
                 LoopCmd::Review { scope, .. } => assert_eq!(scope.as_deref(), Some("since main")),
                 other => panic!("{other:?}"),
             }
+        }
+        match loop_cmd(&["loop", "review", "api"]) {
+            LoopCmd::Review { once, .. } => assert!(!once),
+            other => panic!("{other:?}"),
         }
         match loop_cmd(&["loop", "review", "api", "--scope=last:3"]) {
             LoopCmd::Review { scope, .. } => assert_eq!(scope.as_deref(), Some("last 3")),

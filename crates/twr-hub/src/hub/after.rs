@@ -36,6 +36,17 @@ use super::orch::cut;
 use super::subscribe::wait_state;
 use super::{append_err, rpc, twr_ext, twr_ext_map, Batch, Caller, Core, HubState, Inner};
 
+/// A gated prompt as its notices, card and `thread.get` show it: the start of its text (at most
+/// 300 bytes), then its files by name (`(attached: spec.md)`), never their paths, cut or not.
+fn gated_text(prompt: &str) -> String {
+    let (text, files) = twr_core::upload::split_attachments(prompt);
+    let mut out = cut(&text, 300);
+    if !files.is_empty() {
+        out.push_str(&format!(" (attached: {})", files.join(", ")));
+    }
+    out
+}
+
 /// `conversation.update` `ext.twr` key: a gated prompt.
 pub(super) const SEND_AFTER_KEY: &str = "send_after";
 /// `conversation.update` `ext.twr` key: a gated prompt's end, `{id, outcome, why?}`.
@@ -408,7 +419,7 @@ impl Core {
             "Queued until {} finish{}: {}",
             names.join(", "),
             if names.len() == 1 { "es" } else { "" },
-            cut(&gated.prompt, 300)
+            gated_text(&gated.prompt)
         );
         let body = EventBody::ConversationUpdate(ConversationUpdate {
             text,
@@ -775,7 +786,7 @@ impl Core {
              {target} the prompt queued after {} anyway? {}",
             not_ok.join(", "),
             if g.after.len() == 1 { "it" } else { "them" },
-            cut(&g.prompt, 300)
+            gated_text(&g.prompt)
         );
         let body = EventBody::AttentionRaised(AttentionRaised {
             attn_id: new_id(),
@@ -938,7 +949,7 @@ impl Core {
                 json!({
                     "id": g.id,
                     "after": g.after.iter().map(|a| self.thread_name(&a.thread)).collect::<Vec<_>>(),
-                    "prompt": cut(&g.prompt, 300),
+                    "prompt": gated_text(&g.prompt),
                     "card": g.card,
                 })
             })
@@ -1082,6 +1093,18 @@ mod tests {
     use super::super::{Hub, HubOptions};
     use super::*;
     use twr_core::config::Config;
+
+    /// A gated prompt's notice names its files, never their paths, however long its text.
+    #[test]
+    fn gated_prompts_name_their_files() {
+        let path = "/home/me/.twr-uploads/7f3a/spec.md";
+        for body in ["check it", &"x".repeat(290)] {
+            let text = gated_text(&format!("{body}\n\nUploaded file: spec.md\n{path}"));
+            assert!(text.ends_with(" (attached: spec.md)"), "{text:?}");
+            assert!(!text.contains(".twr-uploads") && !text.contains("Uploaded file"));
+        }
+        assert_eq!(gated_text("plain"), "plain");
+    }
 
     /// Only a deletion wakes the task for the prompts deletions dropped: while one waits to be
     /// recorded, the threads' other events do not; and a retry's due time is never brought

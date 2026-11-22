@@ -3,6 +3,7 @@ import { ArrowDown, ArrowUp, Search } from "lucide-react";
 import type { Attention, HubEvent, InboxSource, Json, Thread } from "./types";
 import { Dialog, Empty, Markdown, Spinner } from "./ui";
 import { requestLine } from "./loops";
+import { namedText } from "./attachmentText";
 import { errorMessage } from "./errors";
 import { announce, scrollBehavior } from "./a11y";
 import "./inbox-search.css";
@@ -309,14 +310,48 @@ interface SearchPage {
   more: boolean;
   workspace: string;
 }
+/** Who an event in a saved conversation came from, in words: the search lists it so. A
+ * prompt the agent sent itself (`from` other than `user`) or a hub update reads as an update. */
+export function eventRole(kind: string, from?: string): string {
+  if (kind === "turn.started")
+    return from && from !== "user" ? "Update" : "You";
+  if (kind === "agent.text") return "Agent";
+  if (kind === "agent.tool_call" || kind === "agent.tool_result") return "Tool";
+  if (kind === "agent.thinking") return "Reasoning";
+  if (kind.startsWith("decision") || kind.startsWith("control"))
+    return "Decision";
+  if (kind === "conversation.update") return "Orchestrator";
+  return "Update";
+}
+/** When an event happened, short: the time alone today, the date and time otherwise. */
+export function eventTime(ts: string, now = new Date()): string {
+  const at = new Date(ts);
+  if (Number.isNaN(at.getTime())) return "";
+  return at.toDateString() === now.toDateString()
+    ? at.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+    : at.toLocaleString([], {
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+      });
+}
 export function eventText(event: HubEvent): string {
   const data = event.data || {};
+  // A message's files show by name (`namedText`), never their paths.
   if (event.kind === "conversation.update")
-    return [data.user_message, data.text].filter(Boolean).join("\n\n");
+    return [
+      data.user_message && namedText(String(data.user_message)),
+      data.text,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
   if (event.kind === "agent.tool_call")
     return [data.tool, data.input_summary].filter(Boolean).join("\n\n");
   if (event.kind === "agent.tool_result")
     return data.output_summary || JSON.stringify(data, null, 2);
+  if (data.user_message) return namedText(String(data.user_message));
+  if (!data.text && data.prompt) return namedText(String(data.prompt));
   return (
     data.user_message ||
     data.text ||
@@ -489,7 +524,7 @@ export function ConversationSearch({
             {threads.find((item) => item.id === chosen.thread)?.name ||
               chosen.thread_name ||
               chosen.thread}{" "}
-            · event {chosen.seq}
+            · {eventRole(chosen.kind)} · {eventTime(chosen.ts)}
           </p>
           <blockquote className="search-match">{chosen.excerpt}</blockquote>
           {!context && !error && <Spinner />}
@@ -511,9 +546,8 @@ export function ConversationSearch({
                 }
               >
                 <header>
-                  <b>{event.kind}</b>
-                  <time>{new Date(event.ts).toLocaleString()}</time>
-                  <span>#{event.seq}</span>
+                  <b>{eventRole(event.kind, event.data?.from)}</b>
+                  <time dateTime={event.ts}>{eventTime(event.ts)}</time>
                 </header>
                 <Markdown text={eventText(event)} />
               </article>
@@ -549,7 +583,6 @@ export function ConversationSearch({
           </label>
           <p className="muted">
             Searches saved events in this workspace, including archived output.
-            Selecting a result preserves your message destination.
           </p>
           <div className="search-results">
             {page?.items.map((hit) => (
@@ -565,12 +598,10 @@ export function ConversationSearch({
                       hit.thread_name ||
                       hit.thread}
                   </b>
-                  <small>
-                    {hit.kind} · #{hit.seq}
-                  </small>
+                  <small>{eventRole(hit.kind)}</small>
                 </span>
                 <p>{hit.excerpt}</p>
-                <time>{new Date(hit.ts).toLocaleString()}</time>
+                <time dateTime={hit.ts}>{eventTime(hit.ts)}</time>
               </button>
             ))}
           </div>

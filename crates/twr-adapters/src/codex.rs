@@ -43,7 +43,7 @@
 //! | `model`                | `model` param                                                        |
 //! | `effort`               | `config.model_reasoning_effort` (one of [`EFFORTS`])                 |
 //! | `system_append`        | `developerInstructions` (added to the developer message; `baseInstructions` would replace Codex's own prompt) |
-//! | `mcp_config(_file)`    | `config.mcp_servers`, as an allowlist like Claude's `--strict-mcp-config`: Codex merges that table into the user's and the project's servers, so the translator reads the effective config first and turns every other server off by name, with plugins and apps off too ([`STRICT_MCP_FEATURES_OFF`]; [`translate`], "MCP allowlist"); sent over stdin, so secrets in it (the orchestrator token) never reach a command line |
+//! | `mcp_config(_file)`    | `config.mcp_servers`, as an allowlist like Claude's `--strict-mcp-config`: Codex merges that table into the user's and the project's servers, so the translator reads the effective config first and turns every other server off by name, with plugins and apps off too ([`STRICT_MCP_FEATURES_OFF`]; [`translate`], "MCP allowlist"); with `keep_own_mcp` merged as Codex does, no allowlist; sent over stdin, so secrets in it (the orchestrator token) never reach a command line |
 //! | `allowed_tools`        | `mcp__<server>` → that server's `default_tools_approval_mode = "approve"`; other rules have no Codex equivalent and are ignored (logged) |
 //! | `builtin_tools`        | `None` = Codex's defaults; `Some(list)` = only the named built-in groups stay on, see [`builtin_overrides`] |
 //! | `thinking`             | `agent.thinking` from reasoning items + `summary: "auto"` on `turn/start` |
@@ -77,8 +77,9 @@
 //! | anything else                                     | refused: the runtime does not start | | |
 //!
 //! `untrusted` asks before every command that is not a known read-only one and before every
-//! file change, which is what "manual" means in twr. With `builtin_tools: Some([])` (no
-//! built-ins, e.g. the orchestrator) the sandbox is `read-only` whatever the mode (also noted in
+//! file change, which is what "manual" means in twr. With `builtin_tools: Some(list)` naming no
+//! shell group and no file-editing tool ([`no_shell_or_edits`]: no built-ins at all, or only the
+//! web group, e.g. the orchestrator) the sandbox is `read-only` whatever the mode (also noted in
 //! `mode_note`).
 //!
 //! ### The sandbox's network and writable roots
@@ -258,16 +259,36 @@ pub fn build_args() -> Vec<String> {
 }
 
 /// `(approvalPolicy, sandbox)` for a permission mode: the table in the module doc
-/// ("Permission modes"). Never wider than the mode; with `builtin_tools: Some([])` the sandbox
-/// is `read-only` whatever the mode. An unknown mode is an error ([`NATIVE_MODES`],
-/// [`crate::acp::translate::native_mode`]): the runtime does not start.
+/// ("Permission modes"). Never wider than the mode; with `builtin_tools` naming no shell group
+/// and no file-editing tool ([`no_shell_or_edits`]) the sandbox is `read-only` whatever the
+/// mode. An unknown mode is an error ([`NATIVE_MODES`], [`crate::acp::translate::native_mode`]):
+/// the runtime does not start.
 pub fn policy(
     mode: &str,
     builtin_tools: Option<&[String]>,
 ) -> anyhow::Result<(&'static str, &'static str)> {
     let (approval, sandbox, _) = mode_policy(mode)?;
-    let no_builtins = builtin_tools.is_some_and(<[String]>::is_empty);
-    Ok((approval, if no_builtins { "read-only" } else { sandbox }))
+    let read_only = no_shell_or_edits(builtin_tools);
+    Ok((approval, if read_only { "read-only" } else { sandbox }))
+}
+
+/// The names that select the shell group ([`builtin_overrides`]).
+const SHELL_NAMES: &[&str] = &["shell", "Bash", "exec_command"];
+
+/// The file-editing tools a `builtin_tools` list may name (Claude's names and Codex's own):
+/// Codex cannot turn `apply_patch` off, so naming one of them keeps the mode's sandbox, and
+/// leaving them all out makes it read-only, where `apply_patch` fails.
+const EDIT_NAMES: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit", "apply_patch"];
+
+/// Whether `builtin_tools` is a list (`Some`) that names neither the shell group nor a
+/// file-editing tool ([`EDIT_NAMES`]): no built-in tools at all, or only others such as the web
+/// group (the orchestrator's). Such a thread gets the `read-only` sandbox ([`policy`]).
+pub fn no_shell_or_edits(builtin_tools: Option<&[String]>) -> bool {
+    builtin_tools.is_some_and(|names| {
+        !names
+            .iter()
+            .any(|n| SHELL_NAMES.contains(&n.as_str()) || EDIT_NAMES.contains(&n.as_str()))
+    })
 }
 
 /// What a thread of `cfg` runs with: `(approvalPolicy, approvalsReviewer, sandbox)`. [`policy`]
@@ -287,8 +308,8 @@ pub fn run_policy(cfg: &SpawnConfig) -> anyhow::Result<(&'static str, &'static s
     })
 }
 
-/// Whether `cfg` is an `auto` thread with a `workspace-write` sandbox (not one with no built-in
-/// tools, whose sandbox is read-only): the widened sandbox of the module doc, and
+/// Whether `cfg` is an `auto` thread with a `workspace-write` sandbox (not one with no shell or
+/// file tools, whose sandbox is read-only): the widened sandbox of the module doc, and
 /// [`SpawnConfig::codex_auto`].
 fn is_auto_sandbox(cfg: &SpawnConfig) -> bool {
     matches!(native(&cfg.mode), Ok("auto"))
@@ -326,9 +347,8 @@ pub fn mode_note(mode: &str, builtin_tools: Option<&[String]>) -> Option<String>
         .map(|n| format!("mode {:?}: {n}", mode.trim()))
         .into_iter()
         .collect();
-    let no_builtins = builtin_tools.is_some_and(<[String]>::is_empty);
-    if no_builtins && sandbox != "read-only" {
-        parts.push("no built-in tools: sandbox read-only".into());
+    if no_shell_or_edits(builtin_tools) && sandbox != "read-only" {
+        parts.push("no shell or file-editing tools: sandbox read-only".into());
     }
     (!parts.is_empty()).then(|| parts.join("; "))
 }
@@ -341,27 +361,36 @@ pub fn mode_note(mode: &str, builtin_tools: Option<&[String]>) -> Option<String>
 /// is Codex's to say.
 pub const EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
-/// The models twr's pickers offer for Codex ([`crate::models`]): those Codex 0.166.0's
-/// `model/list` reported on 2026-11-07, in its order (`gpt-6.1-sol` its default), with its
-/// descriptions. Codex takes other ids too, so the list is a choice, not a check.
+/// The models twr's pickers offer for Codex ([`crate::models`]): those Codex 0.171.0's
+/// `model/list` reported on 2026-11-20, in its order (`gpt-6.2-sol` its default), with its
+/// descriptions (hidden ones left out). Codex takes other ids too, so the list is a choice,
+/// not a check.
 pub const MODELS: &[crate::KnownModel] = &[
     crate::KnownModel::new(
+        "gpt-6.2-sol",
+        "fast, go-to model for coding and everyday work",
+    ),
+    crate::KnownModel::new(
+        "gpt-6.2-astra",
+        "most capable model for complex coding and professional work",
+    ),
+    crate::KnownModel::new(
+        "gpt-6.1-terra",
+        "efficient model for visual understanding and computer use",
+    ),
+    crate::KnownModel::new(
         "gpt-6.1-sol",
-        "latest workhorse model for coding and everyday work",
+        "previous generation model for coding and everyday work",
     ),
     crate::KnownModel::new(
         "gpt-6-astra",
-        "frontier intelligence for the most demanding work",
+        "previous generation model for complex coding and professional work",
     ),
-    crate::KnownModel::new("gpt-6.1-terra", "GPT-6.1 Terra"),
-    crate::KnownModel::new("gpt-6-sol", "previous generation workhorse model"),
+    crate::KnownModel::new("gpt-6-sol", "legacy model for coding and everyday work"),
     crate::KnownModel::new("gpt-6-luna", "fast and affordable model for easier tasks"),
-    crate::KnownModel::new("gpt-5.6-sol", "older generation workhorse model"),
-    crate::KnownModel::new(
-        "gpt-5.6-terra",
-        "older balanced model for straightforward work",
-    ),
-    crate::KnownModel::new("gpt-5.6-luna", "older fast and efficient model"),
+    crate::KnownModel::new("gpt-5.6-sol", "legacy model for coding and everyday work"),
+    crate::KnownModel::new("gpt-5.6-terra", "legacy balanced model for agentic coding"),
+    crate::KnownModel::new("gpt-5.6-luna", "legacy fast model for simpler tasks"),
 ];
 
 /// The mode ids this adapter maps exactly as written (twr's and Codex's own); any other
@@ -924,11 +953,16 @@ fn common_dir_of(repo: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
 /// | group     | selected by                                 | turned off with                          |
 /// |-----------|---------------------------------------------|------------------------------------------|
 /// | shell     | `shell`, `Bash`, `exec_command`             | `features.shell_tool`, `features.unified_exec`, `features.code_mode_host` = false |
-/// | web       | `web_search`, `WebSearch`, `WebFetch`       | `web_search = "disabled"`                |
+/// | web       | `web_search`, `WebSearch`, `WebFetch`       | `web_search = "disabled"`; named without `WebFetch`: `web_search = "cached"` |
 /// | agents    | `spawn_agent`, `Task`, `Agent`              | `features.multi_agent`, `features.multi_agent_v2` = false |
 /// | apps      | `apps`                                      | `features.apps` = false                  |
 /// | browser   | `browser_use`, `computer_use`               | `features.browser_use`, `features.computer_use` = false |
 /// | images    | `image_generation`                          | `features.image_generation` = false      |
+///
+/// The web group named for a search alone (`web_search` or `WebSearch`, not `WebFetch`) gets
+/// `web_search = "cached"`: results from OpenAI's index, no live page fetches (Codex 0.169.0
+/// takes `disabled`, `cached`, `indexed` and `live`, and refuses another value); with `WebFetch`
+/// it is left to Codex and the user's config.
 ///
 /// `apply_patch`, `view_image` and `request_user_input` cannot be turned off; file changes still
 /// need approval under `untrusted` and fail in a `read-only` sandbox. Verified live: with the
@@ -944,11 +978,13 @@ pub fn builtin_overrides(builtin_tools: Option<&[String]>) -> Map<String, Value>
             m.insert(format!("features.{k}"), json!(false));
         }
     };
-    if !has(&["shell", "Bash", "exec_command"]) {
+    if !has(SHELL_NAMES) {
         off(&mut m, &["shell_tool", "unified_exec", "code_mode_host"]);
     }
     if !has(&["web_search", "WebSearch", "WebFetch"]) {
         m.insert("web_search".into(), json!("disabled"));
+    } else if !has(&["WebFetch"]) {
+        m.insert("web_search".into(), json!("cached"));
     }
     if !has(&["spawn_agent", "Task", "Agent"]) {
         off(&mut m, &["multi_agent", "multi_agent_v2"]);
@@ -1069,9 +1105,11 @@ pub fn thread_config(cfg: &SpawnConfig) -> anyhow::Result<Option<Map<String, Val
         config.insert("mcp_servers".into(), Value::Object(servers));
         // A strict set: plugins and apps bring MCP servers of their own. The user's own
         // servers are turned off by name once the config is read (`translate`, "MCP
-        // allowlist").
-        for feature in STRICT_MCP_FEATURES_OFF {
-            config.insert(format!("features.{feature}"), json!(false));
+        // allowlist"). With `keep_own_mcp` all of them stay, beside these.
+        if !cfg.keep_own_mcp {
+            for feature in STRICT_MCP_FEATURES_OFF {
+                config.insert(format!("features.{feature}"), json!(false));
+            }
         }
     }
     Ok((!config.is_empty()).then_some(config))
@@ -1158,6 +1196,7 @@ pub fn thread_params(cfg: &SpawnConfig) -> anyhow::Result<Open> {
         params: Value::Object(p),
         mode_note,
         added_instructions: is_auto_sandbox(cfg).then(|| AUTO_SANDBOX_NOTE.to_string()),
+        keep_own_mcp: cfg.keep_own_mcp,
     })
 }
 
@@ -1725,10 +1764,25 @@ mod tests {
         }
         assert_eq!(
             mode_note("manual", Some(&[])).as_deref(),
-            Some("no built-in tools: sandbox read-only")
+            Some("no shell or file-editing tools: sandbox read-only")
         );
+        // The orchestrator's web search alone: still no shell or edits.
+        let web = ["WebSearch".to_string()];
+        assert_eq!(
+            mode_note("manual", Some(&web)).as_deref(),
+            Some("no shell or file-editing tools: sandbox read-only")
+        );
+        // A shell or an edit tool keeps the mode's sandbox, and its note.
+        for tool in ["Bash", "shell", "Edit", "apply_patch"] {
+            assert_eq!(
+                mode_note("manual", Some(&[tool.to_string()])),
+                None,
+                "{tool}"
+            );
+        }
         // Already read-only: nothing more to say.
         assert_eq!(mode_note("read-only", Some(&[])), None);
+        assert_eq!(mode_note("read-only", Some(&web)), None);
         assert!(mode_note("dontAsk", Some(&[]))
             .unwrap()
             .starts_with("mode \"dontAsk\""));
@@ -2096,11 +2150,14 @@ mod tests {
         ] {
             assert!(sandbox_overrides(&cfg(other), true).is_empty(), "{other}");
         }
-        let orch = SpawnConfig {
-            builtin_tools: Some(vec![]),
-            ..cfg("auto")
-        };
-        assert!(sandbox_overrides(&orch, true).is_empty());
+        for builtin_tools in [vec![], vec!["WebSearch".to_string()]] {
+            let orch = SpawnConfig {
+                builtin_tools: Some(builtin_tools),
+                ..cfg("auto")
+            };
+            assert!(sandbox_overrides(&orch, true).is_empty());
+            assert!(!is_auto_sandbox(&orch));
+        }
         // No roots at all, or a command for another box: still an empty list, so the user's
         // own roots do not stay.
         let bare = SpawnConfig {
@@ -2134,6 +2191,90 @@ mod tests {
         let shell = builtin_overrides(Some(&["Bash".to_string()]));
         assert!(!shell.contains_key("features.shell_tool"));
         assert_eq!(shell["web_search"], "disabled");
+        // A search alone (the orchestrator's): cached results, no live fetches; every other
+        // group stays off.
+        for name in ["WebSearch", "web_search"] {
+            let web = builtin_overrides(Some(&[name.to_string()]));
+            assert_eq!(web["web_search"], "cached", "{name}");
+            assert_eq!(web["features.shell_tool"], false, "{name}");
+            assert_eq!(web["features.multi_agent"], false, "{name}");
+            assert_eq!(web["features.apps"], false, "{name}");
+        }
+        // With WebFetch: Codex's own setting.
+        let fetch = builtin_overrides(Some(&["WebSearch".to_string(), "WebFetch".to_string()]));
+        assert!(!fetch.contains_key("web_search"));
+    }
+
+    /// The sandbox is read-only for a list of built-in tools naming no shell group and no
+    /// file-editing tool, whatever the mode; anything else keeps the mode's sandbox.
+    #[test]
+    fn no_shell_or_edits_means_a_read_only_sandbox() {
+        let names = |n: &[&str]| n.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+        for list in [
+            names(&[]),
+            names(&["WebSearch"]),
+            names(&["web_search", "image_generation"]),
+        ] {
+            assert!(no_shell_or_edits(Some(&list)), "{list:?}");
+            for mode in ["manual", "auto", "never", "bypassPermissions"] {
+                assert_eq!(
+                    policy(mode, Some(&list)).unwrap().1,
+                    "read-only",
+                    "{mode} {list:?}"
+                );
+            }
+        }
+        assert!(!no_shell_or_edits(None));
+        for list in [
+            names(&["Bash"]),
+            names(&["WebSearch", "Edit"]),
+            names(&["apply_patch"]),
+        ] {
+            assert!(!no_shell_or_edits(Some(&list)), "{list:?}");
+            assert_eq!(
+                policy("manual", Some(&list)).unwrap().1,
+                "workspace-write",
+                "{list:?}"
+            );
+        }
+        assert_eq!(
+            policy("bypassPermissions", None).unwrap(),
+            ("never", "danger-full-access")
+        );
+    }
+
+    /// An MCP set that keeps the user's own servers (the orchestrator with full access):
+    /// twr's server is added and approved, plugins and apps stay on, and the translator gets
+    /// no allowlist; without it, the strict set as before.
+    #[test]
+    fn keep_own_mcp_adds_twrs_server_without_an_allowlist() {
+        let mcp = json!({"mcpServers": {"twr": {"command": "/opt/twr", "args": ["mcp"]}}});
+        let strict = SpawnConfig {
+            mcp_config: Some(mcp.clone()),
+            allowed_tools: vec!["mcp__twr".into()],
+            ..Default::default()
+        };
+        let c = thread_config(&strict).unwrap().unwrap();
+        assert_eq!(
+            c["mcp_servers"]["twr"]["default_tools_approval_mode"],
+            "approve"
+        );
+        assert_eq!(
+            (&c["features.apps"], &c["features.plugins"]),
+            (&json!(false), &json!(false))
+        );
+        assert!(!thread_params(&strict).unwrap().keep_own_mcp);
+        let own = SpawnConfig {
+            keep_own_mcp: true,
+            ..strict
+        };
+        let c = thread_config(&own).unwrap().unwrap();
+        assert_eq!(
+            c["mcp_servers"]["twr"]["default_tools_approval_mode"],
+            "approve"
+        );
+        assert!(!c.contains_key("features.apps") && !c.contains_key("features.plugins"));
+        assert!(thread_params(&own).unwrap().keep_own_mcp);
     }
 
     /// What the `auto` sandbox also opens for routine work: `$CARGO_TARGET_DIR` and the

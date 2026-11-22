@@ -240,6 +240,16 @@ describe("Send as implementation loop", () => {
       confirm: false,
     });
   });
+  it("keeps the path of a file named last exactly, a trailing space too", () => {
+    // An older app's upload: its name, and so its path, ends in a space.
+    const task =
+      "build it\nUploaded file: notes.txt\n/w/.twr-uploads/1/notes.txt ";
+    expect(sendAsLoop(`  ${task}\n\n`)).toEqual({ task, confirm: false });
+    // Anything else ending the task is trimmed as before.
+    expect(sendAsLoop("look at\n/w/.twr-uploads/1/notes.txt  ").task).toBe(
+      "look at\n/w/.twr-uploads/1/notes.txt",
+    );
+  });
   it("asks first when nothing was typed", () => {
     expect(sendAsLoop("")).toEqual({ confirm: true });
     expect(sendAsLoop("  \n ")).toEqual({ confirm: true });
@@ -386,7 +396,7 @@ describe("an implementation loop's phases", () => {
     ).toEqual([]);
   });
 
-  it("refuses Skip to verify before the ladder, with the reason", () => {
+  it("refuses Finish early (skip to verify) before the ladder, with the reason", () => {
     for (const phase of ["plan", "plan_check", "implement"]) {
       const skip = skipToVerify({ phase });
       expect(skip).toMatchObject({ show: true, enabled: false });
@@ -772,6 +782,30 @@ describe("rendered", () => {
     ]);
   });
 
+  it("shows the files a held task names by name, never their paths", async () => {
+    const { LoopSetupCard } = await import("../shared/LoopViews");
+    // An older hub's summary holds the task's lines as they are, the file's pair too.
+    const summary = implementCard.replace(
+      "             (+2 more lines)",
+      "             Uploaded file: spec.md\n             /w/.twr-uploads/1/spec.md",
+    );
+    const html = renderToStaticMarkup(
+      createElement(LoopSetupCard, {
+        item: card({ summary }),
+        thread: worker(),
+        readOnly: false,
+        onRespond: async () => {},
+      }),
+    );
+    expect(html).toContain(
+      '<ul class="sent-attachments" aria-label="Attached files">',
+    );
+    expect(html).toContain("<span>spec.md</span>");
+    expect(html).not.toContain(".twr-uploads");
+    expect(html).not.toContain("Uploaded file");
+    expect(html).toContain("test it with the fixtures");
+  });
+
   it("has no Workers row for an implementer whose runtime runs no subagents", async () => {
     const { LoopSetupCard } = await import("../shared/LoopViews");
     // The hub leaves the row out of a card whose setup says `no_workers`; the card draws
@@ -870,12 +904,12 @@ describe("rendered", () => {
     expect(html).toContain("<dt>Plan</dt><dd>revision 1 · contract risk no");
     expect(html).toContain("<dt>Commit</dt><dd>one commit at the end</dd>");
     expect(html).toContain("<b>m1</b> 2 findings · 1 new class");
-    // In the ladder Skip to verify can be asked for (not here: no live connection).
-    expect(html).toMatch(/>Skip to verify<\/button>/);
+    // In the ladder Finish early can be asked for (not here: no live connection).
+    expect(html).toMatch(/>Finish early<\/button>/);
     expect(html).not.toContain("Nothing has been built to verify yet");
   });
 
-  it("lists the plan check's round and holds Skip to verify before the ladder", async () => {
+  it("lists the plan check's round and holds Finish early before the ladder", async () => {
     const html = await section(
       worker({
         loop: implementing({
@@ -888,7 +922,7 @@ describe("rendered", () => {
     );
     expect(html).toContain("<b>p1</b> under review");
     expect(html).toContain(
-      "Nothing has been built to verify yet: Skip to verify is available from the ladder on.",
+      "Nothing has been built to verify yet: Finish early is available from the review rounds on.",
     );
     expect(html).toMatch(/aria-describedby="[^"]*-skip-why"/);
   });
@@ -982,27 +1016,30 @@ describe("rendered", () => {
     );
   });
 
-  it("draws Send's caret, and the phone's ↻ button, named", async () => {
+  it("draws Run as loop beside Send, and the phone's ↻ switch, named", async () => {
     const { SendAsLoop } = await import("../shared/LoopViews");
     const desktop = renderToStaticMarkup(
       createElement(SendAsLoop, {
         thread: worker(),
         phone: false,
         busy: false,
-        onSend: () => {},
+        on: false,
+        onChange: () => {},
       }),
     );
-    expect(desktop).toContain('aria-label="More ways to send"');
-    expect(desktop).toContain('aria-expanded="false"');
+    expect(desktop).toContain('role="switch"');
+    expect(desktop).toContain('aria-checked="false"');
+    expect(desktop).toMatch(/>Run as loop<\/button>/);
     const phone = renderToStaticMarkup(
       createElement(SendAsLoop, {
         thread: worker(),
         phone: true,
         busy: false,
-        onSend: () => {},
+        on: true,
+        onChange: () => {},
       }),
     );
-    expect(phone).toContain('aria-label="Send as implementation loop to api…"');
+    expect(phone).toContain('aria-label="Run as loop"');
     expect(phone).toContain('class="send-loop-button"');
   });
 });

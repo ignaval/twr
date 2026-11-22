@@ -389,7 +389,7 @@ impl Hub {
                 "say routes the user's messages; the orchestrator uses thread.send",
             ));
         }
-        let message = message.trim();
+        let message = twr_core::upload::trim_message(message);
         if message.is_empty() {
             return Err(rpc(codes::BAD_REQUEST, "message is empty"));
         }
@@ -644,7 +644,7 @@ impl Hub {
                 "say routes the user's messages; the orchestrator uses thread.send",
             ));
         }
-        let message = message.trim();
+        let message = twr_core::upload::trim_message(message);
         if message.is_empty() {
             return Err(rpc(codes::BAD_REQUEST, "message is empty"));
         }

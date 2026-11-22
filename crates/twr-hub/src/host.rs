@@ -430,7 +430,7 @@ impl ThreadHost for LocalHost {
         use std::sync::atomic::Ordering;
         let faulted = self
             .start_time_faults
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
             .is_ok();
         if faulted {
             return None;

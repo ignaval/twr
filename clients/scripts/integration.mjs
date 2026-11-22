@@ -1,5 +1,6 @@
 // Real Electron + real Rust hub + twr's deterministic test adapter. No provider account,
 // user's config, network agent, or existing workspace is touched.
+import { floatTestWindow } from "./hyprland-window.mjs";
 import { performanceAudit } from "./performance.mjs";
 import { stopFixture } from "./fixture-cleanup.mjs";
 import { _electron as electron, chromium } from "@playwright/test";
@@ -229,6 +230,7 @@ try {
       timeout: 60000,
     });
   applicationProcess = packagedProcess || application.process();
+  await floatTestWindow(applicationProcess.pid);
   const page = await application.firstWindow();
   page.on("pageerror", (error) => errors.push(error.message));
   await page
@@ -400,14 +402,17 @@ try {
     .filter({ hasText: "Permission requested" })
     .waitFor({ state: "hidden", timeout: 15000 });
   console.log("Revision-bound permission answered");
-  // Conversation and message routing: selecting a card doesn't change the destination.
+  // Conversation and message routing: one card click opens the thread directly.
   await page
     .getByRole("button", { name: /api.*done/ })
     .first()
     .click();
-  await page.getByRole("button", { name: "Talk to this thread" }).click();
   await page.getByRole("textbox", { name: "Message api directly" }).waitFor();
-  await page.getByText("Hello desktop", { exact: true }).waitFor();
+  // Scoped: the latest-user shortcut above the history repeats the message's first line.
+  await page
+    .locator(".conversation-scroll")
+    .getByText("Hello desktop", { exact: true })
+    .waitFor();
   await page
     .locator(".conversation-scroll")
     .getByText("Finished safely", { exact: true })
@@ -462,11 +467,11 @@ try {
   await deny.click();
   await longRequest.waitFor({ state: "hidden" });
   await page.setViewportSize(fullViewport);
-  const showSidebar = page.getByRole("button", {
-    name: "Show sidebar",
-    exact: true,
-  });
-  if (await showSidebar.isVisible()) await showSidebar.click();
+  // Widening the window brings back the sidebar the wide layout had (a tiling window
+  // manager narrows and widens a window as others open and close beside it).
+  await page
+    .getByRole("button", { name: "Hide sidebar", exact: true })
+    .waitFor({ timeout: 5000 });
   console.log(
     "PASS: long inline requests preserve a visible composer in narrow windows",
   );
@@ -483,7 +488,9 @@ try {
   const create = page.getByRole("dialog", { name: "New thread", exact: true });
   await create.getByLabel(/Project or repository/).fill("demo");
   await create.getByLabel("Name", { exact: true }).fill("ui-first");
-  await create.getByLabel("Runtime", { exact: true }).fill("fake");
+  // The runtime is one of the less common choices, under More options.
+  await create.getByText("More options", { exact: true }).click();
+  await create.getByLabel("Runtime", { exact: true }).selectOption("fake");
   await create.locator('button[type="submit"]').click();
   const firstComposer = page.getByRole("textbox", {
     name: "Message ui-first directly",
@@ -498,7 +505,6 @@ try {
     .locator(".thread-list .thread-card")
     .filter({ hasText: "api" })
     .click();
-  await page.getByRole("button", { name: "Talk to this thread" }).click();
   // Structured forms really run in a PTY, and interactive attach reaches the same session.
   const session = await page.evaluate(() =>
     window.twr.terminalOpen({ args: ["attach", "api"], title: "Attach test" }),
@@ -597,7 +603,8 @@ try {
     { env, stdio: "pipe" },
   );
   await page
-    .getByRole("button", { name: "Open command palette", exact: true })
+    .locator(".sidebar-footer")
+    .getByRole("button", { name: "Commands", exact: true })
     .click();
   await page
     .getByRole("textbox", { name: "Search commands" })
@@ -655,7 +662,6 @@ try {
     .locator(".thread-list .thread-card")
     .filter({ hasText: "api" })
     .click();
-  await page.getByRole("button", { name: "Talk to this thread" }).click();
   await page
     .getByRole("button", {
       name: "Continue with configured features",
@@ -750,25 +756,23 @@ try {
     .getByRole("button", { name: "Settings", exact: true })
     .first()
     .click();
-  const suggestionSetting = page.getByRole("checkbox", {
+  // Settings › Agents › New thread defaults: a switch saves as it changes.
+  await page.getByRole("tab", { name: "Agents", exact: true }).click();
+  const suggestionSetting = page.getByRole("switch", {
     name: "Suggest next messages",
     exact: true,
   });
   await suggestionSetting.uncheck();
-  const suggestionRow = page
-    .locator(".setting-row")
-    .filter({ has: suggestionSetting });
-  await suggestionRow
-    .getByRole("button", { name: "Save", exact: true })
-    .click();
-  await suggestionRow
-    .getByRole("button", { name: "Saved", exact: true })
+  await page
+    .locator(".app-option")
+    .filter({ has: suggestionSetting })
+    .getByRole("status")
+    .filter({ hasText: "Saved" })
     .waitFor();
   await page
     .locator(".thread-list .thread-card")
     .filter({ hasText: "api" })
     .click();
-  await page.getByRole("button", { name: "Talk to this thread" }).click();
   await suggestedComposer.waitFor();
   await page.waitForTimeout(1000);
   assert.notEqual(
@@ -788,8 +792,9 @@ try {
     .getByRole("button", { name: "Settings", exact: true })
     .first()
     .click();
-  const interfaceText = page.getByRole("slider", { name: "Interface text" });
-  await interfaceText.fill("22");
+  await page.getByRole("tab", { name: "General", exact: true }).click();
+  const interfaceText = page.getByRole("combobox", { name: "Interface text" });
+  await interfaceText.selectOption({ label: "Extra large" });
   await page.waitForFunction(
     () =>
       getComputedStyle(document.documentElement)
@@ -800,7 +805,6 @@ try {
     .locator(".thread-list .thread-card")
     .filter({ hasText: "api" })
     .click();
-  await page.getByRole("button", { name: "Talk to this thread" }).click();
   await suggestedComposer.waitFor();
   const composerBox = () =>
     page.evaluate(() => {
@@ -879,21 +883,18 @@ try {
       );
   }
   await page.setViewportSize(fullViewport);
-  const sidebarBack = page.getByRole("button", {
-    name: "Show sidebar",
-    exact: true,
-  });
-  if (await sidebarBack.isVisible()) await sidebarBack.click();
+  await page
+    .getByRole("button", { name: "Hide sidebar", exact: true })
+    .waitFor({ timeout: 5000 });
   await page
     .getByRole("button", { name: "Settings", exact: true })
     .first()
     .click();
-  await interfaceText.fill("13");
+  await interfaceText.selectOption({ label: "Default" });
   await page
     .locator(".thread-list .thread-card")
     .filter({ hasText: "api" })
     .click();
-  await page.getByRole("button", { name: "Talk to this thread" }).click();
   await suggestedComposer.waitFor();
   console.log(
     "PASS: the message field grows with wrapped text at 22 px, to its cap, and shrinks back, in full and phone-width windows",
@@ -1092,7 +1093,6 @@ try {
     .locator(".thread-list .thread-card")
     .filter({ hasText: "api" })
     .click();
-  await page.getByRole("button", { name: "Talk to this thread" }).click();
   await page.setViewportSize({ width: 520, height: 850 });
   assert(
     await page
@@ -1112,9 +1112,12 @@ try {
     .evaluate((element) => (element.open = true));
   await page
     .locator(".sidebar-secondary")
-    .getByRole("button", { name: "Accounts", exact: true })
+    .getByRole("button", { name: "Machines & accounts", exact: true })
     .click();
-  await page.getByRole("heading", { name: "Accounts", exact: true }).waitFor();
+  await page
+    .getByRole("heading", { name: /accounts/i })
+    .first()
+    .waitFor();
   await page
     .locator(".compact-nav")
     .getByRole("button", { name: "Chat", exact: true })

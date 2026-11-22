@@ -78,6 +78,15 @@ jobs:
           rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy --no-self-update
           rustc --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # rust-cache deletes the libraries sherpa-onnx-sys downloads into target/sherpa-onnx-prebuilt
+      # but keeps their directories and the build script's recorded output, so a rebuild linked
+      # against an empty lib/ ("could not find native static library"). Drop both: the build
+      # script runs again and downloads them.
+      - name: Remove sherpa-onnx's emptied download and its cached build
+        shell: bash
+        run: |
+          [ -d target ] || exit 0
+          find target -maxdepth 4 \( -name sherpa-onnx-prebuilt -o -name 'sherpa-onnx-sys-*' -o -name 'libsherpa_onnx_sys-*' \) -prune -exec rm -rf {} +
       - name: Install Git LFS (the LFS tests of twr-runner skip without it)
         shell: bash
         run: |
@@ -90,6 +99,11 @@ jobs:
             fi
           fi
           git lfs version
+      - name: Install ALSA's headers (Linux, for the audio output of twr's own voices)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libasound2-dev pkg-config
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Use a temporary directory without symlinks (macOS)
         # macOS's $TMPDIR is under /var, a symlink to /private/var: git and twr report the
@@ -130,6 +144,15 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: twr-ps
+      # rust-cache deletes the libraries sherpa-onnx-sys downloads into target/sherpa-onnx-prebuilt
+      # but keeps their directories and the build script's recorded output, so a rebuild linked
+      # against an empty lib/ ("could not find native static library"). Drop both: the build
+      # script runs again and downloads them.
+      - name: Remove sherpa-onnx's emptied download and its cached build
+        shell: bash
+        run: |
+          [ -d target ] || exit 0
+          find target -maxdepth 4 \( -name sherpa-onnx-prebuilt -o -name 'sherpa-onnx-sys-*' -o -name 'libsherpa_onnx_sys-*' \) -prune -exec rm -rf {} +
       - run: cargo test -p twr-runner --locked --no-fail-fast
 
   deny:
@@ -222,8 +245,9 @@ jobs:
       - run: npm run format:check
       # Known advisories of high or critical severity, in the whole tree: Electron and the
       # Capacitor runtime ship in the apps but are devDependencies (electron-builder and
-      # Capacitor want them there), so `--omit=dev` would skip them.
-      - run: npm audit --audit-level=high
+      # Capacitor want them there), so `--omit=dev` would skip them. The script is
+      # `npm audit --audit-level=high` less the few advisories it allows, each with its reason.
+      - run: python3 ../.github/scripts/npm-audit.py
 
   real-systemd:
     # The rest of the suite replaces systemd-run and systemctl with stand-ins
@@ -247,6 +271,15 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: real-systemd
+      # rust-cache deletes the libraries sherpa-onnx-sys downloads into target/sherpa-onnx-prebuilt
+      # but keeps their directories and the build script's recorded output, so a rebuild linked
+      # against an empty lib/ ("could not find native static library"). Drop both: the build
+      # script runs again and downloads them.
+      - name: Remove sherpa-onnx's emptied download and its cached build
+        shell: bash
+        run: |
+          [ -d target ] || exit 0
+          find target -maxdepth 4 \( -name sherpa-onnx-prebuilt -o -name 'sherpa-onnx-sys-*' -o -name 'libsherpa_onnx_sys-*' \) -prune -exec rm -rf {} +
       - id: manager
         name: Start a systemd user manager
         shell: bash
@@ -351,7 +384,9 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.zig }}" = "true" ]; then
-            cargo zigbuild --release --locked -p twr-cli --target "$TARGET"
+            # Static musl: without twr's own voices (sherpa-onnx's prebuilt libraries are
+            # glibc's, and a static ALSA can't load PipeWire's plugin).
+            cargo zigbuild --release --locked -p twr-cli --no-default-features --target "$TARGET"
           else
             cargo build --release --locked -p twr-cli --target "$TARGET"
           fi
@@ -437,6 +472,12 @@ jobs:
 
       - name: Write the third-party licences
         run: cargo about generate --locked --fail -o THIRD-PARTY-LICENSES.html about.hbs
+
+      # The macOS builds have twr's own voices (the `neural` feature): sherpa-onnx's C and C++
+      # libraries, which cargo-about doesn't list (licenses/native).
+      - name: Add the native libraries' licences (macOS)
+        if: endsWith(matrix.target, 'apple-darwin')
+        run: node licenses/native/section.mjs THIRD-PARTY-LICENSES.html
 
       - name: Package (not published)
         shell: bash

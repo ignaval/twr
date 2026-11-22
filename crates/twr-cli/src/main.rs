@@ -12,6 +12,7 @@ mod runner_update;
 mod speech;
 #[cfg(test)]
 mod test_support;
+mod voices;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -194,14 +195,20 @@ enum Cmd {
     },
     /// The Claude Code orchestrator's file guard, a `PreToolUse` hook the hub configures: reads
     /// the hook's JSON on stdin and denies Read, Write and Edit outside the session's memory
-    /// directory, and whatever it cannot decide within its deadline (a deny decision on stdout
-    /// and exit 2).
+    /// directory (with `--protect`: Write, Edit and NotebookEdit inside twr's own directories),
+    /// and whatever it cannot decide within its deadline (a deny decision on stdout and exit
+    /// 2).
     #[command(name = "claude-memory-guard", hide = true)]
     ClaudeMemoryGuard {
         /// The one memory directory to allow (the `autoMemoryDirectory` the hub set), instead
         /// of the ones derived from the session's transcript and working directory.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "protect")]
         memory_dir: Option<PathBuf>,
+        /// A directory or file of twr's own that the file-writing tools may not touch
+        /// (repeated); the guard then lets those tools write anywhere else (an orchestrator
+        /// with `[orchestrator] access = "full"`).
+        #[arg(long)]
+        protect: Vec<PathBuf>,
     },
     /// Serve the twr MCP tools on stdin/stdout for the orchestrator's runtime (logs go to
     /// stderr; stdout is the MCP channel). The hub starts it for the orchestrator with
@@ -307,8 +314,9 @@ enum Cmd {
     /// handoff of what the previous session did; a model or effort left out is the new
     /// runtime's default. Moving back to a runtime it left a session of resumes that session
     /// instead, told what the thread did since, with the settings it had (`default` starts a new
-    /// one). Not for the orchestrator (switch it with `twr orchestrator use`); a pty thread can
-    /// only move to another runtime.
+    /// one). The orchestrator's model and effort change the same way, in place (`twr model
+    /// orch opus --effort high`); another runtime or account for it is `twr orchestrator use`.
+    /// A pty thread can only move to another runtime.
     Model {
         /// Thread id, name, alias or unique prefix.
         thread: String,
@@ -466,6 +474,10 @@ enum Cmd {
         /// rate`.
         #[arg(long, value_name = "WPM", value_parser = clap::value_parser!(u32).range(80..=500))]
         rate: Option<u32>,
+        /// The voice for messages in one language, over `[speech] voices`: `es=kokoro/ef_dora`,
+        /// `en=Ava (Premium)` (`twr voices list`). Repeat it for each language.
+        #[arg(long, value_name = "LANG=VOICE")]
+        voice_for: Vec<String>,
         /// Print a LaunchAgent (macOS) or systemd user unit (Linux) that runs this `twr speak`,
         /// and the commands to install it; installs nothing.
         #[arg(long)]
@@ -485,6 +497,12 @@ enum Cmd {
     Voice {
         #[command(subcommand)]
         cmd: VoiceCmd,
+    },
+    /// The voices that read messages aloud (docs/read-aloud.md#voices): this machine's own
+    /// (macOS's) and twr's local neural ones, which `install` downloads.
+    Voices {
+        #[command(subcommand)]
+        cmd: voices::VoicesCmd,
     },
     /// `mosh HOST -- twr ARGS...` (with `--ssh`: `ssh -t HOST -- twr ARGS...`) with `twr speak
     /// --ssh HOST` running beside it, in the background (its output in `speak.log` in twr's
@@ -894,9 +912,13 @@ enum VoiceCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Download whisper.cpp's base.en model (148 MB) to `voice/ggml-base.en.bin` in twr's data
-    /// directory, the model `[voice] model` left empty means.
-    Setup,
+    /// Download a pinned whisper.cpp model to the data directory (no config changes).
+    Setup {
+        /// Catalogue model: base.en, base (multilingual), or small.en and small (more accurate,
+        /// 488 MB, slower). Omit for base.en; explicit selection ignores [voice] model.
+        #[arg(long, value_parser = ["base.en", "base", "small.en", "small"])]
+        model: Option<String>,
+    },
     /// The text of one recording: a 16 kHz mono 16-bit WAV on stdin (at most two minutes),
     /// its text on stdout (empty when nothing was said).
     Transcribe {
@@ -1207,6 +1229,19 @@ enum OrchestratorCmd {
     /// Clear the conversation: a fresh session on the current runtime/model, no handoff.
     /// The old conversation stays in the log; workers and their attention are kept.
     Reset,
+    /// Show or set the orchestrator's access level: `limited` (twr's tools and a web search
+    /// only) or `full` (every tool a worker has, its shell included, without asking, in every
+    /// turn). Applied now, without a hub restart: a running orchestrator restarts with it on
+    /// its session, after its current turn. Kept in config.toml (`[orchestrator] access`).
+    /// Without a level: print the current one.
+    Access {
+        /// `limited` or `full`.
+        #[arg(value_parser = ["limited", "full"])]
+        level: Option<String>,
+        /// Print the raw `orchestrator.access` JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show the orchestrator: its runtime and model, its thread, the configured default and
     /// the runtimes that can host it.
     Show {
@@ -1231,6 +1266,10 @@ enum OrchestratorCmd {
         /// Model (default: the runtime's default).
         #[arg(long)]
         model: Option<String>,
+        /// Reasoning effort, one the runtime takes (`twr orchestrator show --json` lists them
+        /// under `models`), or `default`: the runtime's own (the default).
+        #[arg(long)]
+        effort: Option<String>,
         /// Do not ask the current orchestrator for a handoff summary: the new one gets only
         /// what the log shows (recent conversation, threads, attention items, reports).
         #[arg(long)]
@@ -1463,8 +1502,12 @@ fn main() -> ExitCode {
     );
     // Before anything else that could fail: a hook that exits with anything but 2 lets the
     // tool call through.
-    if let Some(Cmd::ClaudeMemoryGuard { memory_dir }) = &cli.cmd {
-        return memory_guard(memory_dir.clone());
+    if let Some(Cmd::ClaudeMemoryGuard {
+        memory_dir,
+        protect,
+    }) = &cli.cmd
+    {
+        return memory_guard(memory_dir.clone(), protect.clone());
     }
     // The hub sets the agent marker only on what it starts for a thread:
     // a hub started from an agent's shell must not pass that shell's marker on to the rest
@@ -1529,8 +1572,10 @@ fn shutdown_cli_runtime(runtime: tokio::runtime::Runtime, background: bool) {
 /// (`twr_adapters::claude_code::guard`) within the guard's deadline. A denial (outside the
 /// memory directory, stdin unreadable, a panic, no decision by the deadline) is a JSON decision
 /// on stdout and exit 2, which Claude Code blocks on either way. With `memory_dir`
-/// (`--memory-dir`), exactly that directory is allowed (`guard::check_with`).
-fn memory_guard(memory_dir: Option<PathBuf>) -> ExitCode {
+/// (`--memory-dir`), exactly that directory is allowed (`guard::check_with`); with `protect`
+/// (`--protect`), the file-writing tools may write anywhere but there
+/// (`guard::check_protected`).
+fn memory_guard(memory_dir: Option<PathBuf>, protect: Vec<PathBuf>) -> ExitCode {
     use std::io::Read;
     use twr_adapters::claude_code::guard;
     let read = || {
@@ -1540,7 +1585,12 @@ fn memory_guard(memory_dir: Option<PathBuf>) -> ExitCode {
             .read_to_string(&mut input)
             .map(|_| input)
     };
-    match guard::run_with(read, guard::deadline(), memory_dir) {
+    let policy = if protect.is_empty() {
+        guard::Policy::Memory(memory_dir)
+    } else {
+        guard::Policy::Protect(protect)
+    };
+    match guard::run_policy(read, guard::deadline(), policy) {
         Some(deny) => {
             outln!("{deny}");
             ExitCode::from(2)
@@ -2021,6 +2071,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             engine,
             voice,
             rate,
+            voice_for,
             print_service,
             control,
             announce,
@@ -2038,6 +2089,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     engine,
                     voice,
                     rate,
+                    voice_for,
                     print_service,
                     control_stdio: control.is_some(),
                     announce,
@@ -2046,6 +2098,17 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             )
             .await?;
             return Ok(ExitCode::SUCCESS);
+        }
+        // The root's voices (`[speech]`, its data directory): no hub. Installing one downloads
+        // it, which an agent need not do on its own.
+        Some(Cmd::Voices { cmd }) => {
+            if matches!(
+                cmd,
+                voices::VoicesCmd::Install { .. } | voices::VoicesCmd::Remove { .. }
+            ) {
+                refuse_agent_action("install or remove a voice")?;
+            }
+            return voices::run(cmd, &paths).await;
         }
         // The machine's own `[voice]` (the root's), as a speaker's `[speech]`: no hub. It
         // records nothing (the app with the microphone does) and sends nothing anywhere: it
@@ -2290,6 +2353,7 @@ async fn run_simple(cmd: Cmd, paths: Paths, socket: PathBuf) -> anyhow::Result<(
         | Cmd::Speech { .. }
         | Cmd::Speak { .. }
         | Cmd::Voice { .. }
+        | Cmd::Voices { .. }
         | Cmd::Remote { .. }
         | Cmd::TerminalSetup { .. }
         | Cmd::Completions { .. }
@@ -2341,10 +2405,14 @@ async fn run_simple(cmd: Cmd, paths: Paths, socket: PathBuf) -> anyhow::Result<(
             cmd: OrchestratorCmd::Show { json },
         } => orchestrator_show(&socket, json).await,
         Cmd::Orchestrator {
+            cmd: OrchestratorCmd::Access { level, json },
+        } => orchestrator_access(&socket, level.as_deref(), json).await,
+        Cmd::Orchestrator {
             cmd:
                 OrchestratorCmd::Use {
                     runtime,
                     model,
+                    effort,
                     no_summary,
                     wait,
                 },
@@ -2359,7 +2427,7 @@ async fn run_simple(cmd: Cmd, paths: Paths, socket: PathBuf) -> anyhow::Result<(
             };
             let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
             let ask: Option<Ask<'_>> = if tty { Some(&mut ask) } else { None };
-            orchestrator_use(&socket, &runtime, model, !no_summary, wait, ask).await
+            orchestrator_use(&socket, &runtime, model, effort, !no_summary, wait, ask).await
         }
         Cmd::Info { json } => info(&socket, json).await,
         Cmd::Usage {
@@ -6789,6 +6857,13 @@ fn trash_empty_text(r: &Value) -> String {
 
 // --- thread list -------------------------------------------------------------------------------
 
+/// `, effort <e>` for a reasoning effort, nothing for the runtime's default (null).
+fn effort_text(effort: &Value) -> String {
+    effort
+        .as_str()
+        .map_or_else(String::new, |e| format!(", effort {e}"))
+}
+
 /// The model part of an orchestrator line: ` model <m>` or ` (the runtime's default model)`.
 fn model_text(model: &Value) -> String {
     match model.as_str() {
@@ -6820,6 +6895,61 @@ async fn orchestrator_show(socket: &Path, raw: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn orchestrator_access(socket: &Path, level: Option<&str>, raw: bool) -> anyhow::Result<()> {
+    let mut c = connect(socket).await?;
+    let params = match level {
+        Some(l) => json!({ "access": l }),
+        None => json!({}),
+    };
+    let r = c.call("orchestrator.access", params).await?;
+    if raw {
+        outln!("{}", serde_json::to_string_pretty(&r)?);
+        return Ok(());
+    }
+    out!("{}", orchestrator_access_text(&r));
+    if let Some(e) = r["persist_error"].as_str() {
+        errln!(
+            "twr: warning: not kept in config.toml ({e}): it applies until the hub stops; set              `[orchestrator] access` there by hand to keep it"
+        );
+    }
+    Ok(())
+}
+
+/// What full access means, in one line.
+const FULL_ACCESS_NOTE: &str = "With full access the orchestrator runs any command and uses     every tool without asking, in every turn (also the ones a watch or a hub notice starts).";
+
+/// `twr orchestrator access` for an `orchestrator.access` result: the level alone when only
+/// read, else what changed and when the orchestrator picks it up.
+fn orchestrator_access_text(r: &Value) -> String {
+    let access = str_of(&r["access"]);
+    let mut out = if r["previous"].is_null() {
+        format!("orchestrator access: {access}\n")
+    } else if r["previous"] == r["access"] {
+        format!("orchestrator access is already {access}\n")
+    } else {
+        let when = match r["restart"].as_str() {
+            Some("now") => "the orchestrator is restarting with it now, on the same conversation",
+            Some("after_turn") => {
+                "the orchestrator restarts with it when its current turn ends, on the same \
+                 conversation"
+            }
+            _ => "the orchestrator starts with it next time it runs",
+        };
+        format!(
+            "orchestrator access: {access} (was {}): {when}\n",
+            str_of(&r["previous"])
+        )
+    };
+    if r["persisted"].as_bool() == Some(true) {
+        out.push_str("Kept in config.toml.\n");
+    }
+    if access == "full" {
+        out.push_str(FULL_ACCESS_NOTE);
+        out.push('\n');
+    }
+    out
+}
+
 /// The orchestrator's runtime as `twr orchestrator show`, `twr info` and `twr orchestrator
 /// use` write it (`o`: an `orchestrator.show` object, `hub.info`'s `orchestrator`, an
 /// `orchestrator.use` answer), as a thread's
@@ -6840,8 +6970,9 @@ fn orchestrator_runtime(o: &Value) -> String {
 fn orchestrator_text(o: &Value) -> String {
     let runtime = orchestrator_runtime(o);
     let mut out = format!(
-        "orchestrator: {runtime}{}{}\n",
+        "orchestrator: {runtime}{}{}{}\n",
         models_text(&o["model"], &o["model_actual"]),
+        effort_text(&o["effort"]),
         if o["available"].as_bool() == Some(true) {
             ""
         } else {
@@ -6882,6 +7013,15 @@ fn orchestrator_text(o: &Value) -> String {
         .filter_map(Value::as_str)
         .collect();
     out.push_str(&format!("can run on:   {}\n", runtimes.join(", ")));
+    if let Some(access) = o["access"].as_str() {
+        let pending = match o["running_access"].as_str() {
+            Some(r) if r != access => format!(" (its runtime runs {r} until its turn ends)"),
+            _ => String::new(),
+        };
+        out.push_str(&format!(
+            "access:       {access}{pending} (`twr orchestrator access` changes it)\n"
+        ));
+    }
     if let Some(n) = o["retired"].as_u64().filter(|n| *n > 0) {
         out.push_str(&format!(
             "retired:      {n} earlier orchestrator thread(s)\n"
@@ -6897,6 +7037,7 @@ async fn orchestrator_use(
     socket: &Path,
     runtime: &str,
     model: Option<String>,
+    effort: Option<String>,
     mut summary: bool,
     wait: Option<u64>,
     ask: Option<Ask<'_>>,
@@ -6905,6 +7046,9 @@ async fn orchestrator_use(
     let mut params = json!({ "runtime": runtime });
     if let Some(m) = model {
         params["model"] = json!(m);
+    }
+    if let Some(e) = effort {
+        params["effort"] = json!(e);
     }
     let wait_secs = wait.unwrap_or(twr_hub::hub::SUMMARY_WAIT.as_secs());
     if summary {
@@ -6954,9 +7098,10 @@ fn orchestrator_use_text(r: &Value) -> String {
 
 fn orchestrator_session_text(r: &Value, reset: bool) -> String {
     let mut out = format!(
-        "orchestrator is now {}{}: thread {} ({})",
+        "orchestrator is now {}{}{}: thread {} ({})",
         orchestrator_runtime(r),
         model_text(&r["model"]),
+        effort_text(&r["effort"]),
         str_of(&r["name"]),
         str_of(&r["thread"])
     );
@@ -6990,6 +7135,31 @@ fn orchestrator_session_text(r: &Value, reset: bool) -> String {
         out.push_str(&format!(" ({dropped} queued prompt(s) dropped)"));
     }
     out.push_str(".\n");
+    // The user's own, whole, so they can be sent again.
+    let mine: Vec<&str> = p["dropped_messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if !mine.is_empty() {
+        out.push_str("Your dropped message(s), to send again:\n");
+        for m in mine {
+            // Each line as it was sent, its files' `Uploaded file:` lines and paths too (a
+            // path's own trailing space included), so it can be sent again exactly.
+            for (i, line) in m.split('\n').enumerate() {
+                out.push_str(if i == 0 { "  - " } else { "    " });
+                out.push_str(line.strip_suffix('\r').unwrap_or(line));
+                out.push('\n');
+            }
+        }
+    }
+    if let Some(n) = p["dropped_messages_omitted"].as_u64().filter(|n| *n > 0) {
+        out.push_str(&format!(
+            "{n} more of your dropped message(s) were too long to return and can't be sent \
+             again from here.\n"
+        ));
+    }
     let h = &r["handoff"];
     if !h.is_object() {
         if !reset {
@@ -8236,8 +8406,8 @@ async fn voice(cmd: VoiceCmd, paths: &Paths) -> anyhow::Result<()> {
                 println!("voice: {}", s.problem.as_deref().unwrap_or("unavailable"));
             }
         }
-        VoiceCmd::Setup => {
-            voice_setup(&config.voice, &root.data_dir).await?;
+        VoiceCmd::Setup { model } => {
+            voice_setup(&config.voice, &root.data_dir, model.as_deref()).await?;
             let s = twr_voice::status(&config.voice, &root.data_dir, path.as_deref());
             match (s.available, s.problem) {
                 (true, _) => println!("voice: ready"),
@@ -8283,6 +8453,7 @@ async fn voice(cmd: VoiceCmd, paths: &Paths) -> anyhow::Result<()> {
 struct ModelCheck {
     len: u64,
     sha256: &'static str,
+    source: &'static str,
     got: u64,
     head: Vec<u8>,
     digest: ring::digest::Context,
@@ -8293,6 +8464,7 @@ impl ModelCheck {
         ModelCheck {
             len,
             sha256,
+            source: twr_voice::engine::MODEL_URL,
             got: 0,
             head: Vec::with_capacity(4),
             digest: ring::digest::Context::new(&ring::digest::SHA256),
@@ -8300,17 +8472,18 @@ impl ModelCheck {
     }
 
     fn update(&mut self, chunk: &[u8]) -> anyhow::Result<()> {
-        use twr_voice::engine::{is_model, MODEL_URL};
+        use twr_voice::engine::is_model;
+        let source = self.source;
         if self.head.len() < 4 {
             self.head.extend(chunk.iter().take(4 - self.head.len()));
             if self.head.len() == 4 && !is_model(&self.head) {
-                bail!("{MODEL_URL} did not send a whisper model; nothing was kept");
+                bail!("{source} did not send a whisper model; nothing was kept");
             }
         }
         self.got += chunk.len() as u64;
         if self.got > self.len {
             bail!(
-                "{MODEL_URL} sent more than the model's {} bytes; nothing was kept",
+                "{source} sent more than the model's {} bytes; nothing was kept",
                 self.len
             );
         }
@@ -8319,10 +8492,11 @@ impl ModelCheck {
     }
 
     fn finish(self) -> anyhow::Result<()> {
-        use twr_voice::engine::{is_model, MODEL_URL};
+        use twr_voice::engine::is_model;
+        let source = self.source;
         if self.got != self.len || !is_model(&self.head) {
             bail!(
-                "{MODEL_URL} did not send a whole whisper model ({} of {} bytes); nothing was kept",
+                "{source} did not send a whole whisper model ({} of {} bytes); nothing was kept",
                 self.got,
                 self.len
             );
@@ -8336,7 +8510,7 @@ impl ModelCheck {
             .collect();
         if actual != self.sha256 {
             bail!(
-                "{MODEL_URL} is not the model twr expects: its SHA-256 is {actual}, not {}; \
+                "{source} is not the model twr expects: its SHA-256 is {actual}, not {}; \
                  nothing was kept",
                 self.sha256
             );
@@ -8345,27 +8519,84 @@ impl ModelCheck {
     }
 }
 
-/// `twr voice setup`: [`twr_voice::engine::MODEL_URL`] (pinned to a commit) to the default
-/// model's place, through a private file beside it, renamed into place only once whole and its
-/// SHA-256 the one twr expects ([`ModelCheck`]).
-async fn voice_setup(cfg: &twr_core::config::VoiceConfig, data_dir: &Path) -> anyhow::Result<()> {
-    use std::io::Write;
-    use twr_voice::engine::{is_model, DEFAULT_MODEL, MODEL_BYTES, MODEL_SHA256, MODEL_URL};
-    if !cfg.model.trim().is_empty() {
-        bail!(
-            "[voice] model names your own model ({}): `twr voice setup` only downloads the \
-             default one; leave [voice] model empty to use it",
-            cfg.model.trim()
-        );
+/// Select a canonical destination, retaining no-flag protection of custom configuration.
+fn setup_model(
+    cfg: &twr_core::config::VoiceConfig,
+    selected: Option<&str>,
+) -> anyhow::Result<&'static twr_voice::engine::ModelSpec> {
+    if selected.is_none() && !cfg.model.trim().is_empty() {
+        bail!("[voice] model names your own model ({}): `twr voice setup` only downloads the default one; leave [voice] model empty to use it, or select --model explicitly", cfg.model.trim());
     }
-    let target = data_dir.join(DEFAULT_MODEL);
-    if std::fs::File::open(&target)
-        .and_then(|mut f| {
-            let mut head = [0u8; 4];
-            std::io::Read::read_exact(&mut f, &mut head).map(|_| head)
-        })
-        .is_ok_and(|head| is_model(&head))
-    {
+    twr_voice::engine::model_spec(selected.unwrap_or("base.en"))
+}
+
+/// Fully validate existing files too: a ggml header alone does not establish integrity.
+fn verified_model(target: &Path, spec: &twr_voice::engine::ModelSpec) -> anyhow::Result<()> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(target)?;
+    if file.metadata()?.len() != spec.bytes {
+        bail!("model size mismatch");
+    }
+    let mut check = ModelCheck::new(spec.bytes, spec.sha256);
+    check.source = spec.url;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        check.update(&buf[..n])?;
+    }
+    check.finish()
+}
+
+/// The private staging file owns cleanup even if the download future is cancelled.
+struct ModelDownload {
+    part: tempfile::NamedTempFile,
+    check: ModelCheck,
+}
+
+impl ModelDownload {
+    fn new(target: &Path, spec: &twr_voice::engine::ModelSpec) -> anyhow::Result<Self> {
+        let dir = target.parent().context("the model's directory")?;
+        let part = tempfile::Builder::new()
+            .prefix(".model-")
+            .tempfile_in(dir)?;
+        let mut check = ModelCheck::new(spec.bytes, spec.sha256);
+        check.source = spec.url;
+        Ok(Self { part, check })
+    }
+
+    fn write(&mut self, chunk: &[u8]) -> anyhow::Result<()> {
+        use std::io::Write;
+        self.check.update(chunk)?;
+        self.part.write_all(chunk)?;
+        Ok(())
+    }
+
+    fn finish(self, target: &Path) -> anyhow::Result<()> {
+        self.check.finish()?;
+        self.part
+            .as_file()
+            .sync_all()
+            .context("writing the model")?;
+        self.part
+            .persist(target)
+            .with_context(|| format!("moving the model to {}", target.display()))?;
+        Ok(())
+    }
+}
+
+/// Provision only a verified model, atomically, through a unique private temporary file.
+async fn voice_setup(
+    cfg: &twr_core::config::VoiceConfig,
+    data_dir: &Path,
+    selected: Option<&str>,
+) -> anyhow::Result<()> {
+    let spec = setup_model(cfg, selected)?;
+    let source = spec.url;
+    let target = data_dir.join(spec.path);
+    if verified_model(&target, spec).is_ok() {
         eprintln!("twr: the model is already at {}", target.display());
         return Ok(());
     }
@@ -8374,25 +8605,26 @@ async fn voice_setup(cfg: &twr_core::config::VoiceConfig, data_dir: &Path) -> an
     let client = https_client()
         .https_only(true)
         .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(30 * 60))
         .build()
         .context("setting up the HTTP client")?;
-    eprintln!("twr: downloading {MODEL_URL}");
+    eprintln!("twr: downloading {source}");
     let mut resp = client
-        .get(MODEL_URL)
+        .get(source)
         .send()
         .await
-        .with_context(|| format!("downloading {MODEL_URL}"))?;
+        .with_context(|| format!("downloading {source}"))?;
     if !resp.status().is_success() {
-        bail!("downloading {MODEL_URL} failed: HTTP {}", resp.status());
+        bail!("downloading {source} failed: HTTP {}", resp.status());
     }
-    if let Some(total) = resp.content_length().filter(|n| *n != MODEL_BYTES) {
-        bail!("{MODEL_URL} is {total} bytes, not the model's {MODEL_BYTES}; nothing was kept");
+    if let Some(total) = resp.content_length().filter(|n| *n != spec.bytes) {
+        bail!(
+            "{source} is {total} bytes, not the model's {}; nothing was kept",
+            spec.bytes
+        );
     }
-    let part = target.with_extension(format!("bin.part-{}", std::process::id()));
+    let mut staging = ModelDownload::new(&target, spec)?;
     let download = async {
-        let mut file =
-            std::fs::File::create(&part).with_context(|| format!("creating {}", part.display()))?;
-        let mut check = ModelCheck::new(MODEL_BYTES, MODEL_SHA256);
         let mut shown = 0;
         let chunk_wait = std::time::Duration::from_secs(60);
         while let Some(chunk) = tokio::time::timeout(chunk_wait, resp.chunk())
@@ -8400,19 +8632,13 @@ async fn voice_setup(cfg: &twr_core::config::VoiceConfig, data_dir: &Path) -> an
             .map_err(|_| anyhow!("the download stalled"))?
             .context("downloading the model")?
         {
-            check.update(&chunk)?;
-            file.write_all(&chunk)
-                .with_context(|| format!("writing {}", part.display()))?;
-            let pct = check.got * 100 / MODEL_BYTES;
+            staging.write(&chunk)?;
+            let pct = staging.check.got * 100 / spec.bytes;
             if pct >= shown + 10 {
                 shown = pct - pct % 10;
                 eprintln!("twr: {shown}%");
             }
         }
-        check.finish()?;
-        file.sync_all().context("writing the model")?;
-        std::fs::rename(&part, &target)
-            .with_context(|| format!("moving the model to {}", target.display()))?;
         anyhow::Ok(())
     };
     // Stopped (Ctrl-C, or the desktop app giving up): the partial file goes too.
@@ -8423,10 +8649,8 @@ async fn voice_setup(cfg: &twr_core::config::VoiceConfig, data_dir: &Path) -> an
         _ = term.recv() => Err(anyhow!("download stopped")),
         _ = tokio::signal::ctrl_c() => Err(anyhow!("download stopped")),
     };
-    if result.is_err() {
-        let _ = std::fs::remove_file(&part);
-    }
     result?;
+    staging.finish(&target)?;
     eprintln!("twr: the model is at {}", target.display());
     Ok(())
 }
@@ -8867,6 +9091,15 @@ fn spawn_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
         // file named in their environment.
         .env_remove(twr_core::client::TEST_USER_TOKEN_ENV);
     twr_adapters::process::new_session_std(&mut cmd);
+    // It outlives this process, so it keeps none of the descriptors this one inherited (the
+    // desktop app's, when the app runs this `twr`).
+    // SAFETY: close_inherited_on_exec is async-signal-safe and allocates nothing.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(
+            &mut cmd,
+            twr_core::fork::close_inherited_on_exec,
+        );
+    }
     spawn_reaped(&mut cmd).with_context(|| format!("starting the hub ({})", exe.display()))?;
     Ok(())
 }
@@ -9137,6 +9370,103 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn voice_setup_selection_and_cli_contract() {
+        use twr_core::config::VoiceConfig;
+        let mut cfg = VoiceConfig::default();
+        assert_eq!(setup_model(&cfg, None).unwrap().name, "base.en");
+        for name in ["base", "base.en"] {
+            assert_eq!(setup_model(&cfg, Some(name)).unwrap().name, name);
+            assert!(Cli::try_parse_from(["twr", "voice", "setup", "--model", name]).is_ok());
+            let args = ["voice", "setup", "--model", name].map(String::from);
+            assert!(twr_core::app_commands::validate(&args).is_ok());
+        }
+        assert!(Cli::try_parse_from(["twr", "voice", "setup"]).is_ok());
+        for name in ["large", "../base", "https://example.com/model", "BASE"] {
+            assert!(setup_model(&cfg, Some(name)).is_err());
+            assert!(Cli::try_parse_from(["twr", "voice", "setup", "--model", name]).is_err());
+        }
+        cfg.model = "/custom/model.bin".into();
+        assert!(setup_model(&cfg, None).is_err());
+        assert_eq!(
+            setup_model(&cfg, Some("base")).unwrap().path,
+            "voice/ggml-base.bin"
+        );
+        cfg.model = "/isolated/voice/ggml-base.bin".into();
+        assert!(setup_model(&cfg, None).is_err());
+        assert!(setup_model(&cfg, Some("base")).is_ok());
+        assert_eq!(cfg.model, "/isolated/voice/ggml-base.bin");
+    }
+
+    #[test]
+    fn voice_setup_private_atomic_and_existing_integrity() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("model.bin");
+        let bytes = b"lmggfixture model";
+        let spec = twr_voice::engine::ModelSpec {
+            name: "fixture",
+            path: "model.bin",
+            url: "https://example.invalid/model",
+            bytes: bytes.len() as u64,
+            sha256: Box::leak(sha256_hex(bytes).into_boxed_str()),
+            size: "17 B",
+        };
+        std::fs::write(&target, b"original").unwrap();
+        let mut one = ModelDownload::new(&target, &spec).unwrap();
+        let two = ModelDownload::new(&target, &spec).unwrap();
+        assert_ne!(one.part.path(), two.part.path());
+        assert_eq!(
+            one.part.as_file().metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let abandoned = two.part.path().to_owned();
+        drop(two);
+        assert!(!abandoned.exists());
+        one.write(&bytes[..5]).unwrap();
+        let partial = one.part.path().to_owned();
+        assert!(one.finish(&target).is_err());
+        assert!(!partial.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        let mut bad = ModelDownload::new(&target, &spec).unwrap();
+        let mut corrupt = bytes.to_vec();
+        *corrupt.last_mut().unwrap() ^= 1;
+        bad.write(&corrupt).unwrap();
+        assert!(bad.finish(&target).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        let mut good = ModelDownload::new(&target, &spec).unwrap();
+        good.write(bytes).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        let mut concurrent = ModelDownload::new(&target, &spec).unwrap();
+        concurrent.write(bytes).unwrap();
+        good.finish(&target).unwrap();
+        concurrent.finish(&target).unwrap();
+        verified_model(&target, &spec).unwrap();
+        std::fs::write(&target, corrupt).unwrap();
+        assert!(verified_model(&target, &spec).is_err());
+        std::fs::write(&target, b"lmgg").unwrap();
+        assert!(verified_model(&target, &spec).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn voice_setup_cancelled_download_cleans_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("model.bin");
+        std::fs::write(&target, b"original").unwrap();
+        let spec = twr_voice::engine::model_spec("base").unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_millis(1), async {
+            let mut staging = ModelDownload::new(&target, spec).unwrap();
+            staging.write(b"lmggpartial").unwrap();
+            std::future::pending::<()>().await;
+            staging.finish(&target).unwrap();
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     /// `twr voice setup` keeps only exactly the model it pinned: ggml's magic, its size and its
     /// SHA-256, checked while it streams and before the rename.
@@ -10481,8 +10811,16 @@ mod tests {
         assert!(matches!(
             c.cmd,
             Some(Cmd::Orchestrator {
-                cmd: OrchestratorCmd::Use { ref runtime, ref model, no_summary: false, wait: None }
+                cmd: OrchestratorCmd::Use { ref runtime, ref model, effort: None, no_summary: false, wait: None }
             }) if runtime == "codex" && model.as_deref() == Some("o5")
+        ));
+        let c = Cli::try_parse_from(["twr", "orchestrator", "use", "codex", "--effort", "high"])
+            .unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Orchestrator {
+                cmd: OrchestratorCmd::Use { ref effort, model: None, .. }
+            }) if effort.as_deref() == Some("high")
         ));
         let c =
             Cli::try_parse_from(["twr", "orchestrator", "use", "codex", "--no-summary"]).unwrap();
@@ -10518,6 +10856,42 @@ mod tests {
             "--no-summary"
         ])
         .is_err());
+        for (args, want) in [
+            (&["twr", "orchestrator", "access"][..], None),
+            (&["twr", "orchestrator", "access", "full"][..], Some("full")),
+            (
+                &["twr", "orchestrator", "access", "limited"][..],
+                Some("limited"),
+            ),
+        ] {
+            let c = Cli::try_parse_from(args).unwrap();
+            assert!(
+                matches!(
+                    c.cmd,
+                    Some(Cmd::Orchestrator {
+                        cmd: OrchestratorCmd::Access { ref level, json: false }
+                    }) if level.as_deref() == want
+                ),
+                "{args:?}"
+            );
+        }
+        assert!(Cli::try_parse_from(["twr", "orchestrator", "access", "root"]).is_err());
+        assert_eq!(
+            orchestrator_access_text(&json!({"access": "limited"})),
+            "orchestrator access: limited\n"
+        );
+        let set = orchestrator_access_text(&json!({
+            "access": "full", "previous": "limited", "persisted": true, "restart": "after_turn"
+        }));
+        assert!(set.starts_with("orchestrator access: full (was limited): the orchestrator restarts with it when its current turn ends"), "{set}");
+        assert!(
+            set.contains("Kept in config.toml.") && set.contains("without asking, in every turn"),
+            "{set}"
+        );
+        let same = orchestrator_access_text(&json!({
+            "access": "limited", "previous": "limited", "persisted": false, "restart": "none"
+        }));
+        assert_eq!(same, "orchestrator access is already limited\n");
         let c = Cli::try_parse_from(["twr", "orchestrator", "show", "--json"]).unwrap();
         assert!(matches!(
             c.cmd,
@@ -10527,11 +10901,23 @@ mod tests {
         ));
         assert!(Cli::try_parse_from(["twr", "orchestrator", "use"]).is_err());
 
+        let with_effort = orchestrator_use_text(&json!({
+            "thread": "01NEW", "name": "orchestrator", "runtime": "codex", "model": "o5",
+            "effort": "high", "started": false, "previous": null,
+        }));
+        assert!(
+            with_effort.starts_with(
+                "orchestrator is now codex model o5, effort high: thread orchestrator (01NEW),"
+            ),
+            "{with_effort}"
+        );
         let switched = orchestrator_use_text(&json!({
             "thread": "01NEW", "name": "orchestrator", "runtime": "codex", "model": "o5",
             "started": true,
             "previous": {"thread": "01OLD", "runtime": "claude-code", "model": null,
-                         "stopping": true, "dropped_prompts": 2},
+                         "stopping": true, "dropped_prompts": 2,
+                         "dropped_messages": [
+                             "and the deploys\nplease\nUploaded file: a.png\n/w/.twr-uploads/u1/a.png"]},
         }));
         assert!(
             switched.starts_with(
@@ -10547,7 +10933,30 @@ mod tests {
             switched.contains("was retired and is being stopped (2 queued prompt(s) dropped)."),
             "{switched}"
         );
+        assert!(
+            switched.contains(
+                "Your dropped message(s), to send again:\n  - and the deploys\n    please\n    \
+                 Uploaded file: a.png\n    /w/.twr-uploads/u1/a.png\n"
+            ),
+            "{switched}"
+        );
         assert!(switched.contains("No handoff"), "{switched}");
+        assert!(!switched.contains("too long to return"), "{switched}");
+        // Those the hub left out, too long for its answer, are counted.
+        let omitted = orchestrator_use_text(&json!({
+            "thread": "01NEW", "name": "orchestrator", "runtime": "codex", "model": null,
+            "started": true,
+            "previous": {"thread": "01OLD", "runtime": "claude-code", "model": null,
+                         "dropped_prompts": 3, "dropped_messages": ["one"],
+                         "dropped_messages_omitted": 2},
+        }));
+        assert!(
+            omitted.contains(
+                "  - one\n2 more of your dropped message(s) were too long to return and can't \
+                 be sent again from here.\n"
+            ),
+            "{omitted}"
+        );
         let handed = orchestrator_use_text(&json!({
             "thread": "01NEW", "name": "orchestrator", "runtime": "codex", "model": null,
             "started": true,
@@ -10612,6 +11021,14 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("retired:      1 earlier"), "{shown}");
+        let shown = orchestrator_text(&json!({
+            "available": true, "runtime": "codex", "model": "o5", "effort": "xhigh",
+            "thread": null, "configured": {"runtime": "codex"}, "runtimes": ["codex"],
+        }));
+        assert!(
+            shown.starts_with("orchestrator: codex model o5, effort xhigh\n"),
+            "{shown}"
+        );
     }
 
     /// The orchestrator's runtime is labelled with its account only while `account_shown`:

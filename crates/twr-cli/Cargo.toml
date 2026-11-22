@@ -12,6 +12,12 @@ description = "twr: a control tower for parallel coding agents"
 name = "twr"
 path = "src/main.rs"
 
+[features]
+default = ["neural"]
+# twr's own voices (`twr voices install`, docs/read-aloud.md#twrs-voices): sherpa-onnx's
+# prebuilt libraries and an audio output. The static musl release builds without it.
+neural = ["dep:twr-neural", "twr-speech/neural"]
+
 [dependencies]
 twr-adapters.workspace = true
 twr-core.workspace = true
@@ -21,6 +27,8 @@ twr-mcp.workspace = true
 twr-runner.workspace = true
 # `twr speak` and `twr remote`: the speaker (docs/read-aloud.md).
 twr-speech.workspace = true
+# `twr voices`: the catalog of twr's local voices, installing and timing them (`neural`).
+twr-neural = { workspace = true, optional = true }
 twr-voice.workspace = true
 twr-tui.workspace = true
 anyhow.workspace = true
@@ -35,6 +43,10 @@ ring.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# `twr voices render`: audio for the mobile gateway, as base64 in JSON lines.
+base64 = "0.23.1"
+# Private, unique, automatically cleaned voice model downloads.
+tempfile.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
@@ -45,7 +57,6 @@ webpki-roots.workspace = true
 twr-docs.workspace = true
 crossterm.workspace = true
 portable-pty.workspace = true
-tempfile.workspace = true
 
 [build-dependencies]
 twr-source.workspace = true

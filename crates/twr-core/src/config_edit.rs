@@ -23,12 +23,17 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 
-/// A value the settings view writes: only scalars.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A value the settings view (and the hub's `config.set`) writes: only scalars.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Scalar {
     Bool(bool),
     Int(i64),
+    /// A finite float (one that is not is refused by [`set_key`]).
+    Float(f64),
     Str(String),
+    /// A list of strings, written on one line (`["~/code", "~/src"]`). Read back only by
+    /// [`set_key`]'s check: [`Scalar::of`] still takes no array.
+    Strs(Vec<String>),
 }
 
 impl Scalar {
@@ -37,16 +42,40 @@ impl Scalar {
         match self {
             Scalar::Bool(b) => toml::Value::Boolean(*b),
             Scalar::Int(i) => toml::Value::Integer(*i),
+            Scalar::Float(f) => toml::Value::Float(*f),
             Scalar::Str(s) => toml::Value::String(s.clone()),
+            Scalar::Strs(v) => {
+                toml::Value::Array(v.iter().cloned().map(toml::Value::String).collect())
+            }
         }
     }
 
-    /// The value as TOML text, always on one line (a string is a basic string, escaped).
-    fn text(&self) -> String {
+    /// The value as TOML text, always on one line (a string is a basic string, escaped; a
+    /// float always with a `.` or an exponent, so it reads back as a float).
+    pub fn text(&self) -> String {
         match self {
             Scalar::Bool(b) => b.to_string(),
             Scalar::Int(i) => i.to_string(),
+            Scalar::Float(f) => format!("{f:?}"),
             Scalar::Str(s) => basic_string(s),
+            Scalar::Strs(v) => format!(
+                "[{}]",
+                v.iter()
+                    .map(|s| basic_string(s))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
+    /// The scalar a parsed document holds as `v`; `None` for a table, an array or a date.
+    pub fn of(v: &toml::Value) -> Option<Scalar> {
+        match v {
+            toml::Value::Boolean(b) => Some(Scalar::Bool(*b)),
+            toml::Value::Integer(i) => Some(Scalar::Int(*i)),
+            toml::Value::Float(f) => Some(Scalar::Float(*f)),
+            toml::Value::String(s) => Some(Scalar::Str(s.clone())),
+            _ => None,
         }
     }
 }
@@ -216,14 +245,62 @@ fn value_end(line: &str, from: usize, old: &toml::Value) -> Option<usize> {
     None
 }
 
+/// `text` with the value of `key` (now `old_value`) replaced by `value`'s on the one line of
+/// `body` (a table's lines) that holds it all, or why not (`name`: the key for messages).
+fn replace_value(
+    text: &str,
+    body: &[Line],
+    key: &str,
+    old_value: &toml::Value,
+    name: &str,
+    value: &Scalar,
+) -> Result<String, String> {
+    let mut over_lines = false;
+    let mut spot = None;
+    for line in body {
+        let s = &text[line.start..line.end];
+        let Some(from) = value_start(s, key) else {
+            continue;
+        };
+        // The line alone must hold the whole key and value.
+        let alone: Option<toml::Table> = s.parse().ok();
+        let mut expected = toml::Table::new();
+        expected.insert(key.to_string(), old_value.clone());
+        if alone.as_ref() != Some(&expected) {
+            over_lines |= alone.is_none();
+            continue;
+        }
+        if let Some(to) = value_end(s, from, old_value) {
+            spot = Some((line.start + from, line.start + to));
+            break;
+        }
+    }
+    let Some((from, to)) = spot else {
+        return Err(if over_lines {
+            format!("config.toml spreads {name} over several lines: edit it by hand")
+        } else {
+            format!("config.toml sets {name} in a form this cannot change: edit it by hand")
+        });
+    };
+    Ok(format!("{}{}{}", &text[..from], value.text(), &text[to..]))
+}
+
 /// `text` with `table.key` set to `value` (table is a dotted header path like `["tui"]` or
 /// `["tui", "notify"]`), or why it cannot be done safely.
 ///
 /// A key already there gets its value replaced on its own line; a key missing from a table
 /// whose header is in the file is added on the line after the header; a table the file does
-/// not have is appended at the end. The result is checked: it must parse to the old document
+/// not have is appended at the end. With no `table`, a top-level key: a missing one is added
+/// after the last line before the first header that holds anything (else first). The result is checked: it must parse to the old document
 /// with only `table.key` changed, and load as a twr config (as the old text must already).
 pub fn set_key(text: &str, table: &[&str], key: &str, value: &Scalar) -> Result<String, String> {
+    if matches!(value, Scalar::Float(f) if !f.is_finite()) {
+        return Err(format!(
+            "twr does not take {} = {}: only a finite number",
+            dotted(table, Some(key)),
+            value.text()
+        ));
+    }
     let old: toml::Table = text
         .parse()
         .map_err(|_| "config.toml does not parse: fix it by hand".to_string())?;
@@ -252,71 +329,74 @@ pub fn set_key(text: &str, table: &[&str], key: &str, value: &Scalar) -> Result<
             (None, _) => {}
         }
     }
-    let new = match (find_table(&old, table), section) {
-        (Found::NotTable(what), _) => {
-            return Err(format!(
-                "config.toml has {what} as a value, not a table: edit it by hand"
-            ));
-        }
-        (Found::Table(t), None) if t.contains_key(key) => return Err(by_hand),
-        (Found::Table(t), Some((_, body))) if t.contains_key(key) => {
-            let old_value = &t[key];
-            let mut over_lines = false;
-            let mut spot = None;
-            for line in body {
-                let s = &text[line.start..line.end];
-                let Some(from) = value_start(s, key) else {
-                    continue;
-                };
-                // The line alone must hold the whole key and value.
-                let alone: Option<toml::Table> = s.parse().ok();
-                let mut expected = toml::Table::new();
-                expected.insert(key.to_string(), old_value.clone());
-                if alone.as_ref() != Some(&expected) {
-                    over_lines |= alone.is_none();
-                    continue;
-                }
-                if let Some(to) = value_end(s, from, old_value) {
-                    spot = Some((line.start + from, line.start + to));
-                    break;
-                }
-            }
-            let Some((from, to)) = spot else {
-                return Err(if over_lines {
-                    format!("config.toml spreads {name} over several lines: edit it by hand")
-                } else {
-                    format!("config.toml sets {name} in a form this cannot change: edit it by hand")
+    let new = if table.is_empty() {
+        // Top-level keys: the lines before the first header. A missing one goes after the
+        // last of them that holds anything (else first in the file), not after the comments
+        // that open the first table.
+        let body: Vec<Line> = all
+            .iter()
+            .take_while(|l| header(&text[l.start..l.end]).is_none())
+            .copied()
+            .collect();
+        match old.get(key) {
+            Some(old_value) => replace_value(text, &body, key, old_value, &name, value)?,
+            None => {
+                let last = body.iter().rev().find(|l| {
+                    let t = text[l.start..l.end].trim();
+                    !t.is_empty() && !t.starts_with('#')
                 });
-            };
-            format!("{}{}{}", &text[..from], value.text(), &text[to..])
-        }
-        (Found::Table(_), Some((head, _))) => {
-            // After the header line, keeping the file's line ending.
-            let ending = if head.next > head.end { "" } else { nl };
-            format!(
-                "{}{ending}{new_line}{nl}{}",
-                &text[..head.next],
-                &text[head.next..]
-            )
-        }
-        // A table only implied (by a header below it, as `[tui.notify]` implies `[tui]`)
-        // may still get its own header; one defined inline or by dotted keys may not, which
-        // the parse below finds.
-        (Found::Table(_), None) | (Found::Missing, _) => {
-            let mut out = text.to_string();
-            if !out.is_empty() {
-                if !out.ends_with('\n') {
-                    out.push_str(nl);
-                }
-                let blank =
-                    out.ends_with("\n\n") || out.ends_with("\n\r\n") || out.trim().is_empty();
-                if !blank {
-                    out.push_str(nl);
+                match last {
+                    Some(l) => {
+                        let ending = if l.next > l.end { "" } else { nl };
+                        format!(
+                            "{}{ending}{new_line}{nl}{}",
+                            &text[..l.next],
+                            &text[l.next..]
+                        )
+                    }
+                    None => format!("{new_line}{nl}{text}"),
                 }
             }
-            let path: Vec<String> = table.iter().map(|p| key_text(p)).collect();
-            out.push_str(&format!("[{}]{nl}{new_line}{nl}", path.join(".")));
-            out
+        }
+    } else {
+        match (find_table(&old, table), section) {
+            (Found::NotTable(what), _) => {
+                return Err(format!(
+                    "config.toml has {what} as a value, not a table: edit it by hand"
+                ));
+            }
+            (Found::Table(t), None) if t.contains_key(key) => return Err(by_hand),
+            (Found::Table(t), Some((_, body))) if t.contains_key(key) => {
+                replace_value(text, &body, key, &t[key], &name, value)?
+            }
+            (Found::Table(_), Some((head, _))) => {
+                // After the header line, keeping the file's line ending.
+                let ending = if head.next > head.end { "" } else { nl };
+                format!(
+                    "{}{ending}{new_line}{nl}{}",
+                    &text[..head.next],
+                    &text[head.next..]
+                )
+            }
+            // A table only implied (by a header below it, as `[tui.notify]` implies `[tui]`)
+            // may still get its own header; one defined inline or by dotted keys may not,
+            // which the parse below finds.
+            (Found::Table(_), None) | (Found::Missing, _) => {
+                let mut out = text.to_string();
+                if !out.is_empty() {
+                    if !out.ends_with('\n') {
+                        out.push_str(nl);
+                    }
+                    let blank =
+                        out.ends_with("\n\n") || out.ends_with("\n\r\n") || out.trim().is_empty();
+                    if !blank {
+                        out.push_str(nl);
+                    }
+                }
+                let path: Vec<String> = table.iter().map(|p| key_text(p)).collect();
+                out.push_str(&format!("[{}]{nl}{new_line}{nl}", path.join(".")));
+                out
+            }
         }
     };
     let parsed: toml::Table = match new.parse() {
@@ -344,10 +424,50 @@ pub fn set_key(text: &str, table: &[&str], key: &str, value: &Scalar) -> Result<
             "could not edit config.toml safely: edit {name} by hand"
         ));
     }
-    if Config::from_toml_str(&new).is_err() {
-        return Err(format!("twr does not take {name} = {}", value.text()));
+    if let Err(e) = Config::from_toml_str(&new) {
+        return Err(format!(
+            "twr does not take {name} = {}: {}",
+            value.text(),
+            refusal_reason(&e)
+        ));
     }
     Ok(new)
+}
+
+/// Why twr refuses a config, in a line: the TOML parser's message without the excerpt of the
+/// file it quotes (which could show other lines of it), else the first line of the reason.
+fn refusal_reason(e: &anyhow::Error) -> String {
+    let why = e
+        .chain()
+        .find_map(|c| c.downcast_ref::<toml::de::Error>())
+        .map(|t| t.message().to_string())
+        .unwrap_or_else(|| e.root_cause().to_string());
+    let line = why.lines().next().unwrap_or("").trim();
+    line.chars().take(300).collect()
+}
+
+/// The text of the config file at `path` as it is now, read under the lock edits take (a
+/// missing file is empty), for a caller that edits it with [`set_key`] and saves the result
+/// with [`write_text`] over exactly this text ([`text_hash`]).
+pub fn read_text(path: &Path) -> Result<String, String> {
+    let file = match std::fs::canonicalize(path) {
+        Ok(real) => real,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if std::fs::symlink_metadata(path).is_ok() {
+                return Err("config.toml is a link to nothing: fix it by hand".into());
+            }
+            return Ok(String::new());
+        }
+        Err(e) => return Err(format!("reading config.toml: {e}")),
+    };
+    String::from_utf8(read_plain(&file)?)
+        .map_err(|_| "config.toml is not utf-8: edit it by hand".to_string())
+}
+
+/// The hash [`write_text`] expects of the text it saves over: SHA-256, in hex.
+pub fn text_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(text.as_bytes()))
 }
 
 /// The value of `table.key` as the file at `path` has it now (`None` when unset, or when the
@@ -361,6 +481,28 @@ pub fn read_key(path: &Path, table: &[&str], key: &str) -> Option<toml::Value> {
 pub fn read_doc(path: &Path) -> Option<toml::Table> {
     let bytes = read_plain(&std::fs::canonicalize(path).ok()?).ok()?;
     std::str::from_utf8(&bytes).ok()?.parse().ok()
+}
+
+/// What a config file's text has at a key ([`current`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Current {
+    /// Nothing: the key is unset.
+    Unset,
+    /// A boolean, a number or a string.
+    Scalar(Scalar),
+    /// A list, a table or a date.
+    Other,
+}
+
+/// What `text` (a config file's) has at `table.key`; `Err` when it does not parse.
+pub fn current(text: &str, table: &[&str], key: &str) -> Result<Current, String> {
+    let doc: toml::Table = text
+        .parse()
+        .map_err(|_| "config.toml does not parse: fix it by hand".to_string())?;
+    Ok(match key_of(&doc, table, key) {
+        None => Current::Unset,
+        Some(v) => Scalar::of(&v).map_or(Current::Other, Current::Scalar),
+    })
 }
 
 /// The value of `table.key` in `doc`.
@@ -410,7 +552,6 @@ fn write_key_with(
 /// Saves the complete text, only over the exact text the editor read. Uses the same
 /// lock, private recovery copy and inode checks as scalar TUI edits.
 pub fn write_text(path: &Path, content: &str, expected_hash: &str) -> Result<(), String> {
-    use sha2::{Digest, Sha256};
     let mut config = Config::from_toml_str(content).map_err(|e| e.to_string())?;
     let added = crate::config::BoxesFile::load(&crate::config::BoxesFile::path_for(path))
         .map_err(|e| e.to_string())?;
@@ -423,8 +564,7 @@ pub fn write_text(path: &Path, content: &str, expected_hash: &str) -> Result<(),
     }
     config.validate().map_err(|e| e.to_string())?;
     let check = |text: &str| -> Result<String, String> {
-        let hash = hex::encode(Sha256::digest(text.as_bytes()));
-        if hash != expected_hash {
+        if text_hash(text) != expected_hash {
             return Err("Configuration changed elsewhere. Reload before saving; your edits were not written.".into());
         }
         Ok(content.to_string())
@@ -872,9 +1012,96 @@ terminal = \"bell\"
         assert!(err.contains("not a config twr loads"), "{err}");
         // Nor is a value twr would refuse written.
         let err = set_key(SAMPLE, &["tui"], "card_order", &Scalar::Str("nope".into())).unwrap_err();
-        assert_eq!(err, "twr does not take tui.card_order = \"nope\"");
+        // Why, in a line, without the parser's excerpt of the file.
+        assert!(
+            err.starts_with("twr does not take tui.card_order = \"nope\": unknown variant"),
+            "{err}"
+        );
+        assert!(
+            !err.contains('\n') && !err.contains("secret-token"),
+            "{err}"
+        );
         let err = set_key(SAMPLE, &["tui"], "mouse", &Scalar::Int(1)).unwrap_err();
         assert!(err.starts_with("twr does not take"), "{err}");
+        let err = set_key(SAMPLE, &["tui"], "bogus", &Scalar::Int(1)).unwrap_err();
+        assert!(err.contains("unknown field `bogus`"), "{err}");
+        let err = set_key(SAMPLE, &["speech"], "volume", &Scalar::Float(f64::NAN)).unwrap_err();
+        assert!(err.contains("only a finite number"), "{err}");
+    }
+
+    #[test]
+    fn top_level_keys_and_floats() {
+        // Replaced on its own line, its comment kept.
+        let new = set_key(SAMPLE, &[], "default_runtime", &Scalar::Str("codex".into())).unwrap();
+        assert_eq!(
+            new,
+            SAMPLE.replace(
+                "default_runtime = \"claude-code\"",
+                "default_runtime = \"codex\""
+            )
+        );
+        // A missing one after the last top-level line, not after the next table's comments.
+        let new = set_key(SAMPLE, &[], "stall_after_secs", &Scalar::Int(60)).unwrap();
+        assert!(
+            new.starts_with(
+                "# my twr config\ndefault_runtime = \"claude-code\"\nstall_after_secs = 60\n\n[boxes.lab]"
+            ),
+            "{new}"
+        );
+        let new = set_key(
+            "# only a comment\n[tui]\n",
+            &[],
+            "stall_after_secs",
+            &Scalar::Int(60),
+        )
+        .unwrap();
+        assert_eq!(new, "stall_after_secs = 60\n# only a comment\n[tui]\n");
+        assert_eq!(
+            set_key("", &[], "stall_after_secs", &Scalar::Int(60)).unwrap(),
+            "stall_after_secs = 60\n"
+        );
+        // A float always reads back as one.
+        let new = set_key(SAMPLE, &["speech"], "volume", &Scalar::Float(1.0)).unwrap();
+        assert!(new.ends_with("[speech]\nvolume = 1.0\n"), "{new}");
+        let back: toml::Table = new.parse().unwrap();
+        assert_eq!(back["speech"]["volume"], toml::Value::Float(1.0));
+        let new = set_key(&new, &["speech"], "volume", &Scalar::Float(0.25)).unwrap();
+        assert!(new.ends_with("[speech]\nvolume = 0.25\n"), "{new}");
+        assert_eq!(
+            Scalar::of(&toml::Value::Float(0.25)),
+            Some(Scalar::Float(0.25))
+        );
+        assert_eq!(Scalar::of(&toml::Value::Array(vec![])), None);
+        // A list of strings goes on one line, and replaces one that is on one line.
+        let roots = Scalar::Strs(vec!["~/code".into(), "/srv/a \"b\"".into()]);
+        let new = set_key("", &[], "project_roots", &roots).unwrap();
+        assert_eq!(new, "project_roots = [\"~/code\", \"/srv/a \\\"b\\\"\"]\n");
+        let new = set_key(&new, &[], "project_roots", &Scalar::Strs(vec![])).unwrap();
+        assert_eq!(new, "project_roots = []\n");
+        // One spread over several lines is the user's to edit.
+        let err = set_key(
+            "project_roots = [\n  \"~/code\",\n]\n",
+            &[],
+            "project_roots",
+            &Scalar::Strs(vec!["~/src".into()]),
+        )
+        .unwrap_err();
+        assert!(err.contains("several lines"), "{err}");
+    }
+
+    #[test]
+    fn read_text_and_its_hash_guard_write_text() {
+        let (_d, path) = dir_with(SAMPLE);
+        let text = read_text(&path).unwrap();
+        assert_eq!(text, SAMPLE);
+        let new = set_key(&text, &["tui"], "mouse", &Scalar::Bool(false)).unwrap();
+        // Over another text: refused, nothing written.
+        assert!(write_text(&path, &new, &text_hash("other")).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SAMPLE);
+        write_text(&path, &new, &text_hash(&text)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), new);
+        let missing = path.with_file_name("none.toml");
+        assert_eq!(read_text(&missing).unwrap(), "");
     }
 
     #[test]

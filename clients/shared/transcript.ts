@@ -7,6 +7,9 @@ export interface Block {
   seq: number;
   turn?: number;
   ts: string;
+  /** Conservative identity cutoff. Unlike the first delta, turn.started survives
+   * filtered history reads; a missing matching start leaves thread boxes neutral. */
+  turnStartedAt?: string;
   pending?: boolean;
   about?: string;
   routine?: boolean;
@@ -17,9 +20,11 @@ export interface Block {
 export function blocksOf(events: HubEvent[]): Block[] {
   const output: Block[] = [];
   const calls = new Map<string, Block>();
+  const turnStarts = new Map<string, string>();
   let streaming: Block | undefined;
   for (const event of events) {
     const data = event.data || {};
+    const turnKey = JSON.stringify([event.thread, event.turn]);
     const base = {
       id: event.id,
       seq: event.seq,
@@ -28,6 +33,7 @@ export function blocksOf(events: HubEvent[]): Block[] {
     };
     switch (event.kind) {
       case "turn.started":
+        if (event.turn !== undefined) turnStarts.set(turnKey, event.ts);
         streaming = undefined;
         if (data.prompt)
           output.push({
@@ -39,7 +45,13 @@ export function blocksOf(events: HubEvent[]): Block[] {
       case "agent.text":
         if (data.delta) {
           if (!streaming || streaming.turn !== event.turn) {
-            streaming = { ...base, kind: "assistant", text: "", pending: true };
+            streaming = {
+              ...base,
+              kind: "assistant",
+              text: "",
+              pending: true,
+              turnStartedAt: turnStarts.get(turnKey),
+            };
             output.push(streaming);
           }
           streaming.text += data.text || "";
@@ -52,7 +64,12 @@ export function blocksOf(events: HubEvent[]): Block[] {
           if (streaming) streaming.pending = false;
           streaming = undefined;
           if (data.text)
-            output.push({ ...base, kind: "assistant", text: data.text });
+            output.push({
+              ...base,
+              kind: "assistant",
+              text: data.text,
+              turnStartedAt: turnStarts.get(turnKey),
+            });
         }
         break;
       case "agent.tool_call": {
@@ -117,9 +134,30 @@ export function blocksOf(events: HubEvent[]): Block[] {
       case "prompt.withdrawn":
         output.push({ ...base, kind: "notice", text: "Message taken back" });
         break;
+      case "config.changed":
+        if (data.key)
+          output.push({ ...base, kind: "notice", text: configLine(data) });
+        break;
     }
   }
   return output;
+}
+/** A `config.changed` (a key of config.toml set through the hub) as the TUI's hub line says
+ * it (`ConfigChanged::line`): `Set tui.suggest = false (was true) (by you); takes effect
+ * now`. `orchestrator.access`'s effect may come as the hub's `restart` word. */
+function configLine(data: Record<string, any>): string {
+  const text = (value: unknown) => JSON.stringify(value) ?? "null";
+  const was = data.before == null ? "unset" : text(data.before);
+  const by = data.by === "user" ? " (by you)" : "";
+  const effect =
+    data.effect === "now" || !data.effect
+      ? "now"
+      : data.effect === "after_turn"
+        ? "when the orchestrator's turn ends"
+        : data.effect === "none"
+          ? "the next time the orchestrator starts"
+          : String(data.effect);
+  return `Set ${data.key} = ${text(data.value)} (was ${was})${by}; takes effect ${effect}`;
 }
 export interface RoutineRun {
   thread: string;

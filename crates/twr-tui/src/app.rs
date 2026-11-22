@@ -275,12 +275,23 @@ pub struct ViewState {
     /// The choice of the orchestrator's runtime, while it is pending
     /// ([`AppState::picker_open`]): the first-run one, or `/orch` without arguments.
     pub picker: Option<Picker>,
+    /// What the last model picker opened for ([`PickerFor`]): when that changes underneath
+    /// (another client switches the orchestrator, sets or moves the thread, or deletes it),
+    /// the picker closes and the switch it asked to confirm is cancelled
+    /// ([`AppState::drop_stale_picker`]).
+    pub picker_for: Option<PickerFor>,
     /// The orchestrator the hub would start (`orchestrator.show` `runtime`, `model`), for the
     /// main pane's header before an orchestrator thread exists.
     pub orch_default: Option<(String, Option<String>)>,
     /// The account of that orchestrator (`orchestrator.show` `account`: a name, the native
     /// account's under its current one), labelled in that header as a thread's is.
     pub orch_default_account: Option<String>,
+    /// The orchestrator's access level, `limited` or `full`, as the hub last said it
+    /// (`orchestrator.show`, `hub.info`, `orchestrator.access`, a `config.changed` of
+    /// `orchestrator.access`); `None` until it did (an older hub says nothing).
+    pub orch_access: Option<String>,
+    /// `/access` without a level asked the hub: its answer goes to the status bar.
+    pub access_asked: bool,
     /// The hub's `default_runtime`, when `orchestrator.show` says it: its `configured.runtime`
     /// while no `[orchestrator] runtime` is set (`/new --account` suggestions).
     pub default_runtime: Option<String>,
@@ -600,9 +611,25 @@ pub struct Picker {
     pub model: Option<String>,
     /// Opened by `/orch` to switch the orchestrator, not to choose its first one.
     pub switch: bool,
+    /// Opened as the orchestrator's model picker (Alt-M, a tap on the input box's model label,
+    /// `/model` in the stack view: [`AppState::open_orch_model_picker`]): a model or effort
+    /// picked on its current runtime and account changes them in place (`thread.set_model` on
+    /// its thread, at once); another row is a switch, confirmed as `/orch`'s.
+    pub in_place: bool,
     /// The model step ([`ModelStep`]): after a runtime is chosen, or the whole picker for a
     /// thread's `/model` (then `runtimes` is empty). `None`: the runtimes are shown.
     pub step: Option<ModelStep>,
+}
+
+/// What a model picker opened for ([`ViewState::picker_for`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickerFor {
+    /// The thread's id; `None`: the orchestrator.
+    pub thread: Option<String>,
+    /// Its name, as the picker opened.
+    pub name: String,
+    /// What it ran then ([`AppState::model_target`]).
+    pub runs: String,
 }
 
 /// A row of a model picker ([`ModelStep`]).
@@ -615,6 +642,9 @@ pub enum ModelRow {
     Known(String, String),
     /// An id of your own, typed on the row ([`ModelStep::typed`]).
     Custom,
+    /// The orchestrator's picker opened on its current runtime ([`ModelStep::other_runtime`]):
+    /// to the runtimes, to switch it to another one.
+    OtherRuntime,
 }
 
 /// The model step of the [`Picker`]: the models `orchestrator.show` `models` lists for the
@@ -643,6 +673,11 @@ pub struct ModelStep {
     pub current_effort: Option<String>,
     /// The model chosen, while the effort is picked (`Some(None)`: the runtime's default).
     pub chosen: Option<Option<String>>,
+    /// Opened on the orchestrator's current runtime (Alt-M, a tap on the input box's model
+    /// label, `/model` in the stack view): its models end with an `other runtime…` row
+    /// ([`ModelRow::OtherRuntime`]), and Esc closes the picker rather than going back to the
+    /// runtimes.
+    pub other_runtime: bool,
 }
 
 impl ModelStep {
@@ -673,7 +708,15 @@ impl ModelStep {
             efforts: Vec::new(),
             current_effort: None,
             chosen: None,
+            other_runtime: false,
         }
+    }
+
+    /// With the `other runtime…` row last ([`ModelStep::other_runtime`]).
+    pub fn with_other_runtime(mut self) -> ModelStep {
+        self.other_runtime = true;
+        self.rows.push(ModelRow::OtherRuntime);
+        self
     }
 
     /// While the effort is picked: the effort rows' current value; else the model's.
@@ -769,6 +812,7 @@ impl Picker {
             default,
             model: configured["model"].as_str().map(str::to_string),
             switch: false,
+            in_place: false,
             step: None,
         })
     }
@@ -803,8 +847,10 @@ pub struct OrchCurrent<'a> {
 /// whether it is installed) is a row of its own, as `runtime`, unless it shows account
 /// labels ([`crate::accounts::RuntimeAccounts::shown`]): then each of its usable accounts is
 /// one (`claude-code:work`, `claude-code:personal`), `current`'s among them (added when it
-/// is not usable: choosing it is refused by the hub, never another account in its place).
-/// `current`'s runtime without labels is `runtime:account` when it names an account, so that
+/// is not usable: choosing it is refused by the hub, never another account in its place),
+/// except a current orchestrator on the native login whose name a named account has too: its
+/// row is the runtime alone, and the name's row the named account's. `current`'s runtime
+/// without labels is `runtime:account` when it names an account, so that
 /// choosing it keeps that account; else `runtime`, the hub's default account. A `current` the
 /// rows do not have is its spec as given.
 pub fn orch_rows(
@@ -838,7 +884,18 @@ pub fn orch_rows(
                     .filter(|a| a.usable() && !a.shadowed)
                     .map(|a| a.name.as_str())
                     .collect();
-                if is_current {
+                // The current orchestrator on that native login (recorded without an
+                // account): its name is the named account's, so its row is the runtime alone
+                // ([`orch_row_label`]: `claude-code (native login)`), and the name's row
+                // stays the named account's.
+                let native_shadowed = is_current
+                    && account.is_none()
+                    && resolved.is_none()
+                    && entry.accounts.iter().any(|a| a.native && a.shadowed);
+                if native_shadowed {
+                    rows.push((runtime.clone(), *installed));
+                    default = Some(runtime.clone());
+                } else if is_current {
                     let name = account.or(resolved).unwrap_or(&entry.native);
                     if !names.contains(&name) {
                         names.push(name);
@@ -876,6 +933,22 @@ pub fn orch_label(spec: &str, accounts: &Accounts) -> String {
             runtime.to_string()
         }
         _ => spec.to_string(),
+    }
+}
+
+/// How the picker shows row `spec` of a picker whose current (or default) row is `current`
+/// ([`orch_rows`]): as [`orch_label`] says, except a switch's current row that is the runtime
+/// alone while the runtime shows account labels. That is the orchestrator on its native login
+/// whose name a named account has too: `claude-code (native login)`.
+pub fn orch_row_label(spec: &str, current: &str, switch: bool, accounts: &Accounts) -> String {
+    let native = switch
+        && spec == current
+        && twr_core::account::split_runtime(spec).1.is_none()
+        && accounts.runtime(spec).is_some_and(|r| r.shown);
+    if native {
+        format!("{spec} (native login)")
+    } else {
+        orch_label(spec, accounts)
     }
 }
 
@@ -980,6 +1053,8 @@ pub enum ActionKind {
     LoopChange,
     /// Starts a review loop on the thread, as `/review` (`review loop`).
     LoopStart,
+    /// Starts a single review pass on the thread, as `/review --once` (`review once`).
+    LoopOnce,
     /// Puts `/implement ` in the input box, ready for the task (`implementation loop…`).
     LoopImplement,
     /// Opens the loop settings editor on the settings the thread's project uses
@@ -1200,6 +1275,12 @@ pub enum Action {
     },
     /// A fresh orchestrator session, without a handoff (`/clear`).
     ResetOrchestrator,
+    /// Read the orchestrator's access level, or set it (`orchestrator.access`, `/access`, the
+    /// settings' Orchestrator access row).
+    OrchestratorAccess {
+        /// The level to set (`limited`, `full`); `None` reads it.
+        access: Option<String>,
+    },
     /// Leave the TUI.
     Quit,
     /// Answer an attention item with one of its options.
@@ -1390,6 +1471,9 @@ pub enum Action {
         runtime: String,
         /// Model; `None` = the runtime's default.
         model: Option<String>,
+        /// Reasoning effort; `None` = not sent: the runtime's default (the first
+        /// orchestrator's, `[orchestrator] effort`).
+        effort: Option<String>,
         /// Ask the current orchestrator for its handoff summary first.
         summary: bool,
     },
@@ -1940,6 +2024,17 @@ impl Transcript {
             }),
             // A note of the orchestrator's memory saved or forgotten: shown the same way.
             EventBody::MemoryChanged(p) => self.push(Entry::HubUpdate {
+                text: p.line(),
+                user_message: None,
+                attn_id: None,
+                about: None,
+                outcome: None,
+                seq: ev.seq,
+                resolution: false,
+                routine: None,
+            }),
+            // A key of the config file set through the hub: shown the same way.
+            EventBody::ConfigChanged(p) => self.push(Entry::HubUpdate {
                 text: p.line(),
                 user_message: None,
                 attn_id: None,
@@ -3575,6 +3670,15 @@ impl AppState {
                 }
             }
             EventBody::AttentionRaised(p) => self.note_delete_card(&ev.thread, p),
+            // The orchestrator's access level changed (by anyone): the settings row shows it
+            // (the replay's is in the `orchestrator.show` asked for on connecting).
+            EventBody::ConfigChanged(p)
+                if self.catch_up.is_none() && p.key == "orchestrator.access" =>
+            {
+                if let Some(v) = p.value.as_str() {
+                    self.view.orch_access = Some(v.to_string());
+                }
+            }
             // A `!` command ended (as the hub records it, nobody else): Ctrl-C quits again.
             EventBody::TaskUpdated(p)
                 if !p.running && twr_core::event::is_job_task(&ev.source, &ev.body) =>
@@ -3633,6 +3737,9 @@ impl AppState {
             && self.registry.list().iter().any(|t| t.is_orchestrator())
         {
             self.view.picker = None;
+        }
+        if self.catch_up.is_none() {
+            self.drop_stale_picker();
         }
     }
 
@@ -3948,7 +4055,9 @@ impl AppState {
                 self.view.selection = None;
                 self.view.repaint = true;
                 self.back();
+                self.keep_dropped(result);
             }
+            "orchestrator.use" => self.keep_dropped(result),
             "trash.list" => {
                 // The commands its message quotes run in this view's workspace.
                 let mut result = result.clone();
@@ -3966,7 +4075,18 @@ impl AppState {
             // The orchestrator the hub would start, asked for again after an account change
             // ([`AppState::account_calls`]). A failed call arrives as null: what was known
             // stays.
+            "orchestrator.access" => {
+                if let Some(a) = result["access"].as_str() {
+                    self.view.orch_access = Some(a.to_string());
+                    if std::mem::take(&mut self.view.access_asked) {
+                        self.view.status = Some(crate::settings::access_line(a));
+                    }
+                }
+            }
             "orchestrator.show" => {
+                if let Some(a) = result["access"].as_str() {
+                    self.view.orch_access = Some(a.to_string());
+                }
                 if let Some(rt) = result["runtime"].as_str() {
                     let model = result["model"].as_str().map(str::to_string);
                     self.view.orch_default = Some((rt.to_string(), model));
@@ -3980,6 +4100,9 @@ impl AppState {
             // A failed poll arrives as null: nothing changes but the next poll.
             "hub.info" => {
                 self.info_pending = false;
+                if let Some(a) = result["orchestrator"]["access"].as_str() {
+                    self.view.orch_access = Some(a.to_string());
+                }
                 if let Some(disk) = result["disk"].as_object() {
                     self.disk_low = disk
                         .iter()
@@ -5273,18 +5396,48 @@ impl AppState {
 
     /// Asks for `y` before switching the orchestrator (`/orch`, or the picker `/orch` opens) to
     /// runtime spec `runtime`, which the prompt calls `shown` (a picker row's display,
-    /// [`orch_label`]); `s` switches without the current orchestrator's summary.
-    fn confirm_switch(&mut self, runtime: String, shown: &str, model: Option<String>) {
-        let with = model
-            .as_deref()
-            .map(|m| format!(" ({m})"))
-            .unwrap_or_default();
+    /// [`orch_label`]); `s` switches without the current orchestrator's summary. `effort`:
+    /// the one asked for (`None`: the runtime's default).
+    fn confirm_switch(
+        &mut self,
+        runtime: String,
+        shown: &str,
+        model: Option<String>,
+        effort: Option<String>,
+    ) {
+        let with: Vec<String> = [
+            model.clone(),
+            effort.as_deref().map(|e| format!("effort {e}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let with = if with.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", with.join(", "))
+        };
+        // The orchestrator's queued messages, as last read (only while its conversation is
+        // on the main pane): the switch drops them.
+        let orch = self.orchestrator().map(|o| o.id.clone());
+        let queued = self
+            .queue
+            .as_ref()
+            .filter(|q| Some(&q.thread) == orch.as_ref())
+            .map_or(0, |q| q.total);
+        let dropped = match queued {
+            0 => String::new(),
+            n => format!(
+                " It drops {n} queued message(s): all of them without the summary, those not \
+                 started by then with it; yours go to the history."
+            ),
+        };
         self.view.status = None;
         self.view.confirm = Some(Confirm {
             prompt: format!(
                 "switch the orchestrator to {shown}{with}? A new session that starts with a \
-                 handoff. y: with the current one's summary (waits up to 60s if it is busy) · \
-                 s: without it · any other key cancels"
+                 handoff.{dropped} y: with the current one's summary (waits up to 60s if it is \
+                 busy) · s: without it · any other key cancels"
             ),
             pending: format!(
                 "switching the orchestrator to {shown}: asking the current one for a handoff \
@@ -5295,6 +5448,7 @@ impl AppState {
                 Action::UseOrchestrator {
                     runtime: runtime.clone(),
                     model: model.clone(),
+                    effort: effort.clone(),
                     summary: false,
                 },
                 format!("switching the orchestrator to {shown} (no summary): waiting for the hub"),
@@ -5303,6 +5457,7 @@ impl AppState {
             action: Action::UseOrchestrator {
                 runtime,
                 model,
+                effort,
                 summary: true,
             },
         });
@@ -5381,12 +5536,18 @@ impl AppState {
                 effort,
                 runtime,
             } => {
+                let bare = model.is_none() && effort.is_none() && runtime.is_none();
+                if bare && thread.is_none() && self.view.dive.is_none() {
+                    // In the stack view, `/model` alone: the orchestrator's picker (Alt-M).
+                    self.open_orch_model_picker();
+                    return (Vec::new(), true);
+                }
                 let target = match (thread, &self.view.dive) {
                     (Some(q), _) => self.thread_arg(Some(&q)).map(|t| t.id.clone()),
                     (None, Some(d)) => Ok(d.clone()),
                     (None, None) => Err(
                         "usage: /model <thread> [model] [--effort e] [--runtime r] (in a dive: \
-                         /model [--effort e] [--runtime r])"
+                         /model [--effort e] [--runtime r]; alone: the orchestrator's)"
                             .to_string(),
                     ),
                 };
@@ -5404,8 +5565,10 @@ impl AppState {
                         Some(t) => model_show(t, self.account_label(t).as_deref()),
                         None => format!("no thread {thread}"),
                     });
-                    if let Some(t) = view.filter(|t| !t.is_orchestrator()).cloned() {
-                        self.open_model_picker(&t);
+                    match view.cloned() {
+                        Some(t) if t.is_current_orchestrator() => self.open_orch_model_picker(),
+                        Some(t) if !t.is_orchestrator() => self.open_model_picker(&t),
+                        _ => {}
                     }
                     return (Vec::new(), true);
                 }
@@ -5464,9 +5627,14 @@ impl AppState {
             }
             Slash::Orch { runtime, model } => {
                 let shown = runtime.clone();
-                self.confirm_switch(runtime, &shown, model)
+                self.confirm_switch(runtime, &shown, model, None)
             }
             Slash::OrchPick => self.open_orch_picker(),
+            Slash::Access(None) => {
+                self.view.access_asked = true;
+                return (vec![Action::OrchestratorAccess { access: None }], true);
+            }
+            Slash::Access(Some(level)) => return (self.set_access(&level), true),
             Slash::Grid => self.toggle_grid(),
             Slash::Decisions => self.toggle_decisions(),
             Slash::Pin(q) => {
@@ -5711,6 +5879,7 @@ impl AppState {
             Slash::Review {
                 thread,
                 setup,
+                once,
                 scope,
                 profile,
                 reviewer,
@@ -5725,7 +5894,7 @@ impl AppState {
                     ("workers", workers),
                     ("commit", commit),
                 ];
-                return self.request_review(thread.as_deref(), setup, scope, overrides);
+                return self.request_review(thread.as_deref(), setup, once, scope, overrides);
             }
             Slash::Loop {
                 thread,
@@ -6014,8 +6183,137 @@ impl AppState {
             default,
             model: None,
             switch: true,
+            in_place: false,
             step: None,
         });
+        self.view.picker_for = Some(PickerFor {
+            thread: None,
+            name: "the orchestrator".into(),
+            runs: self.model_target(None),
+        });
+    }
+
+    /// What `thread` (`None`: the current orchestrator) runs, as [`PickerFor::runs`]: its
+    /// id, runtime, account, model and effort; empty when there is no such thread.
+    fn model_target(&self, thread: Option<&str>) -> String {
+        let t = match thread {
+            Some(id) => self.registry.get(id).filter(|t| !t.retired),
+            None => self.orchestrator(),
+        };
+        t.map_or_else(String::new, |t| {
+            [
+                t.id.as_str(),
+                &t.runtime,
+                t.account.as_deref().unwrap_or(""),
+                t.model.as_deref().unwrap_or(""),
+                t.effort.as_deref().unwrap_or(""),
+            ]
+            .join("\0")
+        })
+    }
+
+    /// What the open model picker, or the orchestrator switch it asked to confirm, was for
+    /// changed underneath ([`ViewState::picker_for`]): the picker closes, or the switch is
+    /// cancelled, and the status bar says why. The next choice starts from what runs now.
+    fn drop_stale_picker(&mut self) {
+        let Some(was) = self.view.picker_for.as_ref() else {
+            return;
+        };
+        if self.model_target(was.thread.as_deref()) == was.runs {
+            return;
+        }
+        let was = self.view.picker_for.take().expect("checked above");
+        let gone = was.thread.is_some() && self.model_target(was.thread.as_deref()).is_empty();
+        let what = format!("{} {}", was.name, if gone { "is gone" } else { "changed" });
+        if self.view.picker.as_ref().is_some_and(|p| p.switch) {
+            self.view.picker = None;
+            self.view.status = Some(format!(
+                "{what}: the model picker closed; open it again to pick"
+            ));
+        } else if was.thread.is_none()
+            && self
+                .view
+                .confirm
+                .as_ref()
+                .is_some_and(|c| matches!(c.action, Action::UseOrchestrator { .. }))
+        {
+            self.view.confirm = None;
+            self.view.status = Some(format!("cancelled: {what} before you confirmed"));
+        }
+    }
+
+    /// The orchestrator's model picker (Alt-M, a tap on the input box's model label, `/model`
+    /// in the stack view): the models of its current runtime ([`Picker::default`] of
+    /// [`AppState::open_orch_picker`]) with `other runtime…` last, then its efforts; what
+    /// changed goes at once to its thread as `thread.set_model`, a change in place
+    /// ([`Picker::in_place`]). Another runtime or account is a switch, confirmed with `y`/`s`
+    /// as in `/orch`'s picker.
+    fn open_orch_model_picker(&mut self) {
+        self.open_orch_picker();
+        let current = self.orchestrator().cloned();
+        let choices = &self.view.model_choices;
+        let Some(p) = self.view.picker.as_mut() else {
+            return;
+        };
+        p.in_place = current.is_some();
+        let runtime = p.default.clone();
+        if runtime.is_empty() {
+            return;
+        }
+        let mut step = ModelStep::new(
+            choices,
+            &runtime,
+            None,
+            current.as_ref().and_then(|o| o.model.clone()),
+        )
+        .with_other_runtime();
+        step.efforts = effort_choices(choices, &runtime);
+        step.current_effort = current.and_then(|o| o.effort);
+        p.step = Some(step);
+    }
+
+    /// The model picker of where the input line goes (Alt-M, a tap on the input box's model
+    /// label): the dived thread's ([`AppState::open_model_picker`]), else the orchestrator's
+    /// ([`AppState::open_orch_model_picker`]). A `pty` thread has neither a model nor an
+    /// effort: the status bar says how to move it to another runtime.
+    pub(crate) fn open_target_picker(&mut self) -> Vec<Action> {
+        match self.dived().cloned() {
+            Some(t) if t.runtime == "pty" => {
+                self.view.status = Some(format!(
+                    "{} runs its own command line: no model or effort to pick (/model \
+                     --runtime <runtime> moves it to an agent)",
+                    t.name
+                ));
+            }
+            Some(t) if t.is_current_orchestrator() => self.open_orch_model_picker(),
+            Some(t) if !t.is_orchestrator() => {
+                self.view.status = None;
+                self.open_model_picker(&t);
+            }
+            Some(_) => {}
+            None => self.open_orch_model_picker(),
+        }
+        Vec::new()
+    }
+
+    /// What the input box's bottom border names at its right ([`crate::ui`]'s
+    /// `render_input`): the model and reasoning effort of where the line goes, the dived
+    /// thread or the orchestrator, as `(model, effort)`: the model it runs as its runtime
+    /// reported it, else the one asked for (shortened as on a card), else `default`; the
+    /// effort, `None` for the runtime's default. `None`: nothing to name (no orchestrator yet, a `pty` thread).
+    pub fn model_label(&self) -> Option<(String, Option<String>)> {
+        let t = match &self.view.dive {
+            Some(_) => self.dived()?,
+            None => self.orchestrator()?,
+        };
+        if t.runtime == "pty" {
+            return None;
+        }
+        // As a card shows it ([`crate::ui::model_label`]): a dated id shortened.
+        let model = t
+            .shown_model()
+            .map_or_else(|| "default".into(), crate::ui::short_model);
+        Some((model, t.effort.clone()))
     }
 
     /// `/pin [thread]`: pins or unpins the thread named (`query`), else the selected card.
@@ -6403,6 +6701,8 @@ impl AppState {
             // The one sidebar, whichever: Ctrl-T is Ctrl-B.
             KeyCode::Char('b' | 't') if ctrl => return Some(self.toggle_workspaces()),
             KeyCode::Char('f') if ctrl => self.set_focus_mode(!self.view.focus_mode),
+            // The model and effort of where the line goes (the input box's model label).
+            KeyCode::Char('m' | 'M') if alt && !ctrl => return Some(self.open_target_picker()),
             KeyCode::Char('o') if ctrl => {
                 self.view.expand_all = !self.view.expand_all;
                 // One setting for the orchestrator conversation and every dive.
@@ -6942,6 +7242,15 @@ impl AppState {
         self.set_timed_status(msg, Instant::now());
     }
 
+    /// The user's own queued messages an orchestrator switch or reset (`result`) dropped: in
+    /// the history, to send again (`↑`), as a message taken back that the box can't take.
+    fn keep_dropped(&mut self, result: &Value) {
+        let dropped = result["previous"]["dropped_messages"].as_array();
+        for m in dropped.into_iter().flatten().filter_map(Value::as_str) {
+            self.keep_taken_back(&literal_line(m));
+        }
+    }
+
     /// Makes `text`, a message taken back that could not go back in the box, the newest
     /// history entry (`↑` recalls it), whatever its size: one too long for the history file
     /// is kept for this session only.
@@ -7140,6 +7449,7 @@ impl AppState {
                     match &t.r#loop {
                         None => {
                             rows.push(row(ActionKind::LoopStart, "review loop"));
+                            rows.push(row(ActionKind::LoopOnce, "review once"));
                             rows.push(row(ActionKind::LoopImplement, "implementation loop…"));
                         }
                         Some(l) => {
@@ -7421,7 +7731,12 @@ impl AppState {
             }
             ActionKind::LoopStart => {
                 return self
-                    .request_review(Some(&thread), false, None, Vec::new())
+                    .request_review(Some(&thread), false, false, None, Vec::new())
+                    .0;
+            }
+            ActionKind::LoopOnce => {
+                return self
+                    .request_review(Some(&thread), false, true, None, Vec::new())
                     .0;
             }
             ActionKind::LoopImplement => self.prefill_implement(&thread),
@@ -7680,20 +7995,30 @@ impl AppState {
             }
             KeyCode::Enter => {
                 let runtime = p.runtimes[p.selected].0.clone();
-                // The model in effect for that runtime: a switch's current orchestrator's, the
-                // first choice's configured one with the configured runtime; else the
-                // runtime's default.
-                let current = if p.switch {
-                    self.orchestrator()
-                        .filter(|o| {
-                            twr_core::account::split_runtime(&o.runtime).0
-                                == twr_core::account::split_runtime(&runtime).0
-                        })
-                        .and_then(|o| o.model.clone())
-                } else {
-                    p.model.clone().filter(|_| runtime == p.default)
+                let switch = p.switch;
+                let configured = p.model.clone().filter(|_| runtime == p.default);
+                // The model (and effort) in effect for that runtime: a switch's current
+                // orchestrator's, the first choice's configured one with the configured
+                // runtime; else the runtime's default.
+                let same = self
+                    .orchestrator()
+                    .filter(|o| {
+                        twr_core::account::split_runtime(&o.runtime).0
+                            == twr_core::account::split_runtime(&runtime).0
+                    })
+                    .map(|o| (o.model.clone(), o.effort.clone()));
+                let (current, current_effort) = match (switch, same) {
+                    (true, Some((m, e))) => (m, e),
+                    (true, None) => (None, None),
+                    (false, _) => (configured, None),
                 };
-                let step = ModelStep::new(&self.view.model_choices, &runtime, None, current);
+                let mut step = ModelStep::new(&self.view.model_choices, &runtime, None, current);
+                if switch {
+                    // A switch picks the effort too (the first choice runs the configured
+                    // one).
+                    step.efforts = effort_choices(&self.view.model_choices, &runtime);
+                    step.current_effort = current_effort;
+                }
                 if let Some(p) = self.view.picker.as_mut() {
                     p.step = Some(step);
                 }
@@ -7731,8 +8056,9 @@ impl AppState {
     /// Keys of the picker's model step ([`ModelStep`]): Up/Down (or k/j) and 1-9 pick a row,
     /// Enter chooses it (the custom row: type an id, Enter takes it, Esc goes back to the
     /// rows). For the orchestrator the choice ends the picker: a switch asks to confirm it
-    /// ([`AppState::confirm_switch`]), the first choice is made at once. For a thread the
-    /// effort comes next, then `thread.set_model` with what changed. Esc goes back a step:
+    /// ([`AppState::confirm_switch`]), the first choice is made at once, and its model picker
+    /// on its current runtime sends `thread.set_model` as for a thread. For a thread the effort
+    /// comes next, then `thread.set_model` with what changed. Esc goes back a step:
     /// to the runtimes, from the effort to the model, else closes the picker.
     fn model_key(&mut self, key: KeyEvent) -> Vec<Action> {
         let Some(p) = self.view.picker.as_mut() else {
@@ -7774,6 +8100,10 @@ impl AppState {
                 ModelRow::Default => return self.model_chosen(None),
                 ModelRow::Known(id, _) => return self.model_chosen(Some(id)),
                 ModelRow::Custom => m.typed = Some(String::new()),
+                ModelRow::OtherRuntime => {
+                    p.step = None;
+                    self.view.status = None;
+                }
             },
             KeyCode::Esc => {
                 if let Some(model) = m.chosen.take() {
@@ -7785,6 +8115,9 @@ impl AppState {
                         thread,
                         m.current.clone(),
                     );
+                    if m.other_runtime {
+                        back = back.with_other_runtime();
+                    }
                     back.efforts = std::mem::take(&mut m.efforts);
                     back.current_effort = m.current_effort.take();
                     if let Some(i) = back.rows.iter().position(|r| match (r, &model) {
@@ -7795,7 +8128,7 @@ impl AppState {
                         back.selected = i;
                     }
                     *m = back;
-                } else if has_runtimes {
+                } else if has_runtimes && !m.other_runtime {
                     p.step = None;
                 } else {
                     self.view.picker = None;
@@ -7817,34 +8150,17 @@ impl AppState {
     /// The model step chose `value` (`None`: the runtime's default): the model, or while the
     /// effort is picked the effort. Returns what to run.
     fn model_chosen(&mut self, value: Option<String>) -> Vec<Action> {
+        let orchestrator = self.orchestrator().map(|o| (o.id.clone(), o.name.clone()));
         let Some(p) = self.view.picker.as_mut() else {
             return Vec::new();
         };
         let switch = p.switch;
+        let current_row = p.default.clone();
+        // The orchestrator's model picker on its current runtime and account: its thread's
+        // model and effort change in place, as a thread's do.
+        let in_place = p.in_place && p.step.as_ref().is_some_and(|m| m.runtime == current_row);
         let Some(m) = p.step.as_mut() else {
             return Vec::new();
-        };
-        let Some((thread, name)) = m.thread.clone() else {
-            // The orchestrator: its runtime and model are chosen.
-            let runtime = m.runtime.clone();
-            self.view.picker = None;
-            let shown = orch_label(&runtime, &self.accounts);
-            if switch {
-                self.confirm_switch(runtime, &shown, value);
-                return Vec::new();
-            }
-            let with = value.as_deref().map_or_else(
-                || ", its default model".to_string(),
-                |v| format!(", model {v}"),
-            );
-            self.view.status = Some(format!(
-                "choosing {shown}{with} for the orchestrator: waiting for the hub"
-            ));
-            return vec![Action::UseOrchestrator {
-                runtime,
-                model: value,
-                summary: false,
-            }];
         };
         if m.chosen.is_none() && !m.efforts.is_empty() {
             // The effort next: the runtime's default, then each one it takes.
@@ -7868,6 +8184,42 @@ impl AppState {
             self.view.status = None;
             return Vec::new();
         }
+        let target = match in_place {
+            true => orchestrator,
+            false => m.thread.clone(),
+        };
+        let Some((thread, name)) = target else {
+            // The orchestrator: its runtime and model (and for a switch, its effort) are
+            // chosen. With no effort to pick (an ACP agent's, which the catalog doesn't list),
+            // a switch on the same runtime keeps the effort in effect: `orchestrator.use`
+            // without one would start the new session at the runtime's default.
+            let runtime = m.runtime.clone();
+            // The effort's Default row picked is `default`, the runtime's own: left out, the
+            // hub would take `[orchestrator] effort` from the config instead.
+            let (value, effort) = match m.chosen.take() {
+                Some(model) => (model, Some(value.unwrap_or_else(|| "default".into()))),
+                None => (value, m.current_effort.clone()),
+            };
+            self.view.picker = None;
+            let shown = orch_row_label(&runtime, &current_row, switch, &self.accounts);
+            if switch {
+                self.confirm_switch(runtime, &shown, value, effort);
+                return Vec::new();
+            }
+            let with = value.as_deref().map_or_else(
+                || ", its default model".to_string(),
+                |v| format!(", model {v}"),
+            );
+            self.view.status = Some(format!(
+                "choosing {shown}{with} for the orchestrator: waiting for the hub"
+            ));
+            return vec![Action::UseOrchestrator {
+                runtime,
+                model: value,
+                effort: None,
+                summary: false,
+            }];
+        };
         let (model, effort) = match m.chosen.take() {
             Some(model) => (model, value),
             None => (value, m.current_effort.clone()),
@@ -7912,7 +8264,13 @@ impl AppState {
             default: String::new(),
             model: None,
             switch: true,
+            in_place: false,
             step: Some(step),
+        });
+        self.view.picker_for = Some(PickerFor {
+            thread: Some(thread.id.clone()),
+            name: thread.name.clone(),
+            runs: self.model_target(Some(&thread.id)),
         });
     }
 
@@ -7986,7 +8344,9 @@ impl AppState {
         }
         match key.code {
             KeyCode::Enter => {
-                let text = self.view.input.trim().to_string();
+                // Trimmed as the hub trims a message: a file's path that ends it is kept
+                // exactly, a trailing space too (an older app's upload names ended in one).
+                let text = twr_core::upload::trim_message(&self.view.input).to_string();
                 // Only blanks: nothing to send (an empty line's Enter is the selection's).
                 if text.is_empty() {
                     return Vec::new();
@@ -8954,6 +9314,7 @@ impl AppState {
                 }
             }
             Target::TakeBack => return self.tap_unsend(Instant::now()),
+            Target::ModelPicker => return self.open_target_picker(),
             Target::Row(kind) => return self.tap_row(kind),
             Target::Suggestion(value) => {
                 if let Some(s) = self.popup() {
@@ -10881,6 +11242,25 @@ pub(crate) mod tests {
         assert!(st0.transcript.is_none());
     }
 
+    /// A message sent again from the history (one an orchestrator switch dropped) whose last
+    /// line is a file's path keeps that path exactly: an older app's upload names could end
+    /// in a space, and the path names that file.
+    #[test]
+    fn a_files_path_ending_a_message_is_sent_exactly() {
+        let mut st = three_threads();
+        let message = "see this\nUploaded file: notes.txt \n/w/.twr-uploads/u1/notes.txt ";
+        st.view.input.set(&format!("  {message}\n"));
+        let sent = st.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&sent[..], [Action::Say { text, .. }] if text == message),
+            "{sent:?}"
+        );
+        // Anything else is trimmed as before.
+        st.view.input.set("  deploy the api  ");
+        let sent = st.handle_key(key(KeyCode::Enter));
+        assert!(matches!(&sent[..], [Action::Say { text, .. }] if text == "deploy the api"));
+    }
+
     /// With one worker thread, a typed line still goes to the orchestrator (`say` with `to:
     /// "orchestrator"`), never to the only thread.
     #[test]
@@ -11785,6 +12165,7 @@ pub(crate) mod tests {
             [Action::UseOrchestrator {
                 runtime: "codex".into(),
                 model: None,
+                effort: None,
                 summary: true,
             }]
         );
@@ -11804,6 +12185,7 @@ pub(crate) mod tests {
             [Action::UseOrchestrator {
                 runtime: "grok-build".into(),
                 model: None,
+                effort: None,
                 summary: false,
             }]
         );
@@ -11820,6 +12202,37 @@ pub(crate) mod tests {
         assert!(type_line(&mut st, "/orch codex o5").is_empty());
         let prompt = st.view.confirm.as_ref().unwrap().prompt.clone();
         assert!(prompt.contains("codex (o5)"), "{prompt}");
+        assert!(!prompt.contains("queued"), "{prompt}");
+    }
+
+    /// A switch drops the orchestrator's queued messages: its question says how many, and
+    /// the user's own the hub gives back go to the history, to send again.
+    #[test]
+    fn an_orchestrator_switch_says_what_it_drops_and_keeps_the_users_messages() {
+        let mut st = with_orch();
+        let orch = st.orchestrator().unwrap().id.clone();
+        st.queue = Some(crate::queue::QueueView {
+            thread: orch,
+            total: 2,
+            ..Default::default()
+        });
+        assert!(type_line(&mut st, "/orch codex").is_empty());
+        let prompt = st.view.confirm.as_ref().unwrap().prompt.clone();
+        assert!(
+            prompt.contains("It drops 2 queued message(s): all of them without the summary"),
+            "{prompt}"
+        );
+        st.handle_key(key(KeyCode::Char('n')));
+        st.apply_result(
+            "orchestrator.use",
+            &serde_json::json!({"runtime": "codex", "previous": {
+                "dropped_prompts": 2, "dropped_messages": ["and the deploys", "/not a command"]}}),
+        );
+        let h = &st.view.history;
+        assert_eq!(
+            h[h.len() - 2..],
+            ["and the deploys".to_string(), "//not a command".to_string()]
+        );
     }
 
     /// Types `line` on a cleared input line and presses Enter.
@@ -11829,6 +12242,107 @@ pub(crate) mod tests {
             assert!(st.handle_key(key(KeyCode::Char(c))).is_empty());
         }
         st.handle_key(key(KeyCode::Enter))
+    }
+
+    /// `/access` alone asks the hub and says the level; `/access full` asks `y` first, naming
+    /// what it gives (anything else cancels); `/access limited` goes at once. The hub's answer
+    /// says when the orchestrator picks it up and whether config.toml keeps it, and the view
+    /// follows it. A TUI an agent runs changes nothing.
+    #[test]
+    fn access_shows_the_level_and_asks_before_full() {
+        use serde_json::json;
+        let mut st = with_orch();
+        let read = Action::OrchestratorAccess { access: None };
+        assert_eq!(type_line(&mut st, "/access"), std::slice::from_ref(&read));
+        assert_eq!(
+            crate::action_request(&read),
+            Some(("orchestrator.access", json!({})))
+        );
+        st.apply_result("orchestrator.access", &json!({"access": "limited"}));
+        assert_eq!(st.view.orch_access.as_deref(), Some("limited"));
+        let status = st.view.status.clone().unwrap();
+        assert!(
+            status.starts_with("orchestrator access: limited"),
+            "{status}"
+        );
+        // Full asks first.
+        assert!(type_line(&mut st, "/access full").is_empty());
+        let prompt = st.view.confirm.as_ref().unwrap().prompt.clone();
+        assert!(
+            prompt.contains("runs any command") && prompt.ends_with("[y/N]"),
+            "{prompt}"
+        );
+        assert!(st.handle_key(key(KeyCode::Char('n'))).is_empty());
+        assert_eq!(st.view.status.as_deref(), Some("cancelled"));
+        assert!(type_line(&mut st, "/access full").is_empty());
+        let full = Action::OrchestratorAccess {
+            access: Some("full".into()),
+        };
+        assert_eq!(
+            st.handle_key(key(KeyCode::Char('y'))),
+            std::slice::from_ref(&full)
+        );
+        assert_eq!(
+            crate::action_request(&full),
+            Some(("orchestrator.access", json!({"access": "full"})))
+        );
+        let r = json!({"access": "full", "previous": "limited", "persisted": true, "restart": "after_turn"});
+        assert_eq!(
+            crate::result_status("orchestrator.access", &r).as_deref(),
+            Some(
+                "orchestrator access: full (was limited); the orchestrator restarts with it \
+                 after its current turn; kept in config.toml"
+            )
+        );
+        st.apply_result("orchestrator.access", &r);
+        assert_eq!(st.view.orch_access.as_deref(), Some("full"));
+        let unkept = json!({"access": "limited", "previous": "full", "persisted": false,
+            "persist_error": "this hub runs without a config file", "restart": "now"});
+        assert_eq!(
+            crate::result_status("orchestrator.access", &unkept).as_deref(),
+            Some(
+                "orchestrator access: limited (was full); the orchestrator restarts with it \
+                 now; for this hub run only, config.toml was left alone: this hub runs without \
+                 a config file"
+            )
+        );
+        // A read says nothing there (the view does).
+        assert_eq!(
+            crate::result_status("orchestrator.access", &json!({"access": "full"})),
+            None
+        );
+        // Limited goes at once.
+        assert_eq!(
+            type_line(&mut st, "/access limited"),
+            [Action::OrchestratorAccess {
+                access: Some("limited".into())
+            }]
+        );
+        assert!(st.view.confirm.is_none());
+        // Another client's change, live: the view follows.
+        st.apply_control(&Event::new(
+            "t-orch",
+            90,
+            None,
+            twr_core::event::Source::Hub,
+            EventBody::ConfigChanged(twr_core::event::ConfigChanged {
+                key: "orchestrator.access".into(),
+                value: json!("limited"),
+                by: "user".into(),
+                ..Default::default()
+            }),
+        ));
+        assert_eq!(st.view.orch_access.as_deref(), Some("limited"));
+        // An agent's TUI changes nothing.
+        st.agent = Some("thread web's agent".into());
+        assert!(type_line(&mut st, "/access full").is_empty());
+        assert!(st.view.confirm.is_none());
+        assert!(st
+            .view
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("changes no setting"));
     }
 
     #[test]
@@ -12169,6 +12683,7 @@ pub(crate) mod tests {
             [Action::UseOrchestrator {
                 runtime: "codex".into(),
                 model: Some("o5".into()),
+                effort: None,
                 summary: true,
             }]
         );
@@ -12178,6 +12693,7 @@ pub(crate) mod tests {
             [Action::UseOrchestrator {
                 runtime: "grok-build".into(),
                 model: None,
+                effort: None,
                 summary: false,
             }]
         );
@@ -14910,20 +15426,25 @@ pub(crate) mod tests {
             st.view.status.as_deref(),
             Some("alpha → effort default: waiting for the hub")
         );
-        // Outside a dive the thread is needed; a failed command stays on the line.
-        for line in ["/model", "/model --effort high"] {
-            assert!(type_line(&mut st, line).is_empty());
-            assert!(
-                st.view
-                    .status
-                    .as_deref()
-                    .unwrap()
-                    .starts_with("usage: /model <thread>"),
-                "{line}: {:?}",
-                st.view.status
-            );
-            assert_eq!(st.view.input, line);
-        }
+        // Outside a dive, `/model` alone is the orchestrator's picker (Alt-M); anything else
+        // needs the thread, and a failed command stays on the line.
+        assert!(type_line(&mut st, "/model").is_empty());
+        assert!(st.picker_open());
+        assert_eq!(st.view.input, "");
+        st.handle_key(key(KeyCode::Esc));
+        assert!(!st.picker_open());
+        let line = "/model --effort high";
+        assert!(type_line(&mut st, line).is_empty());
+        assert!(
+            st.view
+                .status
+                .as_deref()
+                .unwrap()
+                .starts_with("usage: /model <thread>"),
+            "{line}: {:?}",
+            st.view.status
+        );
+        assert_eq!(st.view.input, line);
         assert!(type_line(&mut st, "/model nope opus").is_empty());
         assert_eq!(st.view.status.as_deref(), Some("no thread nope"));
         assert!(type_line(&mut st, "/model beta x y").is_empty());
@@ -16233,6 +16754,7 @@ pub(crate) mod tests {
             [Action::UseOrchestrator {
                 runtime: "claude-code".into(),
                 model: None,
+                effort: None,
                 summary: false,
             }]
         );
@@ -16247,6 +16769,7 @@ pub(crate) mod tests {
             [Action::UseOrchestrator {
                 runtime: "claude-code".into(),
                 model: Some("opus".into()),
+                effort: None,
                 summary: false,
             }]
         );
@@ -16307,6 +16830,7 @@ pub(crate) mod tests {
             [Action::UseOrchestrator {
                 runtime: "claude-code".into(),
                 model: Some("my-model".into()),
+                effort: None,
                 summary: false,
             }]
         );
@@ -16398,6 +16922,353 @@ pub(crate) mod tests {
         assert!(!st.picker_open());
     }
 
+    /// Alt-M in the stack view: the orchestrator's picker on its current runtime, its model
+    /// in effect selected, `other runtime…` last; then its effort; then `thread.set_model` on
+    /// its thread with what changed, at once (a change in place, no switch to confirm). Esc
+    /// closes it (not the runtimes). Another runtime is a switch: `y`/`s` confirm it.
+    #[test]
+    fn alt_m_picks_the_orchestrators_model_and_effort() {
+        let mut st = with_orch();
+        st.view.model_choices = catalog();
+        let step = |st: &AppState| st.view.picker.as_ref().unwrap().step.clone().unwrap();
+        let alt_m = || mods(KeyCode::Char('m'), KeyModifiers::ALT);
+        assert!(st.handle_key(alt_m()).is_empty());
+        let m = step(&st);
+        assert_eq!(
+            (m.runtime.as_str(), m.thread.clone()),
+            ("claude-code", None)
+        );
+        assert_eq!(
+            m.rows,
+            [
+                ModelRow::Default,
+                ModelRow::Known("opus".into(), "the latest Opus".into()),
+                ModelRow::Custom,
+                ModelRow::OtherRuntime,
+            ]
+        );
+        assert_eq!(m.selected, 1, "opus, in effect");
+        let s = crate::ui::picker_lines(&st)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            s.contains("Model for the orchestrator on claude-code")
+                && s.contains("other runtime…")
+                && s.contains("its reasoning effort next")
+                && s.contains("Esc cancel"),
+            "{s}"
+        );
+        // The model, then the effort (the runtime's default in effect).
+        assert!(st.handle_key(key(KeyCode::Enter)).is_empty());
+        let m = step(&st);
+        assert_eq!(m.chosen, Some(Some("opus".into())));
+        assert_eq!(
+            m.rows,
+            [
+                ModelRow::Default,
+                ModelRow::Known("low".into(), String::new())
+            ]
+        );
+        assert_eq!(m.selected, 0);
+        let s = crate::ui::picker_lines(&st)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(s.contains("Reasoning effort for the orchestrator"), "{s}");
+        st.handle_key(key(KeyCode::Down));
+        // Only the effort changed: only it is sent, on the orchestrator's thread.
+        assert_eq!(
+            st.handle_key(key(KeyCode::Enter)),
+            [Action::SetModel {
+                thread: "t-orch".into(),
+                model: None,
+                effort: Some("low".into()),
+                runtime: None,
+            }]
+        );
+        assert!(!st.picker_open() && st.view.confirm.is_none());
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("orch → effort low: waiting for the hub")
+        );
+        // The runtime's default model, the effort kept: `default` for the model alone.
+        st.handle_key(alt_m());
+        st.handle_key(key(KeyCode::Char('1')));
+        st.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            st.handle_key(key(KeyCode::Enter)),
+            [Action::SetModel {
+                thread: "t-orch".into(),
+                model: Some("default".into()),
+                effort: None,
+                runtime: None,
+            }]
+        );
+        // Esc on its models closes it.
+        st.handle_key(alt_m());
+        st.handle_key(key(KeyCode::Esc));
+        assert!(!st.picker_open());
+        // `other runtime…`: the runtimes, then that runtime's model (no efforts listed for
+        // it: none to pick), then the confirmation.
+        st.handle_key(alt_m());
+        st.handle_key(key(KeyCode::Char('4')));
+        st.handle_key(key(KeyCode::Enter));
+        let p = st.view.picker.clone().unwrap();
+        assert!(p.step.is_none() && p.switch);
+        st.handle_key(key(KeyCode::Char('2')));
+        st.handle_key(key(KeyCode::Enter));
+        assert_eq!(step(&st).runtime, "codex");
+        assert!(!step(&st).other_runtime);
+        st.handle_key(key(KeyCode::Enter));
+        let prompt = st.view.confirm.as_ref().unwrap().prompt.clone();
+        assert!(
+            prompt.starts_with("switch the orchestrator to codex?") && prompt.contains("handoff"),
+            "{prompt}"
+        );
+        assert_eq!(
+            st.handle_key(key(KeyCode::Char('y'))),
+            [Action::UseOrchestrator {
+                runtime: "codex".into(),
+                model: None,
+                effort: None,
+                summary: true,
+            }]
+        );
+    }
+
+    /// A model picker whose thread changes underneath (another client sets its model,
+    /// deletes it, or switches the orchestrator) closes, saying why, and a switch it asked to
+    /// confirm is cancelled: the next choice starts from what runs now.
+    #[test]
+    fn a_model_picker_closes_when_what_it_is_for_changes_underneath() {
+        let mut st = with_orch();
+        st.view.model_choices = catalog();
+        let model = |m: &str| {
+            EventBody::ThreadModelChanged(twr_core::event::ThreadModelChanged {
+                model: Some(m.into()),
+                ..Default::default()
+            })
+        };
+        let alt_m = || mods(KeyCode::Char('m'), KeyModifiers::ALT);
+        let mut a = ThreadScript::new("t-alpha");
+        let mut o = ThreadScript::new("t-orch");
+        type_line(&mut st, "/model alpha");
+        assert!(st.picker_open());
+        // What another thread does leaves it open.
+        control(&mut st, &[ThreadScript::new("t-beta").event(model("m1"))]);
+        assert!(st.picker_open());
+        control(&mut st, &[a.event(model("m2"))]);
+        assert!(!st.picker_open());
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("alpha changed: the model picker closed; open it again to pick")
+        );
+        type_line(&mut st, "/model alpha");
+        control(
+            &mut st,
+            &[
+                a.event(EventBody::ThreadDeleted(twr_core::event::ThreadDeleted {
+                    name: "alpha".into(),
+                    ..Default::default()
+                })),
+            ],
+        );
+        assert!(!st.picker_open());
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("alpha is gone: the model picker closed; open it again to pick")
+        );
+        // The orchestrator's picker, then the switch it asks to confirm.
+        st.handle_key(alt_m());
+        assert!(st.picker_open());
+        control(&mut st, &[o.event(model("sonnet"))]);
+        assert!(!st.picker_open());
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("the orchestrator changed: the model picker closed; open it again to pick")
+        );
+        // `/orch`'s own picker, on its current runtime: a switch to confirm.
+        type_line(&mut st, "/orch");
+        st.handle_key(key(KeyCode::Enter));
+        st.handle_key(key(KeyCode::Enter));
+        st.handle_key(key(KeyCode::Down));
+        st.handle_key(key(KeyCode::Enter));
+        assert!(
+            st.view
+                .confirm
+                .as_ref()
+                .is_some_and(|c| matches!(c.action, Action::UseOrchestrator { .. })),
+            "{:?}",
+            st.view.status
+        );
+        control(&mut st, &[o.event(model("opus"))]);
+        assert!(st.view.confirm.is_none());
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("cancelled: the orchestrator changed before you confirmed")
+        );
+        assert!(st.handle_key(key(KeyCode::Char('y'))).is_empty());
+    }
+
+    /// `/orch`'s picker asks for the effort after the model, the current one's selected on
+    /// the same runtime; Esc from the effort goes back to the model, from the model to the
+    /// runtimes.
+    #[test]
+    fn the_orch_picker_asks_for_the_effort_too() {
+        let mut st = with_orch();
+        st.view.model_choices = catalog();
+        let mut o = ThreadScript::new("t-orch");
+        control(
+            &mut st,
+            &[o.event(EventBody::ThreadModelChanged(
+                twr_core::event::ThreadModelChanged {
+                    model: Some("opus".into()),
+                    effort: Some("low".into()),
+                    ..Default::default()
+                },
+            ))],
+        );
+        type_line(&mut st, "/orch");
+        st.handle_key(key(KeyCode::Char('1')));
+        st.handle_key(key(KeyCode::Enter));
+        let step = |st: &AppState| st.view.picker.as_ref().unwrap().step.clone().unwrap();
+        assert_eq!(step(&st).current_effort.as_deref(), Some("low"));
+        st.handle_key(key(KeyCode::Enter));
+        assert_eq!(step(&st).selected, 1, "low, in effect");
+        st.handle_key(key(KeyCode::Esc));
+        assert!(step(&st).chosen.is_none());
+        st.handle_key(key(KeyCode::Esc));
+        assert!(st.view.picker.as_ref().unwrap().step.is_none());
+        st.handle_key(key(KeyCode::Enter));
+        st.handle_key(key(KeyCode::Enter));
+        st.handle_key(key(KeyCode::Char('1')));
+        st.handle_key(key(KeyCode::Enter));
+        // The effort's Default row is the runtime's own: `default`, never left out, which
+        // would start the new session at `[orchestrator] effort` from the config.
+        assert_eq!(
+            st.handle_key(key(KeyCode::Char('y'))),
+            [Action::UseOrchestrator {
+                runtime: "claude-code".into(),
+                model: Some("opus".into()),
+                effort: Some("default".into()),
+                summary: true,
+            }]
+        );
+        assert_eq!(
+            crate::action_request(&Action::UseOrchestrator {
+                runtime: "codex".into(),
+                model: None,
+                effort: Some("high".into()),
+                summary: true,
+            }),
+            Some((
+                "orchestrator.use",
+                serde_json::json!({"runtime": "codex", "effort": "high"})
+            ))
+        );
+    }
+
+    /// An orchestrator on an ACP agent, whose efforts the catalog doesn't list: Alt-M changes
+    /// only its model, in place (the effort it runs at is kept: not sent). `/orch`'s switch on
+    /// its runtime keeps that effort too (`orchestrator.use` without one would reset it to
+    /// the agent's default).
+    #[test]
+    fn the_orch_picker_keeps_an_acp_effort_on_a_model_change() {
+        let mut st = three_threads();
+        let mut o = ThreadScript::new("t-orch");
+        o.at(40);
+        let mut created = o.created("orch");
+        if let EventBody::ThreadCreated(p) = &mut created.body {
+            p.runtime = "acp".into();
+            p.ext = serde_json::json!({"twr": {
+                "role": "orchestrator", "model": "m1", "effort": "Deep",
+                "acp_command": "my-agent --acp",
+            }})
+            .as_object()
+            .cloned();
+        }
+        control(&mut st, &[created]);
+        let mut choices = catalog();
+        choices["acp"] = serde_json::json!({"models": [{"id": "m1"}, {"id": "m2"}]});
+        st.view.model_choices = choices;
+        assert_eq!(
+            st.orchestrator().and_then(|o| o.effort.as_deref()),
+            Some("Deep")
+        );
+        st.handle_key(mods(KeyCode::Char('m'), KeyModifiers::ALT));
+        let m = st.view.picker.as_ref().unwrap().step.clone().unwrap();
+        assert_eq!(m.runtime, "acp");
+        assert!(m.efforts.is_empty());
+        // m2, the row after m1.
+        st.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            st.handle_key(key(KeyCode::Enter)),
+            [Action::SetModel {
+                thread: "t-orch".into(),
+                model: Some("m2".into()),
+                effort: None,
+                runtime: None,
+            }]
+        );
+        assert!(st.view.confirm.is_none());
+        st.view.orch_runtimes = vec!["claude-code".into(), "acp".into()];
+        type_line(&mut st, "/orch");
+        let p = st.view.picker.as_ref().unwrap();
+        assert_eq!((p.default.as_str(), p.selected), ("acp", 1));
+        st.handle_key(key(KeyCode::Enter));
+        st.handle_key(key(KeyCode::Down));
+        assert!(st.handle_key(key(KeyCode::Enter)).is_empty());
+        let prompt = st.view.confirm.as_ref().unwrap().prompt.clone();
+        assert!(prompt.contains("(m2, effort Deep)"), "{prompt}");
+        assert_eq!(
+            st.handle_key(key(KeyCode::Char('y'))),
+            [Action::UseOrchestrator {
+                runtime: "acp".into(),
+                model: Some("m2".into()),
+                effort: Some("Deep".into()),
+                summary: true,
+            }]
+        );
+    }
+
+    /// In a dive Alt-M is the thread's `/model` picker; a `pty` thread has none, and the
+    /// status bar says how to move it.
+    #[test]
+    fn alt_m_in_a_dive_picks_the_threads_model() {
+        let mut st = with_orch();
+        st.view.model_choices = catalog();
+        st.dive("t-alpha");
+        st.handle_key(mods(KeyCode::Char('m'), KeyModifiers::ALT));
+        let m = st.view.picker.as_ref().unwrap().step.clone().unwrap();
+        assert_eq!(m.thread, Some(("t-alpha".into(), "alpha".into())));
+        assert!(!m.other_runtime);
+        assert_eq!(st.model_label(), Some(("default".into(), None)));
+        st.handle_key(key(KeyCode::Esc));
+        assert!(!st.picker_open());
+        let mut p = ThreadScript::new("t-sh");
+        let mut created = p.created("sh");
+        if let EventBody::ThreadCreated(c) = &mut created.body {
+            c.runtime = "pty".into();
+        }
+        control(&mut st, &[created]);
+        st.dive("t-sh");
+        assert_eq!(st.model_label(), None);
+        st.handle_key(mods(KeyCode::Char('m'), KeyModifiers::ALT));
+        assert!(!st.picker_open());
+        assert!(
+            st.view
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("runs its own command line"),
+            "{:?}",
+            st.view.status
+        );
+    }
+
     #[test]
     fn the_picker_chooses_with_enter_and_waits_with_esc() {
         let mut st = AppState::new();
@@ -16431,6 +17302,7 @@ pub(crate) mod tests {
             [Action::UseOrchestrator {
                 runtime: "claude-code".into(),
                 model: None,
+                effort: None,
                 summary: false,
             }]
         );
@@ -16438,6 +17310,7 @@ pub(crate) mod tests {
         let (m, p) = crate::action_request(&Action::UseOrchestrator {
             runtime: "claude-code".into(),
             model: None,
+            effort: None,
             summary: false,
         })
         .unwrap();
@@ -16456,6 +17329,7 @@ pub(crate) mod tests {
             [Action::UseOrchestrator {
                 runtime: "codex".into(),
                 model: Some("o5".into()),
+                effort: None,
                 summary: false,
             }]
         );
@@ -16547,6 +17421,7 @@ pub(crate) mod tests {
             [Action::UseOrchestrator {
                 runtime: "claude-code:work".into(),
                 model: Some("opus".into()),
+                effort: None,
                 summary: false,
             }]
         );
@@ -16554,6 +17429,7 @@ pub(crate) mod tests {
             crate::action_request(&Action::UseOrchestrator {
                 runtime: "claude-code:work".into(),
                 model: None,
+                effort: None,
                 summary: false,
             })
             .unwrap()
@@ -16609,6 +17485,7 @@ pub(crate) mod tests {
             [Action::UseOrchestrator {
                 runtime: "claude-code:work".into(),
                 model: Some("opus".into()),
+                effort: None,
                 summary: false,
             }]
         );
@@ -16693,6 +17570,7 @@ pub(crate) mod tests {
             [Action::UseOrchestrator {
                 runtime: "claude-code:personal".into(),
                 model: None,
+                effort: None,
                 summary: false,
             }]
         );
@@ -16738,11 +17616,13 @@ pub(crate) mod tests {
             prompt.starts_with("switch the orchestrator to claude-code? "),
             "{prompt}"
         );
+        // A switch names the current row's account.
         assert_eq!(
             st.handle_key(key(KeyCode::Char('s'))),
             [Action::UseOrchestrator {
                 runtime: "claude-code:work".into(),
                 model: None,
+                effort: None,
                 summary: false,
             }]
         );
@@ -16776,6 +17656,122 @@ pub(crate) mod tests {
             .map(|(n, _)| n.as_str())
             .collect();
         assert_eq!(names, ["default", "work"]);
+    }
+
+    /// The orchestrator on the native login, whose name (`default`) a named account shares:
+    /// its picker's current row is the runtime alone, `claude-code (native login)`, beside
+    /// `claude-code:default`, the named one's. A model and effort change from it (Alt-M) is
+    /// `thread.set_model` on its thread, naming no account, so the hub keeps the native login;
+    /// the named account's row, and another account's, are switches that name it.
+    #[test]
+    fn the_orch_picker_keeps_the_native_login_a_named_account_shares_a_name_with() {
+        let mut st = three_threads();
+        st.view.model_choices = catalog();
+        st.accounts = Accounts::from_list(&serde_json::json!({"runtimes": {"claude-code": {
+            "shown": true, "native": "default", "accounts": [
+                {"name": "default", "native": true, "shadowed": true, "login": "logged_in"},
+                {"name": "default", "native": false, "login": "logged_in"},
+                {"name": "work", "native": false, "login": "logged_in"},
+        ]}}}));
+        st.view.orch_installed = vec![("claude-code".into(), true)];
+        let mut o = ThreadScript::new("t-orch");
+        o.at(40);
+        control(&mut st, &orch_events(&mut o, "t-orch"));
+        assert_eq!(st.orchestrator().unwrap().account, None);
+        st.handle_key(mods(KeyCode::Char('m'), KeyModifiers::ALT));
+        let p = st.view.picker.clone().unwrap();
+        assert_eq!(p.default, "claude-code");
+        let rows: Vec<&str> = p.runtimes.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(
+            rows[..3],
+            ["claude-code", "claude-code:default", "claude-code:work"]
+        );
+        assert_eq!(p.runtimes[p.selected].0, "claude-code");
+        // Each its own: the native login as such, the named `default` by its name.
+        let saved = st.view.picker.take();
+        st.view.picker = Some(Picker {
+            step: None,
+            ..p.clone()
+        });
+        let lines: Vec<String> = crate::ui::picker_lines(&st)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        st.view.picker = saved;
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("1 claude-code (native login)") && l.contains("(current)")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("2 claude-code:default ") && !l.contains("(current)")),
+            "{lines:?}"
+        );
+        // opus, in effect, then the effort `low`.
+        st.handle_key(key(KeyCode::Enter));
+        st.handle_key(key(KeyCode::Down));
+        let actions = st.handle_key(key(KeyCode::Enter));
+        assert!(st.view.confirm.is_none());
+        assert_eq!(
+            crate::action_request(&actions[0]).unwrap(),
+            (
+                "thread.set_model",
+                serde_json::json!({"thread": "t-orch", "effort": "low"})
+            )
+        );
+        // The named `default`'s row, and another account's, from Alt-M's runtimes and from
+        // `/orch`: a switch to that account, by name.
+        for (name, alt_m) in [
+            ("claude-code:default", true),
+            ("claude-code:work", true),
+            ("claude-code:default", false),
+        ] {
+            if alt_m {
+                st.handle_key(mods(KeyCode::Char('m'), KeyModifiers::ALT));
+                // `other runtime…`, last.
+                let last = st
+                    .view
+                    .picker
+                    .as_ref()
+                    .unwrap()
+                    .step
+                    .as_ref()
+                    .unwrap()
+                    .rows
+                    .len();
+                st.view
+                    .picker
+                    .as_mut()
+                    .unwrap()
+                    .step
+                    .as_mut()
+                    .unwrap()
+                    .selected = last - 1;
+                st.handle_key(key(KeyCode::Enter));
+            } else {
+                type_line(&mut st, "/orch");
+            }
+            let p = st.view.picker.clone().unwrap();
+            let row = p.runtimes.iter().position(|r| r.0 == name);
+            st.view.picker.as_mut().unwrap().selected = row.unwrap();
+            // The runtime, its model, its effort.
+            for _ in 0..3 {
+                st.handle_key(key(KeyCode::Enter));
+            }
+            let prompt = st.view.confirm.as_ref().unwrap().prompt.clone();
+            assert!(
+                prompt.starts_with(&format!("switch the orchestrator to {name} ")),
+                "{prompt}"
+            );
+            assert!(matches!(
+                st.handle_key(key(KeyCode::Char('s'))).as_slice(),
+                [Action::UseOrchestrator { runtime, .. }]
+                    if runtime == name
+            ));
+        }
     }
 
     /// `/new <project> --account ` completes the accounts of the runtime the project's latest
@@ -21713,6 +22709,7 @@ pub(crate) mod tests {
             [
                 ActionKind::Talk,
                 ActionKind::LoopStart,
+                ActionKind::LoopOnce,
                 ActionKind::LoopImplement,
                 ActionKind::LoopSettings,
                 ActionKind::Pin,
@@ -24246,6 +25243,40 @@ pub(crate) mod tests {
             );
         }
 
+        /// The input box's bottom border names the model and effort of where the line goes,
+        /// at its right: the orchestrator's in the stack view, the dived thread's in a dive. A
+        /// tap on it opens their picker.
+        #[test]
+        fn the_input_box_names_the_model_and_a_tap_picks_it() {
+            let mut st = with_orch();
+            let screen = screen_text(&frame(&mut st, 120, 30));
+            assert!(screen.contains("─ opus-5-5 ┘"), "{screen}");
+            let mut o = ThreadScript::new("t-orch");
+            control(
+                &mut st,
+                &[o.event(EventBody::ThreadModelChanged(
+                    twr_core::event::ThreadModelChanged {
+                        model: Some("opus".into()),
+                        effort: Some("high".into()),
+                        ..Default::default()
+                    },
+                ))],
+            );
+            let screen = screen_text(&frame(&mut st, 120, 30));
+            assert!(screen.contains("─ opus-5-5 · high ┘"), "{screen}");
+            assert!(tap(&mut st, 120, 30, Target::ModelPicker).is_empty());
+            let m = st.view.picker.as_ref().unwrap().step.clone().unwrap();
+            assert!(m.thread.is_none() && m.other_runtime);
+            st.handle_key(key(KeyCode::Esc));
+            // In a dive: the thread's (the runtime's default).
+            st.dive("t-beta");
+            let screen = screen_text(&frame(&mut st, 120, 30));
+            assert!(screen.contains("─ default ┘"), "{screen}");
+            tap(&mut st, 120, 30, Target::ModelPicker);
+            let m = st.view.picker.as_ref().unwrap().step.clone().unwrap();
+            assert_eq!(m.thread.map(|t| t.1).as_deref(), Some("beta"));
+        }
+
         /// The input box's top border takes back the message just sent: a first tap arms it
         /// (the title says so), a second within the window takes it back.
         #[test]
@@ -24332,6 +25363,7 @@ pub(crate) mod tests {
                 [Action::UseOrchestrator {
                     runtime: "claude-code".into(),
                     model: None,
+                    effort: None,
                     summary: false,
                 }]
             );
@@ -25004,6 +26036,7 @@ pub(crate) mod tests {
                 default: "claude-code".into(),
                 model: None,
                 switch: false,
+                in_place: false,
                 step: None,
             });
             frame(&mut st, 40, 24);
@@ -25027,6 +26060,7 @@ pub(crate) mod tests {
                 default: "claude-code".into(),
                 model: None,
                 switch: false,
+                in_place: false,
                 step: None,
             });
             for h in [8u16, 9, 10] {

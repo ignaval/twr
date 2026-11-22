@@ -414,7 +414,7 @@ fn task_of(log: &LoopLog) -> Option<String> {
     log.started
         .as_ref()
         .and_then(|s| s.task.as_deref())
-        .map(str::trim)
+        .map(twr_core::upload::trim_message)
         .filter(|t| !t.is_empty())
         .map(str::to_string)
 }
@@ -621,7 +621,11 @@ impl Core {
                             summary: format!(
                                 "{name}: its {} is stuck: {}. Resume asks for that step again; \
                                  stop ends the loop.",
-                                loop_report::kind_words(state.kind),
+                                if state.once {
+                                    loop_report::PASS_WORDS
+                                } else {
+                                    loop_report::kind_words(state.kind)
+                                },
                                 prompts::one_line(&why)
                             ),
                             options: vec![LOOP_STUCK_RESUME.into(), LOOP_STUCK_STOP.into()],
@@ -1023,11 +1027,7 @@ impl Core {
                 vec![
                     (
                         "outcome",
-                        loop_report::outcome_words(
-                            kind,
-                            state.outcome.unwrap_or_default(),
-                            log.answered_rounds(),
-                        ),
+                        log.outcome_words(state.outcome.unwrap_or_default()),
                     ),
                     (
                         "report_path",
@@ -1299,11 +1299,7 @@ impl Core {
                     let log = self.loop_log(thread, &state.id);
                     format!(
                         "{}; checking its commit",
-                        loop_report::outcome_words(
-                            state.kind,
-                            state.outcome.unwrap_or_default(),
-                            log.answered_rounds()
-                        )
+                        log.outcome_words(state.outcome.unwrap_or_default())
                     )
                 });
                 Some(LoopAnswer {
@@ -1333,17 +1329,19 @@ impl Core {
                         let shown = path.display().to_string();
                         mark["outcome"] = json!(outcome);
                         mark["report_path"] = json!(shown);
+                        // As the report the hub writes itself has them (below): whether the
+                        // loop changed the work (every round's fixes, its commits) decides the
+                        // watches its report fires (`hub::orch`).
+                        mark["kind"] = json!(state.kind);
+                        mark["fixed"] = json!(log.fixed().len().max(state.fixed as usize));
+                        mark["commits"] = json!(state.commits);
                         Input::ReportWritten { report_path: shown }
                     }
                     Err(e) => Input::Fail {
                         why: format!("cannot write {}: {e:#}", path.display()),
                     },
                 };
-                let summary = format!(
-                    "{}; report: {}",
-                    loop_report::outcome_words(state.kind, outcome, log.answered_rounds()),
-                    path.display()
-                );
+                let summary = format!("{}; report: {}", log.outcome_words(outcome), path.display());
                 Some(LoopAnswer {
                     mark,
                     summary: Some(summary),
@@ -2060,8 +2058,7 @@ impl Core {
                 .flatten()
                 .map(|r| r.grade)
                 .unwrap_or(Grade::Success);
-            let mut summary =
-                loop_report::outcome_words(state.kind, outcome, log.answered_rounds());
+            let mut summary = log.outcome_words(outcome);
             if let Some(c) = committed.words() {
                 summary.push_str("; ");
                 summary.push_str(&c);
@@ -2078,8 +2075,12 @@ impl Core {
                     written_by: "hub".into(),
                     ext: twr_ext_map(json!({ LOOP_REPORT_KEY: {
                         "id": state.id,
+                        "kind": state.kind,
                         "step": "report",
                         "outcome": outcome,
+                        // Every round's fixes, verification's too (`state.fixed` counts the
+                        // ladder's only, for the sweep): whether the loop changed the work.
+                        "fixed": log.fixed().len().max(state.fixed as usize),
                         "report_path": shown,
                         "commits": committed.commits,
                         "commit_problem": committed.problem,

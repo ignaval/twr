@@ -21,6 +21,26 @@ const api: DesktopAPI = {
   voiceTranscribe: (recording, hint) =>
     ipcRenderer.invoke("twr:voice-transcribe", recording, hint),
   voiceSpeaker: (op) => ipcRenderer.invoke("twr:voice-speaker", op),
+  readAloudVoices: {
+    list: () => ipcRenderer.invoke("twr:voices-list"),
+    select: (lang, voice) =>
+      ipcRenderer.invoke("twr:voices-select", lang, voice),
+    install: (model) => ipcRenderer.invoke("twr:voices-install", model),
+    preview: (voice, lang) =>
+      ipcRenderer.invoke("twr:voices-preview", voice, lang),
+    stopPreview: () => ipcRenderer.invoke("twr:voices-preview-stop"),
+    openSystemVoices: () => ipcRenderer.invoke("twr:voices-system"),
+    onEvent: (callback) => {
+      const listener = (_: unknown, event: DesktopEvent) => {
+        if (event.type === "voice-install" && event.install)
+          callback({ type: "install", install: event.install });
+        else if (event.type === "voice-preview")
+          callback({ type: "preview", voice: event.preview?.voice });
+      };
+      ipcRenderer.on("twr:event", listener);
+      return () => ipcRenderer.removeListener("twr:event", listener);
+    },
+  },
   quit: () => ipcRenderer.invoke("twr:quit"),
   copyText: (text) => ipcRenderer.invoke("twr:copy-text", text),
   bootstrap: () => ipcRenderer.invoke("twr:bootstrap"),
@@ -37,6 +57,7 @@ const api: DesktopAPI = {
   terminalClose: (id) => ipcRenderer.invoke("twr:terminal-close", id),
   terminalRead: (id) => ipcRenderer.invoke("twr:terminal-read", id),
   pickDirectory: () => ipcRenderer.invoke("twr:pick-directory"),
+  pickFile: (request) => ipcRenderer.invoke("twr:pick-file", request),
   openExternal: (url) => ipcRenderer.invoke("twr:open-external", url),
   reveal: (path) => ipcRenderer.invoke("twr:reveal", path),
   configRead: () => ipcRenderer.invoke("twr:config-read"),
@@ -108,6 +129,15 @@ const application: DesktopAppAPI = {
     const listener = (_: unknown, status: UpdateStatus) => callback(status);
     ipcRenderer.on("twr:app-update", listener);
     return () => ipcRenderer.removeListener("twr:app-update", listener);
+  },
+  onSaveNow: (save) => {
+    const listener = (_: unknown, id: number) =>
+      void Promise.resolve()
+        .then(save)
+        .catch(() => {})
+        .finally(() => ipcRenderer.send("twr:app-saved", id));
+    ipcRenderer.on("twr:app-save-now", listener);
+    return () => ipcRenderer.removeListener("twr:app-save-now", listener);
   },
 };
 contextBridge.exposeInMainWorld("twrApp", application);

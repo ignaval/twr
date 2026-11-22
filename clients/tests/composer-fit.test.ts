@@ -152,3 +152,75 @@ describe("where the message field stops growing", () => {
     expect(rule).not.toContain("40dvh");
   });
 });
+
+/* Attached files scroll in a strip above the text. Its height comes from what the window
+ * leaves (on a phone, the keyboard) after the rest of the column and of the composer, so a
+ * screen of long file names never pushes Send and the model below the edge. (Measured in a
+ * real browser at 844×200 and 390×320 on a phone, 1200×480 on a computer: Send in view.) */
+describe("where the attachment strip stops growing", () => {
+  const attachments = readFileSync(
+    join(root, "shared/attachments.css"),
+    "utf8",
+  );
+  const mobile = readFileSync(join(root, "mobile/src/mobile.css"), "utf8");
+  const rule = (css: string, selector: string) => {
+    const at = css.lastIndexOf(selector + " {");
+    return css.slice(at, css.indexOf("}", at));
+  };
+  it("gives it what the keyboard leaves on a phone, at least one row of chips", () => {
+    expect(
+      rule(mobile, '[data-mobile="true"] .composer-attachments > ul'),
+    ).toMatch(
+      /max-height: clamp\(\s*52px,\s*calc\(var\(--viewport-height, 100dvh\) - 220px\),\s*128px\s*\)/,
+    );
+  });
+  it("leaves room for the /usage panel's least height on a phone", () => {
+    expect(
+      rule(
+        mobile,
+        ':root[data-mobile="true"]:has(.usage-panel) .composer-attachments > ul',
+      ),
+    ).toMatch(
+      /max-height: clamp\(\s*52px,\s*calc\(var\(--viewport-height, 100dvh\) - 254px\),\s*128px\s*\)/,
+    );
+  });
+  it("gives it what the window leaves on a computer, at least one row of chips", () => {
+    expect(rule(attachments, ".composer-attachments > ul")).toMatch(
+      /max-height: clamp\(44px, calc\(100dvh - 440px\), 168px\)/,
+    );
+  });
+});
+
+/* `/usage` opens a panel above the message box: it gives way before the message box does,
+ * so Send stays on screen in a short window (measured in a browser: a phone at 390×250 to
+ * 390×844 and 844×200, with eight files attached and the keyboard open). */
+describe("the /usage panel in a short window", () => {
+  const usage = readFileSync(join(root, "shared/usage.css"), "utf8");
+  const mobile = readFileSync(join(root, "mobile/src/mobile.css"), "utf8");
+  const rule = (css: string, selector: string) => {
+    const at = css.lastIndexOf(selector + " {");
+    return css.slice(at, css.indexOf("}", at));
+  };
+  it("shrinks, its rows scrolling inside it, instead of holding its height", () => {
+    const panel = rule(usage, ".usage-panel");
+    expect(panel).toMatch(/flex-shrink: 1;/);
+    expect(panel).toMatch(/min-height: 0;/);
+    expect(panel).toMatch(/overflow-y: auto;/);
+  });
+  it("lets the header gauge's popover text wrap, not the header's one-line style", () => {
+    // `.conversation-heading p` is one monospace line cut with an ellipsis (the header's
+    // model line); the popover sits in that header, so its own rule must outrank it.
+    const popover = rule(usage, ".conversation-heading .usage-popover p");
+    expect(popover).toMatch(/white-space: normal;/);
+    expect(popover).toMatch(/font-family: var\(--font-ui\);/);
+    expect(popover).toMatch(/overflow: visible;/);
+  });
+  it("steps aside while you type in a tiny phone viewport", () => {
+    expect(
+      rule(
+        mobile,
+        ':root[data-mobile="true"].tiny-content[data-keyboard="true"] .usage-panel',
+      ),
+    ).toMatch(/display: none;/);
+  });
+});

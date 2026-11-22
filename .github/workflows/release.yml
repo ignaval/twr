@@ -179,7 +179,9 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.zig }}" = "true" ]; then
-            cargo zigbuild --release --locked -p twr-cli --target "$TARGET"
+            # Static musl: without twr's own voices (sherpa-onnx's prebuilt libraries are
+            # glibc's, and a static ALSA can't load PipeWire's plugin).
+            cargo zigbuild --release --locked -p twr-cli --no-default-features --target "$TARGET"
           else
             cargo build --release --locked -p twr-cli --target "$TARGET"
           fi
@@ -266,6 +268,12 @@ jobs:
       # The licences and notices of the crates in the binary (about.toml, about.hbs).
       - name: Write the third-party licences
         run: cargo about generate --locked --fail -o THIRD-PARTY-LICENSES.html about.hbs
+
+      # The macOS builds have twr's own voices (the `neural` feature): sherpa-onnx's C and C++
+      # libraries, which cargo-about doesn't list (licenses/native).
+      - name: Add the native libraries' licences (macOS)
+        if: endsWith(matrix.target, 'apple-darwin')
+        run: node licenses/native/section.mjs THIRD-PARTY-LICENSES.html
 
       - id: package
         name: Package
@@ -527,6 +535,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          # Whether this run attested the archives (the condition of the steps above): the
+          # notes promise attestations only then.
+          PROVENANCE: ${{ github.event_name == 'push' && needs.resolve.outputs.sha == github.sha }}
         run: |
           prerelease=false
           case "$TAG" in *-*) prerelease=true ;; esac
@@ -567,8 +578,11 @@ jobs:
           twr's release key before it installs anything, and \`install.sh\` does too where its
           \`openssl\` can (OpenSSL 3; macOS's LibreSSL can't, and checks
           \`sha256sums.txt.p256.sig\` instead where a release has it). To check by hand, see
-          [docs/install.md](https://github.com/ignaval/twr/blob/main/docs/install.md). Each
-          archive also has a build provenance attestation, which the GitHub CLI checks:
+          [docs/install.md](https://github.com/ignaval/twr/blob/main/docs/install.md).
+          NOTES
+          if [ "$PROVENANCE" = true ]; then
+            cat >> notes.md <<NOTES
+          Each archive also has a build provenance attestation, which the GitHub CLI checks:
 
           \`\`\`sh
           gh attestation verify twr-<target>.tar.gz --repo ignaval/twr \\
@@ -579,6 +593,16 @@ jobs:
           \`desktop-sha256sums.txt\`, signed in \`desktop-sha256sums.txt.sig\` with the same key,
           and have attestations too.
           NOTES
+          else
+            cat >> notes.md <<NOTES
+
+          The desktop installers of a stable release, attached once built, are listed in
+          \`desktop-sha256sums.txt\`, signed in \`desktop-sha256sums.txt.sig\` with the same key.
+
+          This release was built by hand (a rebuild run from \`main\`), so its files carry no
+          build provenance attestations: check them against the signed checksums.
+          NOTES
+          fi
           gh release create "$TAG" --verify-tag --title "twr $TAG" --generate-notes \
             --notes-file notes.md "${flags[@]}" dist/*
 

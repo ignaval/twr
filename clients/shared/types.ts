@@ -1,8 +1,17 @@
 import type { Appearance } from "./appearance";
 export type Json = any;
+/** How an action's form opens (App's `action`). `fixed`: opened from one thread (its
+ * inspector, its ⋯ menu, a slash command naming it): the form is for that thread and says
+ * so instead of asking. Otherwise a `thread` it is given is only the picker's default. */
+export interface OperationOptions {
+  fixed?: boolean;
+}
 export interface Thread {
   id: string;
   name: string;
+  aliases?: string[];
+  former_names?: string[];
+  created_at?: string | null;
   project?: string;
   runtime: string;
   box_name: string;
@@ -55,6 +64,9 @@ export interface ViewState {
   decisions_seen: number;
   head: number;
   went_on?: string[];
+  /** Every account's latest subscription usage (twr-core `UsageEntry`s), as the hub
+   * folds `account.usage`: its change is the cue to read `usage.get` again. */
+  usage?: Json[];
 }
 export interface HubEvent {
   id: string;
@@ -84,6 +96,10 @@ export interface DesktopEvent {
   data?: string;
   exitCode?: number;
   theme?: Record<string, string> | null;
+  /** `voice-install`: a natural voice model's download (desktop/voices.ts). */
+  install?: import("./readAloudVoices").VoiceInstall;
+  /** `voice-preview`: the voice being previewed (none: it ended). */
+  preview?: { voice?: string };
   /** `voice-speaker`: this computer's own speaker (desktop/voice.ts). */
   speaker?: {
     running: boolean;
@@ -120,6 +136,12 @@ export interface InboxSource {
   cached?: boolean;
   error?: string;
 }
+/** What a file dialog offers: its title, and the kinds of file to show (each with "All
+ * files" after them). */
+export interface FilePickRequest {
+  title?: string;
+  filters?: { name: string; extensions: string[] }[];
+}
 export interface DesktopAPI {
   sendMessage?(message: import("./offline").DurableMessage): Promise<Json>;
   inboxSources?(): Promise<InboxSource[]>;
@@ -149,6 +171,8 @@ export interface DesktopAPI {
   ): Promise<NonNullable<DesktopEvent["speaker"]>>;
   /** Voice mode with the platform's own recognizer and voice (mobile). */
   nativeVoice?: import("./voice").NativeVoice;
+  /** Settings › Read-aloud voice: this device's voices and twr's natural ones. */
+  readAloudVoices?: import("./readAloudVoices").ReadAloudVoices;
   quit(): Promise<void>;
   copyText(text: string): Promise<void>;
   bootstrap(): Promise<{
@@ -183,6 +207,9 @@ export interface DesktopAPI {
     id: string,
   ): Promise<{ data: string; sequence: number; exited?: boolean }>;
   pickDirectory(): Promise<string | null>;
+  /** Choose a file (the desktop app's own dialog): its path, or null when cancelled.
+   * Absent where there is no file dialog (the phone, a remote hub's view). */
+  pickFile?(request?: FilePickRequest): Promise<string | null>;
   openExternal(url: string): Promise<void>;
   reveal(path: string): Promise<void>;
   configRead(): Promise<{
@@ -195,7 +222,7 @@ export interface DesktopAPI {
   configSet(
     table: string[],
     key: string,
-    value: string | number | boolean,
+    value: string | number | boolean | string[],
   ): Promise<void>;
   exportText(name: string, content: string): Promise<void>;
   onEvent(callback: (event: DesktopEvent) => void): () => void;
@@ -312,6 +339,9 @@ export interface DesktopAppAPI {
   diagnostics(): Promise<string>;
   openLogs(): Promise<void>;
   onUpdate(callback: (status: UpdateStatus) => void): () => void;
+  /** Runs `save` when the window is about to close or the app to quit, and lets the close
+   * go ahead once it is done (`desktop/save-before-close.ts`). */
+  onSaveNow(save: () => Promise<void>): () => void;
 }
 declare global {
   interface Window {

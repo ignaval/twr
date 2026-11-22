@@ -41,6 +41,7 @@ The apps published in the App Store and on Google Play show notifications only w
 
 - The desktop app and `twr update` ask GitHub for the latest twr release, and download it from there when you update.
 - `twr voice setup` downloads the speech model from whisper.cpp's published models, when you run it.
+- `twr voices install` downloads one of twr's own voices from sherpa-onnx's releases on GitHub, when you run it (or the apps' **Download** in Settings › Voice; a phone's downloads it onto the hub's computer). Speaking with it sends nothing anywhere: the voice runs on your machine. A phone that reads aloud with one gets the audio from the hub's computer over its own encrypted connection to your gateway, as it gets your messages.
 
 These requests carry no identifier of yours beyond what any download reveals (your IP address, to GitHub or the model's host).
 

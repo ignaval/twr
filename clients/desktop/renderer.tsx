@@ -2,6 +2,7 @@ import { initializeLayout } from "../shared/layoutPreferences";
 import { initializeAppearance } from "../shared/appearance";
 import { observeDesktopAppearance } from "./appearance";
 import { useEffect, useRef, useState } from "react";
+import { ChevronDown, Laptop, Server } from "lucide-react";
 import { createRoot } from "react-dom/client";
 import App from "../shared/App";
 import "../shared/style.css";
@@ -16,7 +17,8 @@ import { Dialog } from "../shared/ui";
 import { errorMessage } from "../shared/errors";
 import { withLocalUploads } from "../shared/local-uploads";
 import { withInboxCache } from "../shared/inbox-cache";
-import { UpdateBanner } from "./UpdateBanner";
+import { UpdateBanner, useUpdateNotice } from "./UpdateBanner";
+import { saveNow } from "../shared/save-now";
 import "./app-shell.css";
 // Renderer failures go to the local diagnostics log (bounded and redacted in the main process).
 function reportError(message: string, stack?: string, source?: string) {
@@ -43,6 +45,8 @@ window.addEventListener("unhandledrejection", (event) => {
     "unhandled rejection",
   );
 });
+// The window asks the page to save its drafts before it closes or the app quits.
+window.twrApp?.onSaveNow(saveNow);
 const local = withInboxCache(
   withLocalUploads(window.twrLocal, window.twrUploadRequest),
   () => window.twrRemote.listHubs(),
@@ -90,6 +94,7 @@ function Desktop() {
   const [mounted, setMounted] = useState(true);
   const [manager, setManager] = useState(false);
   const [error, setError] = useState("");
+  const update = useUpdateNotice();
   const [folder, setFolder] = useState<{
     path: string;
     entries: { name: string; path: string }[];
@@ -274,13 +279,22 @@ function Desktop() {
         <App
           key={revision}
           deviceScopes={active?.scopes}
+          notices={update ? [update] : undefined}
           headerAccessory={
             <button
-              className="toolbar-button"
+              className="toolbar-button hub-switcher"
               onClick={() => setManager(true)}
-              aria-label="Hubs and remote access"
+              aria-haspopup="dialog"
+              aria-label={`Computer: ${active?.name || "This computer"} — switch`}
+              title="Switch computer"
             >
-              {active?.name || "This computer"}
+              {active ? (
+                <Server size={14} aria-hidden="true" />
+              ) : (
+                <Laptop size={14} aria-hidden="true" />
+              )}
+              <span>{active?.name || "This computer"}</span>
+              <ChevronDown size={13} aria-hidden="true" />
             </button>
           }
           onReady={() => {
@@ -304,7 +318,7 @@ function Desktop() {
           onSelect={select}
         />
       )}
-      <UpdateBanner />
+      {!mounted && <UpdateBanner notice={update} />}
       {error && (
         <div className="connection-error" role="alert" data-modal-keep="">
           {error}

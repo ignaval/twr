@@ -1,6 +1,6 @@
 import { useEditorSessions } from "../shared/editors";
 import { forgetOfflineHost } from "../shared/offline";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import QRCode from "qrcode";
 import { Dialog } from "../shared/ui";
 import { errorMessage } from "../shared/errors";
@@ -13,7 +13,83 @@ import {
   type Invitation,
 } from "../shared/connections";
 import type { Hub } from "../shared/remote";
+import {
+  fieldsFromInvitation,
+  pairRequest,
+  withoutInvitation,
+  type PairFields,
+} from "./pairing";
 import "./connections.css";
+
+const DEFAULT_LISTEN = "0.0.0.0:47321";
+const PEM = [{ name: "PEM files", extensions: ["pem", "crt", "cer", "key"] }];
+
+/** A TLS file: chosen in the file dialog, its path shown; Edit path types it instead (and
+ * is all there is without a file dialog). */
+function PemFileField({
+  label,
+  kind,
+  value,
+  disabled,
+  placeholder,
+  onChange,
+}: {
+  label: string;
+  kind: string;
+  value: string;
+  disabled: boolean;
+  placeholder: string;
+  onChange(value: string): void;
+}) {
+  const pick = window.twrLocal?.pickFile;
+  const [typing, setTyping] = useState(!pick);
+  const id = useId();
+  if (typing)
+    return (
+      <label>
+        {label}
+        <input
+          aria-required="true"
+          disabled={disabled}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={placeholder}
+          spellCheck={false}
+          autoCapitalize="none"
+          autoCorrect="off"
+        />
+      </label>
+    );
+  return (
+    <div className="pem-field" role="group" aria-labelledby={id}>
+      <span id={id}>{label}</span>
+      <code className="pem-path">{value || "None chosen"}</code>
+      <div className="pem-actions">
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() =>
+            void pick!({ title: `Choose the ${kind}`, filters: PEM }).then(
+              (path) => {
+                if (path) onChange(path);
+              },
+            )
+          }
+        >
+          {value ? `Choose another ${kind}…` : `Choose the ${kind}…`}
+        </button>
+        <button
+          type="button"
+          disabled={disabled}
+          aria-label={`Edit path to the ${kind}`}
+          onClick={() => setTyping(true)}
+        >
+          Edit path
+        </button>
+      </div>
+    </div>
+  );
+}
 
 export function Connections({
   active,
@@ -29,6 +105,18 @@ export function Connections({
   const [tab, setTab] = useState<"hubs" | "gateway">("hubs");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // Why Pair and connect failed: said next to the button, which is where the eye is.
+  const [pairError, setPairError] = useState("");
+  const listenId = useId();
+  const errorRef = useRef<HTMLParagraphElement>(null);
+  const pairErrorRef = useRef<HTMLParagraphElement>(null);
+  // An error said where it is out of view (the dialog scrolled) comes into view.
+  useEffect(() => {
+    if (error) errorRef.current?.scrollIntoView?.({ block: "nearest" });
+  }, [error]);
+  useEffect(() => {
+    if (pairError) pairErrorRef.current?.scrollIntoView?.({ block: "nearest" });
+  }, [pairError]);
   const [vaultError, setVaultError] = useState(false);
   const [resetHubs, setResetHubs] = useState(false);
   const [notice, setNotice] = useState("");
@@ -39,9 +127,19 @@ export function Connections({
     if (qr) invitationPanel.current?.scrollIntoView({ block: "nearest" });
   }, [qr]);
   const [now, setNow] = useState(Date.now());
+  const [pairFields, setPairFields] = useState<PairFields>({
+    hubName: "",
+    url: "",
+    code: "",
+    name: "twr desktop",
+  });
+  const [invitationText, setInvitationText] = useState("");
+  // What the last invitation loaded filled in, emptied again when its text goes.
+  const loaded = useRef<Partial<PairFields>>(undefined);
+  const [manual, setManual] = useState(false);
   const [settings, setSettings] = useState<GatewaySettings>({
     url: "",
-    listen: "0.0.0.0:47321",
+    listen: DEFAULT_LISTEN,
     cert: "",
     key: "",
     scopes: "operate",
@@ -137,13 +235,75 @@ export function Connections({
     setConfirmRestart(false);
     void cancelInvitation().catch((e) => setError(errorMessage(e)));
   }
+  /** Fills the Pair form from pasted invitation text: "loaded", "invalid" for one that is
+   * wrong (said in the error), "none" for text that isn't one at all. */
+  function loadInvitation(text: string): "loaded" | "invalid" | "none" {
+    try {
+      const filled = fieldsFromInvitation(text, pairFields);
+      if (!filled) return "none";
+      setPairFields(filled);
+      loaded.current = {
+        url: filled.url,
+        code: filled.code,
+        hubName: filled.hubName,
+      };
+      setError("");
+      setPairError("");
+      setNotice(
+        `Invitation from ${filled.hubName} loaded. Check the names under Enter details manually if you like, then pair.`,
+      );
+      return "loaded";
+    } catch (error) {
+      setError(errorMessage(error));
+      return "invalid";
+    }
+  }
+  /** Paste invitation was cleared, or no longer holds a valid invitation: what the last
+   * one filled in goes with it. */
+  function forgetInvitation(text: string) {
+    const filled = loaded.current;
+    loaded.current = undefined;
+    setPairFields((old) => withoutInvitation(old, filled));
+    if (filled) setNotice("");
+    if (!text.trim()) {
+      setError("");
+      setPairError("");
+    }
+  }
+  const pairField = (
+    key: keyof PairFields,
+    label: string,
+    extra: React.InputHTMLAttributes<HTMLInputElement> = {},
+  ) => (
+    <label>
+      {label}
+      <input
+        name={key}
+        aria-required="true"
+        value={pairFields[key]}
+        onChange={(e) =>
+          setPairFields((old) => ({ ...old, [key]: e.target.value }))
+        }
+        {...extra}
+      />
+    </label>
+  );
+  const gatewayLine = gatewayStatus
+    ? gatewayStatus.running
+      ? `Remote access is on · gateway ${gatewayStatus.runningVersion} · ${gatewayStatus.listen}`
+      : "Remote access is off."
+    : "Checking remote access…";
   return (
-    <Dialog title="Hubs and remote access" onClose={close}>
+    <Dialog
+      title="Computers"
+      subtitle="Connect to another computer's hub, or let your other devices connect to this one."
+      onClose={close}
+    >
       <div className="connections-content">
         <div
           className="button-row"
           role="tablist"
-          aria-label="Connection settings"
+          aria-label="Computers"
           onKeyDown={(event) => {
             const next = handleRovingKey(
               event,
@@ -156,8 +316,8 @@ export function Connections({
         >
           {(
             [
-              ["hubs", "Saved hubs"],
-              ["gateway", "Share this computer"],
+              ["hubs", "Connect to another computer"],
+              ["gateway", "Let other devices connect"],
             ] as const
           ).map(([key, label]) => (
             <button
@@ -177,7 +337,9 @@ export function Connections({
           ))}
         </div>
         {error && (
-          <p role="alert">{error.replace(/^SAVED_HUBS_UNREADABLE:\s*/, "")}</p>
+          <p role="alert" ref={errorRef}>
+            {error.replace(/^SAVED_HUBS_UNREADABLE:\s*/, "")}
+          </p>
         )}
         {notice && <p role="status">{notice}</p>}
         {vaultError && (
@@ -247,93 +409,99 @@ export function Connections({
               ))}
               <form
                 className="connection-form"
+                noValidate
                 onPaste={(event) => {
-                  const raw = event.clipboardData.getData("text").trim();
-                  if (!raw.startsWith("{")) return;
-                  event.preventDefault();
-                  try {
-                    const invitation = parseInvitation(raw);
-                    const form = event.currentTarget;
-                    const url = form.elements.namedItem(
-                      "url",
-                    ) as HTMLInputElement;
-                    const code = form.elements.namedItem(
-                      "code",
-                    ) as HTMLInputElement;
-                    const name = form.elements.namedItem(
-                      "hubName",
-                    ) as HTMLInputElement;
-                    url.value = invitation.url;
-                    code.value = invitation.code;
-                    if (!name.value)
-                      name.value = new URL(invitation.url).hostname;
-                    setError("");
-                    setNotice(
-                      "Invitation loaded. Check the hub address and device name, then pair.",
-                    );
-                  } catch (error) {
-                    setError(errorMessage(error));
-                  }
+                  // An invitation pasted into any of the fields loads it.
+                  if (event.target instanceof HTMLTextAreaElement) return;
+                  if (
+                    loadInvitation(event.clipboardData.getData("text")) !==
+                    "none"
+                  )
+                    event.preventDefault();
                 }}
                 onSubmit={(event) => {
                   event.preventDefault();
-                  const data = new FormData(event.currentTarget);
+                  // The invitation as its text is now, never what an earlier one filled.
+                  const request = pairRequest(invitationText, pairFields);
+                  setPairError("");
+                  if ("error" in request) {
+                    setNotice("");
+                    setError("");
+                    setPairError(request.error);
+                    if (request.manual) setManual(true);
+                    return;
+                  }
+                  const fields = request.fields;
                   void run(async () => {
-                    const hub = await window.twrRemote.pair({
-                      url: String(data.get("url")),
-                      code: String(data.get("code")).trim(),
-                      hubName: String(data.get("hubName")),
-                      name: String(data.get("name")),
-                    });
+                    let hub: Hub;
+                    try {
+                      hub = await window.twrRemote.pair({
+                        url: fields.url,
+                        code: fields.code.trim(),
+                        hubName: fields.hubName,
+                        name: fields.name,
+                      });
+                    } catch (e) {
+                      setPairError(errorMessage(e));
+                      return;
+                    }
                     await refresh();
                     await onSelect(hub);
                   });
                 }}
               >
-                <h3>Pair another hub</h3>
+                <h3>Pair with another computer</h3>
                 <p>
-                  Create a one-use invitation on that computer. Paste it here,
-                  or enter its address and code.
+                  On that computer, open Let other devices connect and create an
+                  invitation. Copy it and paste it here.
                 </p>
                 <label>
-                  Hub name
-                  <input
-                    name="hubName"
-                    maxLength={80}
-                    required
-                    placeholder="Workstation"
-                  />
-                </label>
-                <label>
-                  HTTPS hub URL
-                  <input
-                    name="url"
-                    type="url"
-                    required
-                    placeholder="https://workstation.example:47321"
+                  Paste invitation
+                  <textarea
+                    rows={3}
+                    value={invitationText}
+                    spellCheck={false}
                     autoCapitalize="none"
                     autoCorrect="off"
+                    placeholder='{"type":"twr-pair", …}'
+                    onChange={(e) => {
+                      const text = e.target.value;
+                      setInvitationText(text);
+                      if (loadInvitation(text) !== "loaded")
+                        forgetInvitation(text);
+                    }}
                   />
                 </label>
-                <label>
-                  One-use code
-                  <input
-                    name="code"
-                    required
-                    autoComplete="off"
-                    autoCapitalize="none"
-                    spellCheck={false}
-                  />
-                </label>
-                <label>
-                  This device
-                  <input
-                    name="name"
-                    required
-                    maxLength={80}
-                    defaultValue="twr desktop"
-                  />
-                </label>
+                <details
+                  className="connection-manual"
+                  open={manual}
+                  onToggle={(e) => setManual(e.currentTarget.open)}
+                >
+                  <summary>Enter details manually</summary>
+                  <div className="connection-manual-fields">
+                    {pairField("hubName", "Hub name", {
+                      maxLength: 80,
+                      placeholder: "Workstation",
+                    })}
+                    {pairField("url", "HTTPS hub URL", {
+                      type: "url",
+                      placeholder: "https://workstation.example:47321",
+                      autoCapitalize: "none",
+                      autoCorrect: "off",
+                    })}
+                    {pairField("code", "One-use code", {
+                      autoComplete: "off",
+                      autoCapitalize: "none",
+                      spellCheck: false,
+                    })}
+                    {pairField("name", "This device", { maxLength: 80 })}
+                  </div>
+                </details>
+                {pairError && (
+                  <p role="alert" ref={pairErrorRef} className="error-text">
+                    {pairError}
+                  </p>
+                )}
                 <button className="primary" disabled={busy}>
                   {busy ? "Connecting…" : "Pair and connect"}
                 </button>
@@ -342,17 +510,33 @@ export function Connections({
           ) : (
             <>
               <p>
-                Use a hostname reachable from your other device and a TLS
-                certificate trusted by it. Your hub and gateway keep running
-                after you close the app, until this computer restarts.
+                Let your phone or another computer use this computer's hub over
+                HTTPS. The hub keeps running after you close the app, until this
+                computer restarts.
               </p>
-              <p role="status">
-                {gatewayStatus
-                  ? gatewayStatus.running
-                    ? `Gateway running · ${gatewayStatus.runningVersion} · ${gatewayStatus.listen}`
-                    : "Gateway stopped. Starting it is optional."
-                  : "Checking gateway status…"}
-              </p>
+              <div className="gateway-status">
+                <p role="status">{gatewayLine}</p>
+                <div className="button-row">
+                  <button
+                    disabled={busy}
+                    onClick={() =>
+                      void run(async () => {
+                        await probeGateway();
+                      })
+                    }
+                  >
+                    Check again
+                  </button>
+                  {gatewayStatus?.running && (
+                    <button
+                      disabled={busy}
+                      onClick={() => setConfirmStop(true)}
+                    >
+                      Stop gateway…
+                    </button>
+                  )}
+                </div>
+              </div>
               {gatewayStatus?.renewalState &&
                 gatewayStatus.renewalState !== "current" && (
                   <p role="status">
@@ -361,26 +545,31 @@ export function Connections({
                     remains active.
                   </p>
                 )}
-              {gatewayStatus?.logTail && <pre>{gatewayStatus.logTail}</pre>}
-              <button
-                disabled={busy}
-                onClick={() =>
-                  void run(async () => {
-                    await probeGateway();
-                  })
-                }
-              >
-                Refresh gateway status
-              </button>
-              {gatewayStatus?.running && (
-                <button disabled={busy} onClick={() => setConfirmStop(true)}>
-                  Stop gateway…
-                </button>
+              {gatewayStatus?.logTail && (
+                <details className="gateway-log">
+                  <summary>Details</summary>
+                  <pre>{gatewayStatus.logTail}</pre>
+                </details>
               )}
               <form
                 className="connection-form"
+                noValidate
                 onSubmit={(event) => {
                   event.preventDefault();
+                  const missing = !settings.url.trim()
+                    ? "Enter the public HTTPS address."
+                    : !settings.cert.trim()
+                      ? "Choose the TLS certificate."
+                      : !settings.key.trim()
+                        ? "Choose the TLS private key."
+                        : !settings.listen.trim()
+                          ? "Enter the IP and port to listen on, under Advanced."
+                          : "";
+                  if (missing) {
+                    setNotice("");
+                    setError(missing);
+                    return;
+                  }
                   void run(async () => {
                     await cancelInvitation();
                     const result = await window.twrRemote.setup({
@@ -397,71 +586,99 @@ export function Connections({
                   });
                 }}
               >
-                <label>
-                  Public HTTPS address
-                  <input
-                    required
-                    type="url"
-                    disabled={busy}
-                    value={settings.url}
-                    onChange={(e) => update("url", e.target.value)}
-                    placeholder="https://workstation.example:47321"
-                  />
-                </label>
-                <label>
-                  Listen IP and port
-                  <input
-                    required
-                    disabled={busy}
-                    value={settings.listen}
-                    onChange={(e) => update("listen", e.target.value)}
-                  />
-                </label>
-                <label>
-                  TLS certificate path
-                  <input
-                    required
-                    disabled={busy}
-                    value={settings.cert}
-                    onChange={(e) => update("cert", e.target.value)}
-                    placeholder="/absolute/path/fullchain.pem"
-                  />
-                </label>
-                <label>
-                  TLS private key path
-                  <input
-                    required
-                    disabled={busy}
-                    value={settings.key}
-                    onChange={(e) => update("key", e.target.value)}
-                    placeholder="/absolute/path/privkey.pem"
-                  />
-                </label>
-                <label>
-                  Device access
-                  <select
-                    disabled={busy}
-                    value={scopes}
-                    onChange={(e) => {
-                      setScopes(e.target.value as GatewaySettings["scopes"]);
-                      void cancelInvitation().catch((e) =>
-                        setError(errorMessage(e)),
-                      );
-                    }}
-                  >
-                    <option value="read">Read only</option>
-                    <option value="operate">Read and operate</option>
-                    <option value="terminal">
-                      Read, operate and terminals
-                    </option>
-                    <option value="admin">
-                      Read, operate, terminals and settings
-                    </option>
-                  </select>
-                </label>
-                <button disabled={busy} className="primary">
-                  {busy ? "Checking…" : "Start gateway and check connection"}
-                </button>
+                <ol className="setup-steps">
+                  <li>
+                    <h3>Address and certificate</h3>
+                    <p>
+                      Use an address your other device can reach, and a TLS
+                      certificate it trusts.
+                    </p>
+                    <label>
+                      Public HTTPS address
+                      <input
+                        aria-required="true"
+                        type="url"
+                        disabled={busy}
+                        value={settings.url}
+                        onChange={(e) => update("url", e.target.value)}
+                        placeholder="https://workstation.example:47321"
+                      />
+                    </label>
+                    <PemFileField
+                      label="TLS certificate path"
+                      kind="certificate"
+                      value={settings.cert}
+                      disabled={busy}
+                      placeholder="/absolute/path/fullchain.pem"
+                      onChange={(value) => update("cert", value)}
+                    />
+                    <PemFileField
+                      label="TLS private key path"
+                      kind="private key"
+                      value={settings.key}
+                      disabled={busy}
+                      placeholder="/absolute/path/privkey.pem"
+                      onChange={(value) => update("key", value)}
+                    />
+                    <details className="connection-advanced">
+                      <summary>Advanced</summary>
+                      <label>
+                        Listen IP and port
+                        <input
+                          aria-required="true"
+                          aria-describedby={`${listenId}-hint`}
+                          disabled={busy}
+                          value={settings.listen}
+                          onChange={(e) => update("listen", e.target.value)}
+                          placeholder={DEFAULT_LISTEN}
+                        />
+                      </label>
+                      <small id={`${listenId}-hint`}>
+                        Default: {DEFAULT_LISTEN}, every network.
+                      </small>
+                    </details>
+                  </li>
+                  <li>
+                    <h3>What devices may do</h3>
+                    <label>
+                      Device access
+                      <select
+                        disabled={busy}
+                        value={scopes}
+                        onChange={(e) => {
+                          setScopes(
+                            e.target.value as GatewaySettings["scopes"],
+                          );
+                          void cancelInvitation().catch((e) =>
+                            setError(errorMessage(e)),
+                          );
+                        }}
+                      >
+                        <option value="read">Read only</option>
+                        <option value="operate">Read and operate</option>
+                        <option value="terminal">
+                          Read, operate and terminals
+                        </option>
+                        <option value="admin">
+                          Read, operate, terminals and settings
+                        </option>
+                      </select>
+                    </label>
+                  </li>
+                  <li>
+                    <h3>Start and invite</h3>
+                    <p>
+                      Starting checks the certificate, the address and the
+                      gateway. Then create a one-use invitation to scan or paste
+                      on the other device.
+                    </p>
+                    <button disabled={busy} className="primary">
+                      {busy
+                        ? "Checking…"
+                        : "Start gateway and check connection"}
+                    </button>
+                  </li>
+                </ol>
               </form>
               {restartRequired && (
                 <button
@@ -502,6 +719,7 @@ export function Connections({
               {checked && (
                 <button
                   disabled={busy}
+                  className="primary"
                   onClick={() =>
                     void run(async () =>
                       setInvitation(
@@ -526,9 +744,28 @@ export function Connections({
                         height={280}
                       />
                     )}
-                    <p>On your phone, choose Pair a hub → Scan QR code.</p>
+                    <p>
+                      On your phone, choose Pair a hub → Scan QR code. On
+                      another computer, copy the invitation and paste it under
+                      Connect to another computer.
+                    </p>
                     <code>{invitation.code}</code>
                     <p>{invitation.url}</p>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void window.twrLocal
+                          .copyText(encodeInvitation(invitation))
+                          .then(() =>
+                            setNotice(
+                              "Invitation copied. Paste it on the other computer within five minutes.",
+                            ),
+                          )
+                          .catch((e) => setError(errorMessage(e)))
+                      }
+                    >
+                      Copy invitation
+                    </button>
                     <p>
                       Granted access: {invitation.scopes?.join(", ") || scopes}.
                     </p>

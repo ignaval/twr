@@ -122,7 +122,9 @@ fn spawn_hub(paths: &Paths, socket: &Path, binary: &Path) -> Result<()> {
         .env_remove("TWR_MOBILE_TRANSPORT")
         .env_remove(twr_core::client::TEST_USER_TOKEN_ENV);
     twr_core::fork::prepare_fork();
-    // SAFETY: setsid is async-signal-safe and touches no Rust allocation or locks.
+    // SAFETY: setsid is async-signal-safe and touches no Rust allocation or locks, and so is
+    // close_inherited_on_exec. The hub outlives the desktop app that runs this: it keeps none
+    // of the app's descriptors.
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -130,6 +132,7 @@ fn spawn_hub(paths: &Paths, socket: &Path, binary: &Path) -> Result<()> {
             }
             Ok(())
         });
+        command.pre_exec(twr_core::fork::close_inherited_on_exec);
     }
     let mut child = command.spawn().context("Starting the hub")?;
     std::thread::spawn(move || {

@@ -1697,6 +1697,7 @@ impl From<WireSpawnConfig> for SpawnConfig {
             prompt_turn: c.prompt_turn,
             wrap: Vec::new(),
             native_memory_off: false,
+            keep_own_mcp: false,
             repo: c.repo,
             codex_auto: c
                 .codex_auto

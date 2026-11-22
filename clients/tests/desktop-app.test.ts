@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
 import {
   existsSync,
   mkdtempSync,
   readFileSync,
   writeFileSync,
   mkdirSync,
+  rmSync,
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -70,6 +71,7 @@ describe("launch at login on Linux", () => {
   });
   it("writes, detects and removes only its own entry", () => {
     const dir = mkdtempSync(join(tmpdir(), "twr-autostart-"));
+    onTestFinished(() => rmSync(dir, { recursive: true, force: true }));
     const file = join(dir, "autostart", "tools.twr.desktop.desktop");
     expect(linuxAutostartEnabled(file)).toBe(false);
     setLinuxAutostart(file, true, "/usr/bin/twr-desktop");
@@ -196,6 +198,7 @@ describe("diagnostics", () => {
   });
   it("rotates the log and tails across both files", () => {
     const dir = mkdtempSync(join(tmpdir(), "twr-log-"));
+    onTestFinished(() => rmSync(dir, { recursive: true, force: true }));
     const log = new DiagnosticLog(dir, "/home/u", 400);
     for (let i = 0; i < 20; i++) log.info("test", `line ${i} /home/u/x`);
     expect(existsSync(join(dir, "twr-desktop.1.log"))).toBe(true);
@@ -219,6 +222,7 @@ describe("diagnostics", () => {
   });
   it("counts crash dumps and builds a redacted report", () => {
     const dir = mkdtempSync(join(tmpdir(), "twr-crash-"));
+    onTestFinished(() => rmSync(dir, { recursive: true, force: true }));
     mkdirSync(join(dir, "completed"), { recursive: true });
     writeFileSync(join(dir, "completed", "a.dmp"), "");
     writeFileSync(join(dir, "settings.dat"), "");
@@ -294,6 +298,7 @@ describe("diagnostics redaction gaps", () => {
   });
   it("keeps a Linux login entry pointing at a renamed AppImage", () => {
     const dir = mkdtempSync(join(tmpdir(), "twr-autostart-refresh-"));
+    onTestFinished(() => rmSync(dir, { recursive: true, force: true }));
     const file = join(dir, "tools.twr.desktop.desktop");
     expect(refreshLinuxAutostart(file, "/a/twr-0.4.0.AppImage")).toBe(false);
     setLinuxAutostart(file, true, "/a/twr-0.3.0.AppImage");

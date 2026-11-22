@@ -121,8 +121,12 @@ fn dir_at(parent: &File, name: &str) -> Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 impl Upload {
+    /// Stages a file of `size` bytes as `name`, without the spaces at either end: the apps
+    /// write its path on a message's line (`Uploaded file: <name>`, then the path), and a
+    /// space ending a path would not survive the line. An older app sends a name with them.
     pub fn begin(root: &Path, name: &str, size: usize, expected: &str) -> Result<Self> {
         anyhow::ensure!(size <= MAX_FILE, "Files can be at most 25 MiB");
+        let name = name.trim_matches(' ');
         anyhow::ensure!(
             !name.is_empty()
                 && name.len() <= 120
@@ -350,6 +354,138 @@ impl Drop for Upload {
         }
     }
 }
+/// A message without the whitespace around it, except for an uploaded file's path that
+/// ends it: the apps name a message's files after its text, an `Uploaded file: <name>`
+/// line and then the path's, and that last line is kept exactly, a trailing space too (an
+/// older app stored names ending in one, and the path names that file). Only the line breaks
+/// after it go.
+pub fn trim_message(message: &str) -> &str {
+    let message = message.trim_start();
+    let trimmed = message.trim_end();
+    let Some(nl) = trimmed.rfind('\n') else {
+        return trimmed;
+    };
+    // The last line that isn't blank, as written up to its line break: blank lines after it
+    // (a space on one, say) go, its own trailing spaces stay.
+    let start = nl + 1;
+    let end = message[start..]
+        .find(['\n', '\r'])
+        .map_or(message.len(), |i| start + i);
+    let last = &message[start..end];
+    let named = trimmed[..nl]
+        .rsplit('\n')
+        .next()
+        .is_some_and(|line| line.starts_with("Uploaded file: "));
+    let path = last.starts_with('/')
+        || matches!(last.as_bytes(), [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic());
+    if named && path {
+        &message[..end]
+    } else {
+        trimmed
+    }
+}
+
+/// The prefix of the line naming a message's file: `Uploaded file: <name>`, then its path.
+const NAMED: &str = "Uploaded file: ";
+
+/// Whether `line` is an uploaded copy's path as the apps write it: absolute (POSIX or a
+/// Windows drive), ending in `.twr-uploads/<directory>/<name>`, with no control character.
+fn upload_path(line: &str) -> bool {
+    let absolute = line.starts_with('/')
+        || matches!(line.as_bytes(), [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic());
+    if !absolute || line.chars().any(char::is_control) {
+        return false;
+    }
+    let mut parts = line.rsplit(['/', '\\']);
+    let (Some(name), Some(dir), Some(base)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !name.is_empty() && !dir.is_empty() && base == ".twr-uploads"
+}
+
+/// The fence a line opens a fenced code block with (CommonMark: up to three spaces, then
+/// three or more backticks or tildes).
+fn fence_of(line: &str) -> Option<&str> {
+    let rest = line.trim_start_matches(' ');
+    if line.len() - rest.len() > 3 {
+        return None;
+    }
+    let c = rest.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let fence = &rest[..rest.len() - rest.trim_start_matches(c).len()];
+    (fence.len() >= 3).then_some(fence)
+}
+
+/// A message's text without its files' lines, and the files' names, as the apps read them:
+/// an `Uploaded file: <name>` line followed by an upload's path line, outside fenced code
+/// blocks; the pairs that end the message count even in a fence left open, since the apps
+/// write them there. Anything else stays text.
+pub fn split_attachments(message: &str) -> (String, Vec<String>) {
+    let (text, pairs) = attachment_pairs(message);
+    let names = pairs
+        .into_iter()
+        .map(|(name, _)| name.trim().to_string())
+        .collect();
+    (text, names)
+}
+
+/// [`split_attachments`], each file as the message holds it: its name (after `Uploaded
+/// file: `, untrimmed) and its path line, exact.
+pub fn attachment_pairs(message: &str) -> (String, Vec<(&str, &str)>) {
+    if !message.contains(NAMED) {
+        return (message.to_string(), Vec::new());
+    }
+    let lines: Vec<&str> = message.split('\n').collect();
+    let pair_at = |i: usize| {
+        let name = lines[i].strip_prefix(NAMED)?;
+        let path = lines.get(i + 1)?;
+        (!name.trim().is_empty() && upload_path(path)).then_some(name)
+    };
+    let mut end = lines.len();
+    while end > 0 && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    let mut tail = end;
+    while tail >= 2 && pair_at(tail - 2).is_some() {
+        tail -= 2;
+    }
+    let (mut kept, mut names) = (Vec::new(), Vec::new());
+    let mut fence: Option<&str> = None;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let named = if (tail..end).contains(&i) || fence.is_none() {
+            pair_at(i)
+        } else {
+            None
+        };
+        if let Some(name) = named {
+            names.push((name, lines[i + 1]));
+            i += 2;
+            continue;
+        }
+        match fence {
+            Some(f) => {
+                // Closed by a fence of its kind, at least as long, with nothing after it.
+                let closes = fence_of(line).is_some_and(|c| {
+                    c[..1] == f[..1]
+                        && c.len() >= f.len()
+                        && line.trim_start_matches(' ')[c.len()..].trim().is_empty()
+                });
+                if closes {
+                    fence = None;
+                }
+            }
+            None => fence = fence_of(line),
+        }
+        kept.push(line);
+        i += 1;
+    }
+    if names.is_empty() {
+        return (message.to_string(), names);
+    }
+    (kept.join("\n").trim_end().to_string(), names)
+}
+
 /// Requests travel only over an authenticated hub/runner connection. The hub supplies the
 /// thread root and the authenticated caller's scope; a client cannot select a filesystem path.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1178,6 +1314,86 @@ mod tests {
         file.chunk(b"hello").unwrap();
         let path = file.commit().unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"hello");
+    }
+    #[test]
+    fn a_path_ending_a_message_is_kept_exactly() {
+        assert_eq!(trim_message("  hello there \n\n"), "hello there");
+        assert_eq!(trim_message(" \n "), "");
+        // An attachment's path ends the message: its trailing space is part of it.
+        assert_eq!(
+            trim_message("see\nUploaded file: notes.txt\n/w/.twr-uploads/1/notes.txt \n"),
+            "see\nUploaded file: notes.txt\n/w/.twr-uploads/1/notes.txt "
+        );
+        assert_eq!(
+            trim_message("Uploaded file: a\r\nC:\\w\\a \r\n"),
+            "Uploaded file: a\r\nC:\\w\\a "
+        );
+        // Blank lines after it, a space on one, go; the path's own space stays.
+        assert_eq!(
+            trim_message("see\nUploaded file: n \n/w/.twr-uploads/1/n \n \n\t\n"),
+            "see\nUploaded file: n \n/w/.twr-uploads/1/n "
+        );
+        // A path line after anything else is ordinary text, trimmed as before.
+        assert_eq!(trim_message("look at\n/etc/hosts  "), "look at\n/etc/hosts");
+        assert_eq!(
+            trim_message("Uploaded file: a\nnot a path  "),
+            "Uploaded file: a\nnot a path"
+        );
+    }
+
+    #[test]
+    fn a_message_names_its_files_by_upload_paths_outside_fences() {
+        let pair = "Uploaded file: a.txt\n/w/.twr-uploads/1/a.txt";
+        assert_eq!(
+            split_attachments(&format!("see\n{pair}")),
+            ("see".to_string(), vec!["a.txt".to_string()])
+        );
+        // An older app's draft: a pair in the middle, a Windows path, a trailing space.
+        assert_eq!(
+            split_attachments("a\nUploaded file: b \nC:\\w\\.twr-uploads\\2\\b \nc"),
+            ("a\nc".to_string(), vec!["b".to_string()])
+        );
+        for text in [
+            "Uploaded file: mock.txt\n/tmp/mock.txt",
+            "Uploaded file: a\n/w/.twr-uploads/a",
+            "Uploaded file: a\n/w/.twr-uploads/1/a\tb",
+            "Uploaded file: a\r\n/w/.twr-uploads/1/a\r",
+            "Uploaded file: \n/w/.twr-uploads/1/a",
+            "plain",
+        ] {
+            assert_eq!(split_attachments(text), (text.to_string(), vec![]));
+        }
+        // A fenced example stays text; the pairs that end the message count, even in a
+        // fence left open.
+        let fenced = format!("```\n{pair}\n```\nafter");
+        assert_eq!(split_attachments(&fenced), (fenced.clone(), vec![]));
+        let tilde = format!("~~~~\n```\n{pair}\n~~~~");
+        assert_eq!(split_attachments(&tilde), (tilde.clone(), vec![]));
+        assert_eq!(
+            split_attachments(&format!("```\ncode\n{pair}")),
+            ("```\ncode".to_string(), vec!["a.txt".to_string()])
+        );
+        assert_eq!(
+            split_attachments(&format!("```\n{pair}\n```\n{pair}\n")),
+            (format!("```\n{pair}\n```"), vec!["a.txt".to_string()])
+        );
+    }
+
+    #[test]
+    fn names_lose_the_spaces_at_their_ends() {
+        let root = tempdir();
+        let hash = hex::encode(Sha256::digest(b"hello"));
+        let mut file = Upload::begin(root.path(), " notes.txt ", 5, &hash).unwrap();
+        file.chunk(b"hello").unwrap();
+        let path = file.commit().unwrap();
+        assert_eq!(path.file_name().unwrap(), "notes.txt");
+        assert_eq!(std::fs::read(path).unwrap(), b"hello");
+        for blank in ["   ", " . ", " .. "] {
+            assert!(
+                Upload::begin(root.path(), blank, 0, &hash).is_err(),
+                "{blank:?}"
+            );
+        }
     }
     #[test]
     fn symlink_destination_is_refused() {

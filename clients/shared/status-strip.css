@@ -1,0 +1,75 @@
+/* The status strip under the header (shared/StatusStrip.tsx): one notice at a time. */
+.status-strip {
+  flex-shrink: 0;
+  max-height: min(240px, 40dvh);
+  overflow: auto;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.status-strip-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 20px;
+  color: var(--muted);
+  font-size: 0.923077rem;
+}
+.status-strip-item + .status-strip-item {
+  border-top: 1px solid var(--border);
+}
+.status-strip-item > svg {
+  flex-shrink: 0;
+}
+.status-strip-item.warning {
+  color: var(--warning);
+}
+.status-strip-item.offline {
+  background: var(--warning-soft);
+  color: var(--text);
+}
+.status-strip-content {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.status-strip-content strong {
+  color: var(--text);
+  font-weight: 600;
+}
+.status-strip-content p {
+  margin: 2px 0 0;
+  color: var(--muted);
+}
+.status-strip-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.status-strip-actions > button {
+  font-size: 0.923077rem;
+  padding: 4px 8px;
+}
+.status-strip-more {
+  font-variant-numeric: tabular-nums;
+}
+/* The assistance disclosure is a panel of its own: in the strip it takes the row. */
+.status-strip .assistance-notice {
+  margin: 0;
+  padding: 0;
+  width: auto;
+  max-width: none;
+  max-height: none;
+  border: 0;
+  background: none;
+}
+@media (max-width: 600px) {
+  .status-strip-item {
+    flex-wrap: wrap;
+    padding-inline: 16px;
+  }
+  .status-strip-actions {
+    flex-basis: 100%;
+  }
+}

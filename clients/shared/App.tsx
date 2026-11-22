@@ -1,20 +1,43 @@
 import {
   appendDraft,
+  appendMessage,
+  draftsWithFiles,
+  isCommandDraft,
+  isShellDraft,
+  isSlashDraft,
+  literalDraft,
   messageDraft,
+  messageText,
   offlineJournal,
+  restoredOf,
   type OfflineJournal,
 } from "./offline";
 import { TerminalSnapshots } from "./terminalSnapshots";
 import { Outbox } from "./Outbox";
-import { UploadController } from "./uploads";
-import { AttachmentManager } from "./AttachmentManager";
+import { ReadAloudControl } from "./ReadAloudControl";
+import { UploadController, unfinished } from "./uploads";
+import { QueuedText, SentMessage, attachmentWait } from "./ComposerAttachments";
+import {
+  splitAttachments,
+  withAttachments,
+  type NamedFile,
+} from "./attachmentText";
+import { UsageButton, UsagePanel } from "./UsageLimits";
 import { Composer, Drafts, composerMemory, useHasDraft } from "./Composer";
+import { ModelPicker, openModelPicker } from "./ModelPicker";
+import { onSaveNow } from "./save-now";
+import {
+  changeProblem,
+  droppedBySwitch,
+  droppedWords,
+  withoutDroppedText,
+} from "./modelPick";
 import { MessageBody } from "./MessageBody";
 import { ConversationSearch, NeedsYouInbox } from "./InboxSearch";
 import { PaneResize } from "./LayoutOptions";
 import { WORKSPACE_REFRESH_MS, workspaceEntries } from "./workspaceTree";
 import { attentionSummary } from "./attentionSummary";
-import { errorMessage } from "./errors";
+import { connectionWords, errorMessage } from "./errors";
 import { savedAppearance } from "./appearance";
 import { useHostAPI } from "./host";
 import {
@@ -37,14 +60,14 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Asterisk,
   Wrench,
-  Database,
-  ListTodo,
   ArrowLeft,
   ArrowDown,
   ArrowUpRight,
   Plus,
   PanelLeftClose,
   PanelLeftOpen,
+  PanelRightClose,
+  PanelRightOpen,
   LayoutGrid,
   MessageSquare,
   Bell,
@@ -56,39 +79,43 @@ import {
   ChevronRight,
   MoreHorizontal,
   GitBranch,
-  Play,
   Square,
   Pin,
   Server,
-  KeyRound,
   Activity,
   FileText,
   Trash2,
   Volume2,
-  Command as CommandIcon,
   Check,
   CheckCircle2,
   Circle,
   ExternalLink,
   Download,
   Eye,
-  EyeOff,
+  Gauge,
   Filter,
   AlertCircle,
-  FolderPlus,
+  Cpu,
+  Pencil,
+  CirclePause,
+  Scissors,
+  Shrink,
 } from "lucide-react";
 import {
   commands as applicationCommands,
   parameters,
   commandArguments,
+  confirmationOf,
   type Command,
 } from "./commands";
+import { accessLevel, accessOutcome } from "./orchestrator-access";
 import type {
   Attention,
   InboxSource,
   DesktopEvent,
   HubEvent,
   Json,
+  OperationOptions,
   TerminalSession,
   Thread,
   ViewState,
@@ -103,7 +130,13 @@ import {
   Markdown,
   Spinner,
 } from "./ui";
-import { effortChoices, formRuntime, modelChoices } from "./models";
+import {
+  findThread,
+  pickerSources,
+  resolveField,
+  splitFields,
+} from "./fieldChoices";
+import { CommandResult } from "./CommandResult";
 import { AssistanceNotice, useAssistance, type Summary } from "./assistance";
 import { announcements, voiceHint } from "./voice";
 import {
@@ -112,7 +145,11 @@ import {
   foldRoutineBlocks,
   messageTime,
 } from "./transcript";
-import { Manager, JobLog, type Section } from "./Managers";
+import { Manager, JobLog, navSection, type Section } from "./Managers";
+import { ActionsMenu, type MenuItem } from "./ActionsMenu";
+import { StatusStrip, type StripItem } from "./StatusStrip";
+import { PermissionModePicker, ThreadActions } from "./ThreadActions";
+import "./palette.css";
 import { useEditorSessions } from "./editors";
 import { localWorkingDirectory } from "./paths";
 import { approvalShortcut, canRespond } from "./attention";
@@ -181,17 +218,23 @@ const initial: ViewState = {
   decisions_seen: 0,
   head: 0,
 };
+/** The Manage pages, then Settings. Other sections render one of these pages (Boxes and
+ * Usage are parts of Machines & accounts and Activity; Read aloud and Hub & storage are
+ * Settings pages): `navSection` says which entry is current for them. */
 const nav: { id: Section; label: string; icon: typeof Activity }[] = [
-  { id: "accounts", label: "Accounts", icon: KeyRound },
-  { id: "boxes", label: "Boxes", icon: Server },
-  { id: "jobs", label: "Jobs", icon: ListTodo },
-  { id: "usage", label: "Usage", icon: Activity },
+  { id: "accounts", label: "Machines & accounts", icon: Server },
+  { id: "jobs", label: "Activity", icon: Activity },
   { id: "memory", label: "Context & memory", icon: FileText },
-  { id: "speech", label: "Read aloud", icon: Volume2 },
   { id: "trash", label: "Trash", icon: Trash2 },
-  { id: "maintenance", label: "Hub & storage", icon: Database },
   { id: "settings", label: "Settings", icon: Settings2 },
 ];
+/** The words the topbar shows for a section. */
+function sectionTitle(section: Section): string {
+  if (section === "grid") return "Threads";
+  if (section === "attention") return "Needs you";
+  if (section === "decisions") return "Decisions";
+  return nav.find((n) => n.id === navSection(section))?.label || "";
+}
 const statusIcon = (status: string) =>
   status === "running" || status === "background" ? (
     <span className="working-dot" />
@@ -203,6 +246,20 @@ const statusIcon = (status: string) =>
     <Circle size={10} />
   );
 
+/** What `orchestrator.access` did, in words, as Settings › Orchestrator says it. */
+function AccessResult({ value }: { value: Json }) {
+  const outcome = accessOutcome(value);
+  return (
+    <>
+      <p className="success-text">{outcome.text}</p>
+      {outcome.warning && (
+        <p className="error-text" role="alert">
+          {outcome.warning}
+        </p>
+      )}
+    </>
+  );
+}
 function operationAction(command: Command, again: boolean) {
   const labels: Record<string, string> = {
     new: "Create thread",
@@ -246,11 +303,15 @@ export default function App({
   onReady,
   headerAccessory,
   onDismissKeyboard,
+  notices: hostNotices,
 }: {
   deviceScopes?: string[];
   onReady?: () => void;
   headerAccessory?: ReactNode;
   onDismissKeyboard?: () => void;
+  /** The host's own notices for the status strip (the desktop's update), ranked after the
+   * connection's and before the assistance notices. */
+  notices?: StripItem[];
 } = {}) {
   const hostApi = useHostAPI();
   const [allowedMethods, setAllowedMethods] = useState<string[]>();
@@ -267,12 +328,9 @@ export default function App({
       ),
     [deviceScopes, allowedMethods],
   );
+  // Machines & accounts is for a device with `admin`; Settings shows what a device may change.
   const visibleNav = nav.filter(
-    (n) =>
-      !(
-        ["accounts", "boxes", "maintenance"].includes(n.id) &&
-        !permitted("admin")
-      ),
+    (n) => n.id !== "accounts" || permitted("admin"),
   );
 
   const [view, setView] = useState(initial);
@@ -324,7 +382,8 @@ export default function App({
   );
   const [pins, setPins] = useState<string[]>(() => storedList("twr.pins"));
   const [selected, setSelected] = useState<string>();
-  const [destination, setDestination] = useState<string>();
+  const [opened, setDestination] = useState<string>();
+  const detailsToggle = useRef<HTMLButtonElement>(null);
   const observedDestination = useRef<string | undefined>(undefined);
   // The message drafts, by destination: outside React state, so that typing re-renders
   // the composer alone (Composer.tsx).
@@ -333,15 +392,18 @@ export default function App({
   const draftSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined,
   );
-  const pendingEnqueue = useRef<
-    { key: string; text: string; saved: boolean } | undefined
-  >(undefined);
+  // A message on its way into the outbox: the drafts wait to save until it is there and
+  // its draft is cleared, so a save never writes back the text the outbox just took.
+  const pendingEnqueue = useRef<{ key: string } | undefined>(undefined);
   const [journal, setJournal] = useState<OfflineJournal>();
   const [offlineNotice, setOfflineNotice] = useState("");
   useEffect(() => {
     const reset = (event: Event) => {
       if ((event as CustomEvent).detail?.hostId === hostId) {
         drafts.update(() => ({}));
+        // The box's files go too, at once and for good: the next save would write their
+        // names and paths again.
+        uploads.clear();
         setJournal(offlineJournal(hostApi, hostId));
         setOfflineNotice("");
       }
@@ -352,10 +414,12 @@ export default function App({
       void saved
         .load()
         .then(() => {
+          drafts.restoreSpoken(saved.snapshot.spokenDrafts);
           drafts.update((current) => ({
             ...saved.snapshot.drafts,
             ...current,
           }));
+          restoreFiles(saved.snapshot.draftFiles);
           setJournal(saved);
           setOfflineNotice("");
         })
@@ -370,33 +434,64 @@ export default function App({
   }, [hostId]);
   const liveView = useRef(false);
   const hasLiveSnapshot = useRef(false);
-  const [uploads] = useState(
-    () =>
-      new UploadController(hostApi, (attachment) => {
-        const key = attachment.workspace + ":" + attachment.thread;
-        const orchKey = attachment.workspace + ":orchestrator";
-        const targetKey =
-          attachment.thread ===
-          currentOrchestrator.current[attachment.workspace]
-            ? orchKey
-            : key;
-        drafts.set(targetKey, (old) =>
-          `${old || ""}\nUploaded file: ${attachment.file.name}\n${attachment.path}\n`.trimStart(),
-        );
-      }),
-  );
-  const currentOrchestrator = useRef<Record<string, string | undefined>>({});
+  // Attached files stay on their conversation (ComposerAttachments shows them in the
+  // message box): a message names the uploaded ones as it is sent (`withAttachments`).
+  // They are keyed as drafts are, by conversation (`orchestrator` or a thread's id), and
+  // saved with them on this device: names and paths of the uploaded ones.
+  const [uploads] = useState(() => new UploadController(hostApi));
+  /** A draft key's workspace and conversation: `<workspace>:<conversation>`. */
+  const draftPlace = (key: string) => {
+    const at = key.lastIndexOf(":");
+    return { space: key.slice(0, at), conversation: key.slice(at + 1) };
+  };
+  /** Puts files saved with the drafts back on their conversations, uploaded. */
+  const restoreFiles = (saved: Record<string, NamedFile[]> = {}) => {
+    for (const [key, files] of Object.entries(saved)) {
+      const { space, conversation } = draftPlace(key);
+      if (files.length) uploads.restore(files, conversation, space);
+    }
+  };
+  /**
+   * Puts a message's text back in a draft (`key`: `<workspace>:orchestrator` or
+   * `<workspace>:<thread>`), as Take back and the outbox do: the files it names go back on
+   * the conversation as attachments, the rest of its text into the draft. `sent`: the text
+   * is a message as the hub has it (Take back, Put back), not a draft as typed: escaped
+   * where it starts the draft (`appendMessage`), so it is still a message, never a command
+   * or a shell line.
+   */
+  const restoreDraft = (key: string, text: string, sent = false) => {
+    if (!text.trim()) return;
+    const { body, files } = splitAttachments(text);
+    const add = sent ? appendMessage : appendDraft;
+    if (!files.length) {
+      drafts.set(key, (old) => add(old, text));
+      return;
+    }
+    const { space, conversation } = draftPlace(key);
+    uploads.restore(files, conversation, space);
+    if (body.trim()) drafts.set(key, (old) => add(old, body));
+  };
   useEffect(() => () => uploads.dispose(), [uploads]);
   useEffect(() => uploads.setWorkspace(workspace), [uploads, workspace]);
-  // Saves the drafts on this device 350 ms after the last change to any of them, into
-  // the storage epoch of that change.
+  // Saves the drafts on this device 350 ms after the last change to any of them, into the
+  // storage epoch of that change. A change to a conversation's uploaded files (one uploaded,
+  // sent, removed or put back) saves at once, and as the app goes away (`save-now.ts`: the
+  // desktop window closing, the phone app going to the background, the page unloading)
+  // whatever still waits for its delay saves now.
   useEffect(() => {
     if (!journal) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const changed = () => {
-      const pending = pendingEnqueue.current;
-      if (pending?.saved && drafts.get(pending.key) !== pending.text)
-        pendingEnqueue.current = undefined;
+    const stop = () => {
+      clearTimeout(timer);
+      if (draftSaveTimer.current === timer) draftSaveTimer.current = undefined;
+      timer = undefined;
+    };
+    const save = (epoch: number) =>
+      journal
+        .drafts(drafts.all(), epoch, drafts.spoken(), uploads.committed())
+        .then(() => setOfflineNotice(""))
+        .catch((error) => setOfflineNotice(errorMessage(error)));
+    const changed = (delay = 350) => {
       const epoch = journal.epoch;
       const persist = () => {
         if (pendingEnqueue.current) {
@@ -404,24 +499,52 @@ export default function App({
           draftSaveTimer.current = timer;
           return;
         }
-        void journal
-          .drafts(drafts.all(), epoch)
-          .then(() => setOfflineNotice(""))
-          .catch((error) => setOfflineNotice(errorMessage(error)));
+        if (draftSaveTimer.current === timer)
+          draftSaveTimer.current = undefined;
+        timer = undefined;
+        void save(epoch);
       };
-      clearTimeout(timer);
-      if (draftSaveTimer.current === timer) draftSaveTimer.current = undefined;
-      timer = setTimeout(persist, 350);
+      stop();
+      timer = setTimeout(persist, delay);
       draftSaveTimer.current = timer;
     };
     changed();
-    const unsubscribe = drafts.subscribe(changed);
+    const unsubscribe = drafts.subscribe(() => changed());
+    // Upload progress changes nothing saved: only a file uploaded, sent or removed does.
+    // At once means once what changed it is done (a message put back restores its files,
+    // then its text): a save between the two would write the files without the text.
+    let files = JSON.stringify(uploads.committed());
+    const stopFiles = uploads.subscribe(() => {
+      const now = JSON.stringify(uploads.committed());
+      if (now === files) return;
+      files = now;
+      changed(0);
+    });
+    // `waitingOnly`: only a save still waiting (the page unloading, as on a reload): one with
+    // nothing to save would write the whole record from memory over anything stored since
+    // (the outbox included). The app going away (`save-now.ts`) saves either way: the desktop
+    // holds its close for the answer, and an answer at once can find its quit still under way.
+    const saveNow = async (waitingOnly = false) => {
+      if (waitingOnly && timer === undefined && !pendingEnqueue.current) return;
+      stop();
+      // A message on its way into the outbox clears its draft first (up to 1.5 s, inside
+      // the 2 s a closing desktop window waits); one still on its way keeps the drafts
+      // saved before it, never writing back what it took.
+      for (let i = 0; i < 15 && pendingEnqueue.current; i++)
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      if (!pendingEnqueue.current) await save(journal.epoch);
+    };
+    const unregister = onSaveNow(() => saveNow());
+    const unloading = () => void saveNow(true);
+    window.addEventListener("pagehide", unloading);
     return () => {
       unsubscribe();
-      clearTimeout(timer);
-      if (draftSaveTimer.current === timer) draftSaveTimer.current = undefined;
+      stopFiles();
+      unregister();
+      window.removeEventListener("pagehide", unloading);
+      stop();
     };
-  }, [journal, drafts]);
+  }, [journal, drafts, uploads]);
   const [sending, setSending] = useState(false);
   const slashPending = useRef(false);
   const [queued, setQueued] = useState<Json[]>([]);
@@ -435,6 +558,12 @@ export default function App({
   const [slashCommands, setSlashCommands] = useState<
     { id: string; title: string }[]
   >([]);
+  // `/usage` opens the usage limits above the message box (UsageLimits.tsx); the hub's
+  // live view carries every account's usage, so a change there reads them again.
+  const [usagePanel, setUsagePanel] = useState(false);
+  // A workspace switch closes it: until the connection serves the new workspace, a read
+  // could still answer for the one left.
+  useEffect(() => setUsagePanel(false), [workspace]);
   useEffect(() => {
     if (connected)
       void hostApi
@@ -462,6 +591,8 @@ export default function App({
     /** Something stops, goes or is interrupted: the button says so in danger style. */
     destructive?: boolean;
     run: () => void;
+    /** A second way to go on, beside the confirming button (a switch without its summary). */
+    alt?: { action: string; run: () => void };
   }>();
   const [workspaceModal, setWorkspaceModal] = useState(false);
   const [newWorkspace, setNewWorkspace] = useState("");
@@ -472,6 +603,9 @@ export default function App({
   const [transcriptError, setTranscriptError] = useState("");
   const [earliestTurn, setEarliestTurn] = useState<number>();
   const [earlierBusy, setEarlierBusy] = useState(false);
+  const [earlierError, setEarlierError] = useState("");
+  const recentTurn = useRef<number | undefined>(undefined);
+  const earlierRequest = useRef<number | undefined>(undefined);
   const connectGeneration = useRef(0);
   const transcriptGeneration = useRef(0);
   const activeThread = useRef<string | undefined>(undefined);
@@ -492,8 +626,35 @@ export default function App({
     (method: string, params: Json = {}) => hostApi.rpc(method, params),
     [],
   );
+  const usageRevision = useMemo(
+    () => workspace + ":" + JSON.stringify(view.usage ?? null),
+    [workspace, view.usage],
+  );
+  const composerCommands = useMemo(() => {
+    const listed = slashCommands.length ? slashCommands : commands;
+    return listed.some((command) => command.id === "usage")
+      ? listed
+      : [...listed, { id: "usage", title: "Usage limits: how much is left" }];
+  }, [slashCommands, commands]);
   const orchestrator = view.threads.find((t) => t.is_orchestrator);
-  currentOrchestrator.current[workspace] = orchestrator?.id;
+  // Where the composer sends: a worker thread, or none for the orchestrator. Opening the
+  // orchestrator's own thread (`/open orchestrator`, its row, a workspace's opened before
+  // its threads are known) opens its main conversation, so every path that reads
+  // `destination` (the send, the model picker, the header, the drafts and files) treats it
+  // as the orchestrator, never as a worker; and the choice is dropped, so a later switch
+  // doesn't leave it on the retired thread.
+  const destination =
+    opened !== undefined && opened === orchestrator?.id ? undefined : opened;
+  useEffect(() => {
+    if (opened !== undefined && opened === orchestrator?.id)
+      setDestination(undefined);
+  }, [opened, orchestrator?.id]);
+  // A switch of the orchestrator's model or effort gives it a new thread: its files stay
+  // on its conversation, and those whose upload has not begun go to the new thread.
+  useEffect(() => {
+    if (orchestrator)
+      uploads.retarget("orchestrator", workspace, orchestrator.id);
+  }, [uploads, workspace, orchestrator?.id]);
   const target = destination
     ? view.threads.find((t) => t.id === destination)
     : orchestrator;
@@ -578,7 +739,8 @@ export default function App({
   const acceptedSuggestion = useRef<{ key: string; text: string }>(undefined);
   function acceptSuggestion() {
     if (!assistance.suggestion) return;
-    drafts.set(draftKey, assistance.suggestion);
+    // Escaped as Take back does: a suggestion is a message, never a command.
+    drafts.set(draftKey, literalDraft(assistance.suggestion));
     acceptedSuggestion.current = { key: draftKey, text: assistance.suggestion };
     input.current?.focus();
   }
@@ -594,10 +756,26 @@ export default function App({
     }
   }
   const openOperation = useCallback(
-    (command: Command, initialValues: Json = {}) => {
+    (
+      command: Command,
+      initialValues: Json = {},
+      { fixed = false }: OperationOptions = {},
+    ) => {
       setPalette(false);
       setOperation(command);
-      setValues({
+      const threads = threadsRef.current;
+      // Opened for a thread (the inspector, its ⋯ menu, a slash command naming one): the
+      // form says which in its subtitle instead of asking. Anywhere else (the palette, a
+      // slash command naming no thread) the thread given is only the picker's first choice.
+      const given =
+        !command.cli &&
+        command.fields.some((f) => f.key === "thread") &&
+        findThread(threads, initialValues.thread);
+      setFixedThread(fixed && given ? given.name : undefined);
+      // Change permission mode opens on the thread's current mode.
+      if (command.id === "mode" && given && !initialValues.mode)
+        initialValues = { ...initialValues, mode: given.mode };
+      const opened = {
         _cwd: initialValues._cwd || localWorkingDirectory(target, homePath),
         ...Object.fromEntries(
           command.fields.map((f) => [
@@ -610,11 +788,17 @@ export default function App({
               (command.id === "delete" && f.key === "threads"
                 ? initialValues.thread
                 : undefined) ??
+              // Orchestrator access opens on the level the hub reports.
+              (command.id === "access" && f.key === "access"
+                ? accessLevel(infoRef.current?.orchestrator?.access)
+                : undefined) ??
               f.initial ??
               (f.type === "boolean" ? false : ""),
           ]),
         ),
-      });
+      };
+      setValues(opened);
+      setMoreOpen(splitFields(command.fields, opened).open);
       setOperationError("");
       setResult(undefined);
     },
@@ -622,8 +806,35 @@ export default function App({
   );
   const infoRef = useRef(info);
   infoRef.current = info;
+  const threadsRef = useRef(view.threads);
+  threadsRef.current = view.threads;
+  // The thread a form was opened for (its name), its More options disclosure, and the
+  // lists its pickers read once it opens (`pickerSources`): null for one that failed.
+  const [fixedThread, setFixedThread] = useState<string>();
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [pickerLists, setPickerLists] = useState<Record<string, Json>>({});
+  useEffect(() => {
+    setPickerLists({});
+    if (!operation) return;
+    let live = true;
+    for (const method of pickerSources(operation)) {
+      const allowed =
+        connected && (!deviceScopes || !!allowedMethods?.includes(method));
+      const settle = (value: Json) => {
+        if (live) setPickerLists((old) => ({ ...old, [method]: value }));
+      };
+      if (!allowed) settle(null);
+      else
+        void rpc(method)
+          .then((value) => settle(value ?? null))
+          .catch(() => settle(null));
+    }
+    return () => {
+      live = false;
+    };
+  }, [operation, connected]);
   const action = useCallback(
-    (id: string, initialValues: Json = {}) => {
+    (id: string, initialValues: Json = {}, options?: OperationOptions) => {
       const command = commands.find((c) => c.id === id);
       // Choosing the first orchestrator starts from the one the hub would start: its
       // runtime, and the runtime's default model unless one is picked.
@@ -632,7 +843,7 @@ export default function App({
         const runtime = o.configured?.runtime || o.runtime;
         if (runtime) initialValues = { ...initialValues, runtime };
       }
-      if (command) openOperation(command, initialValues);
+      if (command) openOperation(command, initialValues, options);
     },
     [openOperation, commands],
   );
@@ -978,17 +1189,29 @@ export default function App({
             try {
               legacy = JSON.parse(localStorage.getItem(oldKey) || "{}");
             } catch {}
-            const previous = Object.fromEntries(
-              Object.entries(legacy || {}).filter(
-                (entry): entry is [string, string] =>
-                  typeof entry[1] === "string",
+            // Their files' pairs, as an older app wrote them into a draft, move onto
+            // the conversations' files (the journal does the same for its own drafts).
+            const previous = draftsWithFiles(
+              Object.fromEntries(
+                Object.entries(legacy || {}).filter(
+                  (entry): entry is [string, string] =>
+                    typeof entry[1] === "string",
+                ),
               ),
             );
-            const restored = { ...previous, ...saved.snapshot.drafts };
-            if (Object.keys(previous).length) {
-              await saved.drafts(restored);
+            const restored = { ...previous.drafts, ...saved.snapshot.drafts };
+            restoreFiles(previous.draftFiles);
+            restoreFiles(saved.snapshot.draftFiles);
+            if (Object.keys(previous.drafts).length) {
+              await saved.drafts(
+                restored,
+                undefined,
+                undefined,
+                uploads.committed(),
+              );
               localStorage.removeItem(oldKey);
             }
+            drafts.restoreSpoken(saved.snapshot.spokenDrafts);
             drafts.update((current) => ({ ...restored, ...current }));
             setJournal(saved);
             setOfflineNotice(saved.historyError);
@@ -1078,11 +1301,19 @@ export default function App({
     const timer = setInterval(save, 5000);
     return () => clearInterval(timer);
   }, [journal, workspace, connected]);
+  // Whether the sidebar shows in the wide layout, kept while the window is narrow (where the
+  // sidebar is the More sheet and starts closed) so that widening the window brings back what
+  // the wide layout had. A tiling window manager (Hyprland on Omarchy) narrows and widens the
+  // window each time another one opens or closes beside it.
+  const wideSidebar = useRef(true);
+  useEffect(() => {
+    if (!narrow) wideSidebar.current = sidebar;
+  }, [narrow, sidebar]);
   useEffect(() => {
     const media = window.matchMedia("(max-width:800px)");
     const change = () => {
       setNarrow(media.matches);
-      if (media.matches) setSidebar(false);
+      setSidebar(media.matches ? false : wideSidebar.current);
     };
     media.addEventListener("change", change);
     return () => media.removeEventListener("change", change);
@@ -1124,7 +1355,12 @@ export default function App({
             : [],
     );
     setTranscriptError("");
-    if (!kept) setEarliestTurn(undefined);
+    setEarlierError("");
+    setEarlierBusy(false);
+    if (!kept) {
+      setEarliestTurn(undefined);
+      recentTurn.current = undefined;
+    }
     activeSubscription.current = "";
     if (eventTimer.current) clearTimeout(eventTimer.current);
     eventTimer.current = undefined;
@@ -1145,6 +1381,7 @@ export default function App({
           since_seq: last,
           limit: 500,
         });
+        if (generation !== transcriptGeneration.current) return;
         const fresh: HubEvent[] = [...page.events];
         for (let pages = 1; page.more && pages < 8; pages++) {
           page = await rpc("thread.transcript", {
@@ -1183,8 +1420,9 @@ export default function App({
           limit: 500,
         });
       }
+      if (generation !== transcriptGeneration.current) return;
       const all: HubEvent[] = [...page.events];
-      let firstTurn = page.turn as number | undefined;
+      const firstTurn = page.turn as number | undefined;
       while (page.more) {
         page = await rpc("thread.transcript", {
           thread: id,
@@ -1196,36 +1434,10 @@ export default function App({
         all.push(...page.events);
       }
       const cursor = page.next || 0;
-      // Give short conversations useful context immediately. Older turns remain
-      // paged, and the virtual list asks for more when the user reaches the top.
-      for (
-        let n = 0;
-        n < 3 &&
-        firstTurn &&
-        firstTurn > 1 &&
-        blocksOf(all).reduce((sum, b) => sum + b.text.length, 0) < 3000;
-        n++
-      ) {
-        let older = await rpc("thread.transcript", {
-          thread: id,
-          turn: firstTurn - 1,
-          limit: 500,
-        });
-        const batch: HubEvent[] = [...older.events];
-        while (older.more) {
-          older = await rpc("thread.transcript", {
-            thread: id,
-            turn: firstTurn - 1,
-            since_seq: older.next,
-            limit: 500,
-          });
-          batch.push(...older.events);
-        }
-        all.unshift(...batch);
-        firstTurn--;
-        if (generation !== transcriptGeneration.current) return;
-      }
       if (generation !== transcriptGeneration.current) return;
+      // Show and subscribe to the recent turn before looking for older context
+      // or the latest user message. Older-page failures must not block live use.
+      recentTurn.current = firstTurn;
       setEarliestTurn(firstTurn);
       setEvents(all);
       liveTranscript.current = id;
@@ -1245,6 +1457,10 @@ export default function App({
         if (generation === transcriptGeneration.current)
           setTranscriptLoading(false);
       });
+    return () => {
+      // Fence both initial loading and older-page requests on switches/unmount.
+      transcriptGeneration.current++;
+    };
   }, [target?.id, connected, transcriptRefresh, rpc]);
   useEffect(() => {
     if (!target || !connected) {
@@ -1294,7 +1510,7 @@ export default function App({
         document.documentElement.dataset.platform || "",
       );
       const menu = document.querySelector<HTMLDetailsElement>(
-        ".conversation-menu[open]",
+        ".actions-menu[open]",
       );
       if (event.key === "Escape" && menu) {
         event.preventDefault();
@@ -1351,6 +1567,14 @@ export default function App({
         setSection("settings");
       }
       if (event.key === "Escape") {
+        // The `/usage` panel above the message box closes first, a draft in the box or not
+        // (a menu of the box's own that took the Esc has prevented it): Esc from the box
+        // would otherwise leave the conversation with the panel still open.
+        if (usagePanel && !event.defaultPrevented) {
+          setUsagePanel(false);
+          input.current?.focus();
+          return;
+        }
         if (event.target instanceof HTMLTextAreaElement && event.target.value)
           return;
         if (event.target instanceof HTMLInputElement) return;
@@ -1362,12 +1586,10 @@ export default function App({
     const closeMenu = (event: PointerEvent) => {
       if (
         event.target instanceof Element &&
-        event.target.closest(".conversation-menu")
+        event.target.closest(".actions-menu")
       )
         return;
-      document
-        .querySelector(".conversation-menu[open]")
-        ?.removeAttribute("open");
+      document.querySelector(".actions-menu[open]")?.removeAttribute("open");
     };
     window.addEventListener("keydown", keyboard);
     window.addEventListener("pointerdown", closeMenu);
@@ -1375,7 +1597,7 @@ export default function App({
       window.removeEventListener("keydown", keyboard);
       window.removeEventListener("pointerdown", closeMenu);
     };
-  }, [selected, destination]);
+  }, [selected, destination, usagePanel]);
   useEffect(() => {
     if (connected)
       void rpc("desktop.preferences", {
@@ -1396,10 +1618,12 @@ export default function App({
     if (connected) announce(`Connected to ${workspace}`);
     else if (previous)
       announce(
-        `Disconnected from ${workspace}${connectionError ? ". " + connectionError : ""}`,
+        `Disconnected from ${workspace}${connectionError ? ". " + connectionWords(connectionError).text : ""}`,
       );
     else if (connectionError)
-      announce(`Could not connect to ${workspace}. ${connectionError}`);
+      announce(
+        `Could not connect to ${workspace}. ${connectionWords(connectionError).text}`,
+      );
   }, [connected, connecting, workspace]);
   const knownAttention = useRef<{ workspace: string; ids: Set<string> }>(
     undefined,
@@ -1514,8 +1738,16 @@ export default function App({
             params.desktop_cwd = values._cwd;
           }
           const value = await rpc(operation.method!, params);
-          setResult(value);
+          // A switch or reset: what it dropped is said, and the user's own offered back
+          // (`afterSwitch`), never shown as raw text with its files' lines.
+          const switched = ["orchestrator.use", "orchestrator.reset"].includes(
+            operation.method!,
+          );
+          setResult(switched ? withoutDroppedText(value) : value);
+          if (switched) afterSwitch(value);
           setRefresh((n) => n + 1);
+          if (operation.method === "orchestrator.access")
+            void refreshInfo().catch(() => {});
           if (operation.id === "new") {
             setOperation(undefined);
             setDestination(value.id);
@@ -1540,7 +1772,7 @@ export default function App({
               }).catch((error) => {
                 // Kept in its box, to send again.
                 drafts.set(workspace + ":" + value.id, (old) =>
-                  appendDraft(old, firstPrompt!),
+                  appendMessage(old, firstPrompt!),
                 );
                 fail(
                   `${name} was made, but its first prompt was not sent: ${errorMessage(error)}`,
@@ -1552,31 +1784,72 @@ export default function App({
           }
         }
       } catch (e) {
-        setOperationError(errorMessage(e));
+        const message = errorMessage(e);
+        setOperationError(message);
+        // A field the error is about, or New thread's missing folder, is shown.
+        if (
+          splitFields(operation.fields, {}, message).open ||
+          (operation.method === "thread.new" && !values._cwd)
+        )
+          setMoreOpen(true);
       } finally {
         setOperationBusy(false);
       }
     };
-    if (operation.confirm)
+    const confirm = confirmationOf(operation, values);
+    // Full access asks only when it changes something.
+    const unchanged =
+      operation.id === "access" &&
+      values.access === accessLevel(infoRef.current?.orchestrator?.access);
+    if (confirm && !unchanged)
       setConfirmation({
-        title: operation.title,
-        detail: operation.confirm,
-        action: operationAction(operation, false),
+        title: confirm.title,
+        detail: confirm.detail,
+        action: confirm.action || operationAction(operation, false),
         destructive: true,
         run: () => void run(),
       });
     else await run();
   };
+  const reviewDictation = (key: string, text: string) => {
+    setConfirmation({
+      title: "Confirm spoken message",
+      detail: `Heard “${text}”. Spoken text never answers a request, changes a mode, or runs a composer command by itself. Review it in the message box before sending it as typed.`,
+      action: "Review in message box",
+      run: () => {
+        drafts.review(key, text);
+        input.current?.focus();
+      },
+    });
+  };
   const send = async (event?: FormEvent) => {
     event?.preventDefault();
     const draft = drafts.get(draftKey);
-    if (!permitted("operate") || !draft.trim() || sending) return;
-    if (
-      !connected &&
-      (!journal || draft.startsWith("/") || draft.startsWith("!"))
-    )
+    // The conversation's uploaded files go with the message, named after its text
+    // (`withAttachments`); a composer command and a shell line take none. A message waits
+    // while a file is still on its way (Send is disabled, and says why).
+    // Files another message on its way reserved are not this one's.
+    const attached =
+      target && !isCommandDraft(draft)
+        ? uploads.available(destination || "orchestrator", workspace)
+        : [];
+    if (attached.some(unfinished)) {
+      announce(attachmentWait(attached));
       return;
-    if (draft.startsWith("/") && !draft.startsWith("//")) {
+    }
+    const files = attached.flatMap((item) =>
+      item.path ? [{ id: item.id, name: item.file.name, path: item.path }] : [],
+    );
+    if (!permitted("operate") || (!draft.trim() && !files.length) || sending)
+      return;
+    const spoken = drafts.isSpoken(draftKey);
+    if (spoken && !connected) return;
+    if (spoken && (draft.startsWith("/") || draft.startsWith("!"))) {
+      reviewDictation(draftKey, draft);
+      return;
+    }
+    if (!connected && (!journal || isCommandDraft(draft))) return;
+    if (isSlashDraft(draft)) {
       await submitSlash(draft);
       return;
     }
@@ -1586,12 +1859,26 @@ export default function App({
       );
       return;
     }
+    // Reserved before anything is awaited: a hands-free message sent meanwhile can't name
+    // them too. Released in the end unless this message took them.
+    const fileIds = files.map((file) => file.id);
+    if (!uploads.reserve(fileIds)) return;
     setSending(true);
     const key = draftKey;
-    const text = draft.startsWith("//") ? draft.slice(1) : draft;
+    const text = messageText(draft);
+    // What is sent, and what the outbox keeps to put back in the draft: with the files.
+    const outgoing = withAttachments(text, files);
+    const kept = withAttachments(draft, files);
+    // Once the message holds them (sent, or saved in the outbox), they leave the box.
+    let taken = false;
+    const takeFiles = () => {
+      if (taken) return;
+      taken = true;
+      uploads.take(fileIds);
+    };
     try {
       let response: Json;
-      if (text.startsWith("!") && !text.startsWith("!!!")) {
+      if (isShellDraft(draft)) {
         const share = text.startsWith("!!");
         const command = text.slice(share ? 2 : 1).trim();
         if (!command)
@@ -1625,14 +1912,18 @@ export default function App({
       } else {
         const method = destination ? "thread.send" : "say";
         const params = destination
-          ? { thread: destination, prompt: text }
+          ? { thread: destination, prompt: outgoing }
           : {
-              message: text,
+              message: outgoing,
               seen_gseq: view.head,
               to: "orchestrator",
-              suggested:
-                acceptedSuggestion.current?.key === key &&
-                acceptedSuggestion.current.text === text,
+              ...(spoken
+                ? { voice: true }
+                : {
+                    suggested:
+                      acceptedSuggestion.current?.key === key &&
+                      acceptedSuggestion.current.text === text,
+                  }),
             };
         // Live replies to a waiting request use only the current visible head.
         // They never enter the delayed message outbox or receive automatic retries.
@@ -1644,50 +1935,79 @@ export default function App({
             (item) =>
               item.reason === "permission" || item.reason === "question",
           );
-        if (journal && hostApi.sendMessage && !liveReply) {
-          const pending = { key, text: draft, saved: false };
+        if (journal && hostApi.sendMessage && !liveReply && !spoken) {
+          const pending = { key };
           pendingEnqueue.current = pending;
           const epoch = journal.epoch;
           clearTimeout(draftSaveTimer.current);
           draftSaveTimer.current = undefined;
           const message = await journal
-            .enqueue(workspace, method, params, draft)
+            .enqueue(workspace, method, params, files.length ? kept : draft)
             .catch((error) => {
               if (pendingEnqueue.current === pending)
                 pendingEnqueue.current = undefined;
-              void journal.drafts(drafts.all(), epoch).catch(() => {});
+              // The save this send stopped, done now: with the box's files, which may
+              // hold one uploaded since the last save.
+              void journal
+                .drafts(
+                  drafts.all(),
+                  epoch,
+                  drafts.spoken(),
+                  uploads.committed(),
+                )
+                .catch(() => {});
               throw error;
             });
-          pending.saved = true;
+          takeFiles();
           drafts.set(key, (old) => (old === draft ? "" : old));
+          // The outbox holds the message and the box is cleared: the drafts save again,
+          // even when that cleared nothing (a message of files alone).
+          if (pendingEnqueue.current === pending)
+            pendingEnqueue.current = undefined;
           if (connected) response = await journal.deliver(message);
           else response = { saved_offline: true };
         } else response = await rpc(method, params);
       }
 
-      for (const restored of response.restored_drafts || [])
-        drafts.set(restored.key, (old) => appendDraft(old, restored.text));
+      if (spoken && response.action === "confirm") {
+        reviewDictation(key, draft);
+        return;
+      }
+      // What the outbox put back goes in the box once (`claim`): another delivery waiting
+      // on the same message may have put it there already.
+      for (const restored of journal?.claim(response.restored_drafts || []) ||
+        [])
+        restoreDraft(restored.key, restored.text);
       if (response.action === "pending") {
-        drafts.set(key, (old) => appendDraft(old, draft));
+        // Files the outbox took go back on the conversation; others never left it. Once:
+        // from the outbox, only if no other delivery put it back first.
+        const back = response.restored_draft
+          ? journal?.claim([response.restored_draft]).length
+          : 1;
+        if (back && taken) restoreDraft(key, kept);
+        else if (back) drafts.set(key, (old) => appendDraft(old, draft));
         setSection("attention");
         throw new Error(
           "Message not sent. Review the waiting requests and answer the exact item shown.",
         );
       }
       drafts.set(key, (old) => (old === draft ? "" : old));
-      if (!response.saved_offline && target)
-        uploads.dismissReady(target.id, workspace, draft);
+      takeFiles();
       announce(
         response.saved_offline
           ? "Message saved on this device. It sends when the hub reconnects."
-          : text.startsWith("!") && !text.startsWith("!!!")
+          : isShellDraft(draft)
             ? "Shell command started"
             : "Message sent",
       );
       setQueueRefresh((n) => n + 1);
     } catch (e) {
+      // Earlier saved messages the hub held went back to their drafts before this failed.
+      for (const restored of journal?.claim(restoredOf(e)) || [])
+        restoreDraft(restored.key, restored.text);
       fail(e);
     } finally {
+      uploads.release(fileIds);
       setSending(false);
       input.current?.focus();
     }
@@ -1695,28 +2015,53 @@ export default function App({
   /** Send as implementation loop: the draft is the task of a loop on the thread whose
    * conversation is shown. Live only, never to the outbox; an empty draft asks first, since
    * the task is then what the conversation already settled. */
-  const sendAsImplementation = () => {
+  const sendAsImplementation = (started: () => void) => {
     const thread = destination
       ? view.threads.find((t) => t.id === destination)
       : undefined;
     if (!thread || thread.is_orchestrator || sending) return;
     const key = draftKey;
     const draft = drafts.get(key);
+    if (drafts.isSpoken(key)) {
+      reviewDictation(key, draft);
+      return;
+    }
+    // The thread's uploaded files are part of the task, named after its text.
+    const attached = uploads.available(thread.id, workspace);
+    if (attached.some(unfinished)) {
+      announce(attachmentWait(attached));
+      return;
+    }
+    const files = attached.flatMap((item) =>
+      item.path ? [{ id: item.id, name: item.file.name, path: item.path }] : [],
+    );
     let plan: ReturnType<typeof sendAsLoop>;
     try {
-      plan = sendAsLoop(draft);
+      plan = sendAsLoop(
+        isCommandDraft(draft) ? draft : withAttachments(draft, files),
+      );
     } catch (error) {
       fail(error);
       return;
     }
+    const fileIds = files.map((file) => file.id);
     const run = async () => {
+      // Taken by another message since (the task names them): ask again.
+      if (!uploads.reserve(fileIds)) {
+        announce("Your files went with another message. Check the task again.");
+        return;
+      }
       setSending(true);
       try {
         if (
           await startImplement(thread.id, plan.task ? { task: plan.task } : {})
-        )
+        ) {
           drafts.set(key, (old) => (old === draft ? "" : old));
+          uploads.take(fileIds);
+          started();
+        }
       } finally {
+        uploads.release(fileIds);
         setSending(false);
         input.current?.focus();
       }
@@ -1733,23 +2078,38 @@ export default function App({
   // Voice mode (shared/voice.ts): a transcript goes to the orchestrator as it was heard,
   // marked spoken, so the hub never takes it for an answer or a mode change. Sent at once,
   // not through the offline outbox: it is said now, about what is on screen now.
+  // The orchestrator conversation's uploaded files go with it, as with a typed message;
+  // one still uploading waits for a later message (speech is not held back for it).
   const submitVoice = async (text: string): Promise<Json> => {
     if (!orchestrator)
       throw new Error("Choose an orchestrator before talking to it.");
-    const response = await rpc("say", {
-      message: text,
-      seen_gseq: view.head,
-      to: "orchestrator",
-      voice: true,
-    });
-    if (response.action === "pending") {
-      setSection("attention");
-      throw new Error(
-        "Not sent: review the waiting requests and answer the exact item shown.",
-      );
+    // Reserved at once, as a typed message does: a file goes with one message only.
+    const files = uploads.ready("orchestrator", workspace);
+    const fileIds = files.map((item) => item.id);
+    if (!uploads.reserve(fileIds))
+      throw new Error("Your files are going with another message.");
+    try {
+      const response = await rpc("say", {
+        message: withAttachments(
+          text,
+          files.map((item) => ({ name: item.file.name, path: item.path! })),
+        ),
+        seen_gseq: view.head,
+        to: "orchestrator",
+        voice: true,
+      });
+      if (response.action === "pending") {
+        setSection("attention");
+        throw new Error(
+          "Not sent: review the waiting requests and answer the exact item shown.",
+        );
+      }
+      if (response.action !== "confirm") uploads.take(fileIds);
+      setQueueRefresh((n) => n + 1);
+      return response;
+    } finally {
+      uploads.release(fileIds);
     }
-    setQueueRefresh((n) => n + 1);
-    return response;
   };
   const voiceHintWords = useMemo(() => voiceHint(view.threads), [view.threads]);
   // What this device may have read aloud lately, for voice mode's echo check: the
@@ -1766,15 +2126,24 @@ export default function App({
     ...announcements(view.threads),
   ];
   async function submitSlash(text: string) {
+    if (drafts.isSpoken(draftKey)) {
+      reviewDictation(draftKey, drafts.get(draftKey));
+      return;
+    }
     if (slashPending.current) return;
     slashPending.current = true;
     setSending(true);
     try {
       const rawName = text.slice(1).trim().split(/\s/)[0];
+      if (rawName === "usage") {
+        setSection("chat");
+        setUsagePanel(true);
+        drafts.set(draftKey, "");
+        return;
+      }
       const extraRoutes: Record<string, Section> = {
         boxes: "boxes",
         jobs: "jobs",
-        usage: "usage",
         memory: "memory",
         maintenance: "maintenance",
       };
@@ -1787,8 +2156,10 @@ export default function App({
       const args = parsed.args;
       const chosen = destination || selected;
       const named = (name: string | undefined) =>
-        view.threads.find((thread) =>
-          [thread.id, thread.name, ...(thread.aliases || [])].includes(name),
+        view.threads.find(
+          (thread) =>
+            name !== undefined &&
+            [thread.id, thread.name, ...(thread.aliases || [])].includes(name),
         );
       const thread = (name?: string) => name || chosen;
       const toggle = (
@@ -1856,9 +2227,12 @@ export default function App({
         case "Account": {
           let name = args.account,
             target = args.thread;
+          // A thread named in the command is the form's; the conversation's is a default.
+          let fixed = !!target;
           if (destination && target && !name && !named(target)) {
             name = target;
             target = destination;
+            fixed = false;
           }
           if (!name)
             openOperation(
@@ -1872,17 +2246,23 @@ export default function App({
                 fields: [{ key: "thread", label: "Thread", required: true }],
               },
               { thread: thread(target) },
+              { fixed },
             );
           else
-            action("model", {
-              thread: thread(target),
-              account: name,
-              outside_pin: args.outside_pin,
-            });
+            action(
+              "model",
+              {
+                thread: thread(target),
+                account: name,
+                outside_pin: args.outside_pin,
+              },
+              { fixed },
+            );
           break;
         }
         case "Model": {
           const values = { ...args, thread: thread(args.thread) };
+          const fixed = { fixed: !!args.thread };
           if (!args.model && !args.effort && !args.runtime)
             openOperation(
               {
@@ -1895,15 +2275,24 @@ export default function App({
                 fields: [{ key: "thread", label: "Thread", required: true }],
               },
               values,
+              fixed,
             );
-          else action("model", values);
+          else action("model", values, fixed);
           break;
         }
         case "Mode":
-          action("mode", { ...args, thread: thread(args.thread) });
+          action(
+            "mode",
+            { ...args, thread: thread(args.thread) },
+            { fixed: !!args.thread },
+          );
           break;
         case "Rename":
-          action("rename", { ...args, thread: thread(args.thread) });
+          action(
+            "rename",
+            { ...args, thread: thread(args.thread) },
+            { fixed: !!args.thread },
+          );
           break;
         case "New":
           // `/new <project> --implement <task>`: the form, with its switch on and the task
@@ -1918,6 +2307,11 @@ export default function App({
           break;
         case "OrchPick":
           action("orch");
+          break;
+        case "Access":
+          // `/access [limited|full]`: the palette's form, on the level named (Full still
+          // asks first); with none, on the current level.
+          action("access", args ? { access: args } : {});
           break;
         case "Clear":
           action("clear");
@@ -1938,6 +2332,7 @@ export default function App({
               } as Record<string, string>
             )[parsed.kind],
             { thread: thread(args) },
+            { fixed: !!args },
           );
           break;
         case "Attach": {
@@ -2010,11 +2405,15 @@ export default function App({
             speaker = args.on || undefined;
           if (cmd.kind === "Status") setSection("speech");
           else if (cmd.kind === "Last")
-            action("read", {
-              last: cmd.args.n,
-              thread: cmd.args.orch ? orchestrator?.id : destination,
-              speaker,
-            });
+            action(
+              "read",
+              {
+                last: cmd.args.n,
+                thread: cmd.args.orch ? orchestrator?.id : destination,
+                speaker,
+              },
+              { fixed: !!cmd.args.orch },
+            );
           else if (cmd.kind === "This") {
             const event = events.findLast(
               (event) => event.kind === "agent.text" && event.data.final,
@@ -2023,12 +2422,12 @@ export default function App({
               throw new Error(
                 "There is no completed message in this conversation to read.",
               );
-            action("read", {
-              thread: target.id,
-              seq: event.seq,
-              last: "",
-              speaker,
-            });
+            // The message read is this thread's: the form is for it.
+            action(
+              "read",
+              { thread: target.id, seq: event.seq, last: "", speaker },
+              { fixed: true },
+            );
           } else
             action("speech-control", {
               op: (
@@ -2167,10 +2566,8 @@ export default function App({
         throw new Error(
           response.message || "This message can no longer be taken back.",
         );
-      drafts.set(
-        draftKey,
-        (old) => (old ? old + "\n\n" : "") + response.prompt,
-      );
+      // Its files go back on the conversation, its text into the draft: still a message.
+      restoreDraft(draftKey, String(response.prompt ?? ""), true);
       setQueueRefresh((n) => n + 1);
       input.current?.focus();
     } catch (error) {
@@ -2220,14 +2617,20 @@ export default function App({
     return byThread;
   }, [view.attention]);
   const attentionFor = (id: string) => attentionByThread.get(id) || noAttention;
-  const selectThread = useCallback((id: string) => setSelected(id), []);
   const openThread = useCallback((id: string) => {
     setDestination(id);
     setSection("chat");
     setSelected(undefined);
+    if (window.innerWidth <= 800) setSidebar(false);
   }, []);
-  // While a workspace connects, its entry keeps the rows it had (a double-click's second
-  // click lands on the row the first one chose).
+  const selectThread = useCallback(
+    (id: string) => {
+      if (document.documentElement.dataset.mobile === "true") setSelected(id);
+      else openThread(id);
+    },
+    [openThread],
+  );
+  // Keep the workspace's rows available while its connection is being established.
   const entries = workspaceEntries(
     workspaces,
     workspace,
@@ -2250,7 +2653,7 @@ export default function App({
   /**
    * Opens a workspace's orchestrator (no `thread`) or one of its threads from the sidebar,
    * switching to the workspace first when it is another one. `talk` makes the thread the
-   * message destination (a double-click); otherwise it is selected, opening its inspector.
+   * message destination; otherwise it is selected, opening its inspector.
    * Clicks while the switch connects update the pending request instead of switching again.
    * `then` runs once it is open (a new thread's form, the grid).
    */
@@ -2272,6 +2675,7 @@ export default function App({
       } else if (toThread) {
         setDestination(id);
         setSelected(undefined);
+        if (window.innerWidth <= 800) setSidebar(false);
       } else setSelected(id);
       after?.();
     };
@@ -2354,6 +2758,83 @@ export default function App({
     const timer = setTimeout(() => setNotice(""), 6000);
     return () => clearTimeout(timer);
   }, [notice]);
+  // A success notice is about where it was given: going elsewhere clears it. (A notice
+  // given with the move that goes with it, such as a new thread opening, stays: both
+  // effects run after the same render, this place recorded first.)
+  const place = `${section}\u0000${destination ?? ""}\u0000${selected ?? ""}`;
+  const noticePlace = useRef(place);
+  useEffect(() => {
+    if (notice) noticePlace.current = place;
+    // Recorded when the notice is given, not when the place changes.
+  }, [notice]);
+  useEffect(() => {
+    if (noticePlace.current !== place) setNotice("");
+  }, [place]);
+  // Where a toast goes: under the header, the status strip and the conversation's heading,
+  // so that it never covers their controls (`--toast-top`).
+  useLayoutEffect(() => {
+    if (!error && !notice) return;
+    const main = document.getElementById("twr-main");
+    if (!main?.getBoundingClientRect) return;
+    const parts = () =>
+      [
+        ...main.querySelectorAll<HTMLElement>(
+          ":scope > .topbar, :scope > .status-strip, .conversation-heading",
+        ),
+      ].filter((part) => part.getBoundingClientRect);
+    const placeToast = () => {
+      let bottom = 0;
+      for (const part of parts())
+        bottom = Math.max(bottom, part.getBoundingClientRect().bottom);
+      if (bottom > 0)
+        document.documentElement.style.setProperty(
+          "--toast-top",
+          `${Math.round(bottom)}px`,
+        );
+    };
+    placeToast();
+    window.addEventListener("resize", placeToast);
+    const observer =
+      typeof ResizeObserver === "undefined"
+        ? undefined
+        : new ResizeObserver(placeToast);
+    // The work area too: a strip that comes or grows later shrinks it (the heading only
+    // moves, which no observer of its own size sees).
+    for (const part of [
+      ...parts(),
+      ...main.querySelectorAll<HTMLElement>(":scope > .work-area"),
+    ])
+      observer?.observe(part);
+    return () => {
+      window.removeEventListener("resize", placeToast);
+      observer?.disconnect();
+    };
+  }, [error, notice, section, destination]);
+  // An orchestrator switch that dropped queued messages says so, and offers to put the
+  // user's own back in the orchestrator's message box, files and all (as Take back does).
+  // One whose new orchestrator can't start (its program is missing, its start failed)
+  // says that too.
+  const afterSwitch = (result: Json) => {
+    const problem = changeProblem(result);
+    const { count, mine, lost } = droppedBySwitch(result);
+    const words = droppedWords(count, mine.length, lost);
+    if (words && "notice" in words) {
+      setNotice(problem ? `${problem} ${words.notice}` : words.notice);
+      return;
+    }
+    if (problem) setNotice(problem);
+    if (!words) return;
+    const key = workspace + ":orchestrator";
+    setConfirmation({
+      title: words.title,
+      detail: words.detail,
+      action: "Put back",
+      run: () => {
+        for (const message of mine) restoreDraft(key, message, true);
+        input.current?.focus();
+      },
+    });
+  };
   const loopNavigation = useRef({
     destination,
     section,
@@ -2406,7 +2887,14 @@ export default function App({
           );
           const words = startedWords(detail?.started, found);
           const line = words || result.loop?.line;
-          setNotice(startedNotice(name, request.kind, line));
+          setNotice(
+            startedNotice(
+              name,
+              request.kind,
+              line,
+              request.kind === "review" && !!request.once,
+            ),
+          );
         } else if (result?.status === "needs_setup") {
           // The card is the user's to answer: bring it into view, never answer it here.
           if (!found) setSection("attention");
@@ -2489,16 +2977,26 @@ export default function App({
   );
   const earlierTarget = target?.id;
   const earlier = useCallback(async () => {
-    if (!earliestTurn || earliestTurn <= 1 || !earlierTarget || earlierBusy)
+    if (
+      !earliestTurn ||
+      earliestTurn <= 1 ||
+      !earlierTarget ||
+      !connected ||
+      earlierBusy
+    )
       return;
     const generation = transcriptGeneration.current;
+    if (earlierRequest.current === generation) return;
+    earlierRequest.current = generation;
     setEarlierBusy(true);
+    setEarlierError("");
     try {
       let page = await rpc("thread.transcript", {
         thread: earlierTarget,
         turn: earliestTurn - 1,
         limit: 500,
       });
+      if (generation !== transcriptGeneration.current) return;
       const more: HubEvent[] = [...page.events];
       while (page.more) {
         page = await rpc("thread.transcript", {
@@ -2507,17 +3005,56 @@ export default function App({
           since_seq: page.next,
           limit: 500,
         });
+        if (generation !== transcriptGeneration.current) return;
         more.push(...page.events);
       }
       if (generation !== transcriptGeneration.current) return;
       setEvents((old) => mergeEvents(old, more));
       setEarliestTurn(earliestTurn - 1);
     } catch (e) {
-      fail(e);
+      if (generation === transcriptGeneration.current)
+        setEarlierError(errorMessage(e));
     } finally {
-      setEarlierBusy(false);
+      if (generation === transcriptGeneration.current) {
+        earlierRequest.current = undefined;
+        setEarlierBusy(false);
+      }
     }
-  }, [earliestTurn, earlierTarget, earlierBusy, rpc, fail]);
+  }, [earliestTurn, earlierTarget, connected, earlierBusy, rpc]);
+  useEffect(() => {
+    if (
+      !connected ||
+      transcriptLoading ||
+      transcriptError ||
+      earlierBusy ||
+      earlierError ||
+      !earliestTurn ||
+      earliestTurn <= 1 ||
+      liveTranscript.current !== earlierTarget ||
+      activeSubscription.current !== String(transcriptGeneration.current)
+    )
+      return;
+    const blocks = blocksOf(events);
+    // Continue independently until the latest user message is known. Preserve
+    // the bounded short-conversation context lookup, after subscribing as well.
+    if (
+      !blocks.some((block) => block.kind === "user") ||
+      (recentTurn.current != null &&
+        recentTurn.current - earliestTurn < 3 &&
+        blocks.reduce((sum, block) => sum + block.text.length, 0) < 3000)
+    )
+      void earlier();
+  }, [
+    connected,
+    transcriptLoading,
+    transcriptError,
+    earlierBusy,
+    earlierError,
+    earliestTurn,
+    earlierTarget,
+    events,
+    earlier,
+  ]);
   const setupOrchestrator = useCallback(() => actionRef.current("orch"), []);
   useEffect(() => {
     setPaletteIndex(0);
@@ -2527,15 +3064,41 @@ export default function App({
       .querySelector<HTMLElement>("[data-palette-active=true]")
       ?.scrollIntoView({ block: "nearest" });
   }, [paletteIndex]);
-  const allCommands = useMemo(
-    () => [...commands, ...(permitted("terminal") ? cliCommands : [])],
-    [cliCommands, commands],
+  // Orchestrator access only where the hub reports a level: an older hub has neither.
+  const hasAccess = accessLevel(info?.orchestrator?.access) !== undefined;
+  // The palette lists the app's actions; the CLI's own commands come when the search names
+  // one, or when Show CLI commands is on. An action that asks for an id no screen shows (an
+  // event, a device, a job) waits for a search too: the screen that has the id offers it.
+  // Updates are the update notice's and Settings'.
+  const [paletteCli, setPaletteCli] = useState(false);
+  const appCommands = useMemo(
+    () =>
+      commands.filter(
+        (c) => (c.id !== "access" || hasAccess) && c.id !== "app-update",
+      ),
+    [commands, hasAccess],
   );
-  const matching = allCommands.filter((c) =>
-    (c.title + " " + c.group + " " + c.id)
+  const asksForId = (c: Command) =>
+    c.fields.some(
+      (f) =>
+        f.required &&
+        f.initial == null &&
+        !f.options &&
+        /(^|_)id$|^job$/.test(f.key),
+    );
+  const searching = query.trim().toLowerCase();
+  const paletteMatches = (c: Command) =>
+    (c.title + " " + c.group + " " + c.id + " " + (c.cli?.join(" ") || ""))
       .toLowerCase()
-      .includes(query.toLowerCase()),
-  );
+      .includes(searching);
+  const matching = [
+    ...appCommands.filter(
+      (c) => paletteMatches(c) && (searching || !asksForId(c)),
+    ),
+    ...(paletteCli || searching
+      ? (permitted("terminal") ? cliCommands : []).filter(paletteMatches)
+      : []),
+  ];
   // A thread's conversation: its colour, and the ink its name is written in ("To:").
   const rootStyle = target
     ? ({
@@ -2549,6 +3112,249 @@ export default function App({
           : {}),
       } as CSSProperties)
     : {};
+  const openShell = () =>
+    void openTerminal({
+      shell: true,
+      cwd: localWorkingDirectory(target, homePath) || undefined,
+    });
+  const has = (id: string) => commands.some((c) => c.id === id);
+  /** The status strip's notices, the most pressing first: the connection, offline, a
+   * version mismatch, the host's (an update), then the assistance notices. */
+  const savedOffline = !connected
+    ? journal?.snapshot.workspaces[workspace]
+    : undefined;
+  const offlineWords = savedOffline
+    ? `Offline · saved ${new Date(savedOffline.savedAt).toLocaleString()}. Requests need a live connection before you can answer.`
+    : "";
+  const connectionNotice = !!(connectionError || connecting);
+  // The host reconnecting on its own (its error names the hub's socket): news, not alarm.
+  const reconnecting = !connecting && !!connectionWords(connectionError).detail;
+  const notices: StripItem[] = [
+    ...(connectionNotice
+      ? [
+          {
+            key: "connection",
+            role:
+              connecting || reconnecting
+                ? ("status" as const)
+                : ("alert" as const),
+            tone: connectionError ? ("warning" as const) : undefined,
+            busy: connecting || reconnecting,
+            icon:
+              connecting || reconnecting ? (
+                <Spinner />
+              ) : (
+                <AlertCircle size={15} />
+              ),
+            // What this device saved shows meanwhile: one notice says both.
+            content: (
+              <>
+                {connecting ? (
+                  "Connecting to your workspace…"
+                ) : (
+                  <span title={connectionWords(connectionError).detail}>
+                    {connectionWords(connectionError).text}
+                  </span>
+                )}
+                {offlineWords && <p>{offlineWords}</p>}
+              </>
+            ),
+            actions: !connecting && (
+              <button onClick={() => void connect(workspace)}>Reconnect</button>
+            ),
+          },
+        ]
+      : []),
+    ...(offlineWords && !connectionNotice
+      ? [
+          {
+            key: "offline",
+            role: "status" as const,
+            tone: "offline" as const,
+            content: offlineWords,
+          },
+        ]
+      : []),
+    ...(paths?.versionMismatch
+      ? [
+          {
+            key: "version",
+            tone: "warning" as const,
+            icon: <AlertCircle size={15} />,
+            content: `The app bundles twr ${paths.version}; this hub still runs ${paths.hubVersion}. Stop and reconnect when you’re ready to use the new engine.`,
+            actions: (
+              <button onClick={() => action("hub-stop")}>Stop hub…</button>
+            ),
+          },
+        ]
+      : []),
+    // A decision first (the suggestions consent), then news; the storage warning,
+    // which can stand for as long as the app runs, never hides either.
+    ...(section === "chat" && assistance.needsDisclosure
+      ? [
+          {
+            key: "assistance-disclosure",
+            content: (
+              <AssistanceNotice
+                settings={assistance.settings}
+                acknowledge={assistance.acknowledge}
+                disable={() => {
+                  void Promise.all([
+                    hostApi.configSet(["tui"], "suggest", false),
+                    hostApi.configSet(["tui"], "summaries", false),
+                  ])
+                    .then(() => setRefresh((n) => n + 1))
+                    .catch(fail);
+                }}
+              />
+            ),
+          },
+        ]
+      : []),
+    ...(hostNotices || []),
+    ...(offlineNotice
+      ? [
+          {
+            key: "offline-notice",
+            role: "status" as const,
+            tone: "offline" as const,
+            content: offlineNotice,
+          },
+        ]
+      : []),
+    ...(section === "chat" && assistance.notice
+      ? [
+          {
+            key: "assistance",
+            role: "status" as const,
+            content: assistance.notice,
+            actions: (
+              <>
+                <button onClick={assistance.retry}>Retry assistance</button>
+                <button
+                  onClick={assistance.clearNotice}
+                  aria-label="Dismiss assistance notice"
+                  title="Dismiss"
+                >
+                  <X size={12} />
+                </button>
+              </>
+            ),
+          },
+        ]
+      : []),
+  ];
+  /** The conversation's less common actions: its "⋯" menu (in the topbar on a phone). */
+  const conversationMenu: MenuItem[] =
+    section !== "chat"
+      ? []
+      : [
+          {
+            key: "tools",
+            label: "Show tool calls",
+            icon: <Wrench size={16} aria-hidden="true" />,
+            pressed: showTools,
+            onSelect: () => setShowTools((v) => !v),
+          },
+          {
+            key: "reasoning",
+            label: "Show reasoning",
+            icon: <Eye size={16} aria-hidden="true" />,
+            pressed: showThinking,
+            onSelect: () => setShowThinking((v) => !v),
+          },
+          ...(target
+            ? [
+                {
+                  key: "export",
+                  label: "Export conversation",
+                  icon: <Download size={16} aria-hidden="true" />,
+                  onSelect: () => void exportConversation(),
+                },
+              ]
+            : []),
+          ...(has(destination ? "model" : "orch")
+            ? [
+                {
+                  key: "model",
+                  label: "Model & runtime…",
+                  icon: <Cpu size={16} aria-hidden="true" />,
+                  dialog: true,
+                  // The composer's model picker, the one place for its model and
+                  // effort (and a move to another runtime); before there is a thread to
+                  // pick for (no orchestrator yet), the form.
+                  disabled: !!target && (!connected || !permitted("operate")),
+                  onSelect: () =>
+                    target
+                      ? openModelPicker()
+                      : action(
+                          destination ? "model" : "orch",
+                          destination ? { thread: destination } : {},
+                          { fixed: true },
+                        ),
+                },
+              ]
+            : []),
+          {
+            key: "usage",
+            label: "Usage limits",
+            icon: <Gauge size={16} aria-hidden="true" />,
+            disabled: !connected,
+            onSelect: () => setUsagePanel(true),
+          },
+          ...(destination && target && !target.is_orchestrator
+            ? threadMenu(target.id).map((item, i) => ({
+                ...item,
+                group: i === 0,
+              }))
+            : []),
+        ];
+  /** A thread's less common actions, each opening its form (the hub confirms). */
+  function threadMenu(thread: string, hints = false): MenuItem[] {
+    const entries: [string, string, string, ReactNode][] = [
+      [
+        "rename",
+        "Rename…",
+        "",
+        <Pencil size={16} aria-hidden="true" key="i" />,
+      ],
+      [
+        "park",
+        "Park…",
+        "Stop it and free its worktree; keep the branch.",
+        <CirclePause size={16} aria-hidden="true" key="i" />,
+      ],
+      [
+        "trim",
+        "Trim…",
+        "Delete its build output.",
+        <Scissors size={16} aria-hidden="true" key="i" />,
+      ],
+      [
+        "compact",
+        "Compact…",
+        "Summarize its context to free space.",
+        <Shrink size={16} aria-hidden="true" key="i" />,
+      ],
+      [
+        "delete",
+        "Move to trash…",
+        "Recoverable from Trash for a while.",
+        <Trash2 size={16} aria-hidden="true" key="i" />,
+      ],
+    ];
+    return entries
+      .filter(([id]) => has(id) && (hints ? id !== "rename" : id !== "trim"))
+      .map(([id, label, hint, icon]) => ({
+        key: id,
+        label,
+        icon,
+        hint: hints ? hint : undefined,
+        dialog: true,
+        danger: id === "delete",
+        onSelect: () => action(id, { thread }, { fixed: true }),
+      }));
+  }
   const shell = (
     <div className={`app ${sidebar ? "" : "sidebar-hidden"}`} style={rootStyle}>
       <button
@@ -2592,7 +3398,6 @@ export default function App({
           <span className="wordmark">
             twr<span>_</span>
           </span>
-          <span className="brand-caption">Hub client</span>
           <button
             className="icon-button no-drag"
             aria-label="Hide sidebar"
@@ -2643,15 +3448,6 @@ export default function App({
               onClick={() => setFocus((v) => !v)}
             >
               <Filter size={13} />
-            </button>
-            <button
-              className="icon-button"
-              aria-label="Manage workspaces"
-              title="New or remove workspaces"
-              aria-haspopup="dialog"
-              onClick={() => setWorkspaceModal(true)}
-            >
-              <FolderPlus size={15} />
             </button>
           </div>
         </div>
@@ -2804,9 +3600,14 @@ export default function App({
                             <button
                               className="workspace-thread"
                               style={threadStyle(thread.accent)}
-                              title={`${thread.name} in ${entry.name}: ${thread.status_label || thread.status}. Double-click to talk to it.`}
+                              title={`${thread.name} in ${entry.name}: ${thread.status_label || thread.status}. ${document.documentElement.dataset.mobile === "true" ? "Double-click" : "Click"} to talk to it.`}
                               onClick={(event) =>
-                                openIn(entry.name, thread.id, event.detail > 1)
+                                openIn(
+                                  entry.name,
+                                  thread.id,
+                                  document.documentElement.dataset.mobile !==
+                                    "true" || event.detail > 1,
+                                )
                               }
                             >
                               {thread.accent && (
@@ -2865,7 +3666,9 @@ export default function App({
               .map((n) => (
                 <button
                   key={n.id}
-                  aria-current={section === n.id ? "page" : undefined}
+                  aria-current={
+                    navSection(section) === n.id ? "page" : undefined
+                  }
                   onClick={() => setSection(n.id)}
                 >
                   <n.icon size={15} />
@@ -2898,7 +3701,9 @@ export default function App({
             </span>
           </button>
           <button
-            aria-current={section === "settings" ? "page" : undefined}
+            aria-current={
+              navSection(section) === "settings" ? "page" : undefined
+            }
             onClick={() => setSection("settings")}
           >
             <Settings2 size={15} />
@@ -2914,27 +3719,13 @@ export default function App({
               : connecting
                 ? "Connecting…"
                 : "Disconnected"}
-            <span>v{paths?.version || "0.5.0"}</span>
+            <span>v{paths?.version || "0.6.0"}</span>
           </div>
         </div>
       </aside>
       <main className="main-shell" id="twr-main" tabIndex={-1}>
-        {!connected && journal?.snapshot.workspaces[workspace] && (
-          <div className="offline-banner" role="status">
-            Offline · saved{" "}
-            {new Date(
-              journal.snapshot.workspaces[workspace].savedAt,
-            ).toLocaleString()}
-            . Requests need a live connection before you can answer.
-          </div>
-        )}
-        {offlineNotice && (
-          <div className="offline-banner" role="status">
-            {offlineNotice}
-          </div>
-        )}
         <header className="topbar drag-region">
-          <div className="topbar-left no-drag">
+          <div className="topbar-left">
             {!sidebar && (
               <button
                 className="icon-button"
@@ -2965,11 +3756,7 @@ export default function App({
                 ? target?.name
                 : section === "chat"
                   ? "Orchestrator"
-                  : section === "grid"
-                    ? "Threads"
-                    : section === "attention"
-                      ? "Needs you"
-                      : nav.find((n) => n.id === section)?.label || "Decisions"}
+                  : sectionTitle(section)}
               {section === "chat" && target && (
                 <small className="mobile-runtime">
                   {target.runtime} ·{" "}
@@ -2989,9 +3776,9 @@ export default function App({
             )}
           </div>
           {headerAccessory && (
-            <div className="topbar-accessory no-drag">{headerAccessory}</div>
+            <div className="topbar-accessory">{headerAccessory}</div>
           )}
-          <div className="topbar-actions no-drag">
+          <div className="topbar-actions">
             <button
               className="icon-button"
               aria-label="Search conversations"
@@ -3010,148 +3797,35 @@ export default function App({
                   ? "This device has no terminal access"
                   : "Open shell"
               }
-              onClick={() =>
-                void openTerminal({
-                  shell: true,
-                  cwd: localWorkingDirectory(target, homePath) || undefined,
-                })
-              }
+              onClick={openShell}
             >
               <TerminalSquare size={17} />
             </button>
-            <button
-              className="icon-button"
-              aria-label="Open command palette"
-              title="Commands (⌘/Ctrl K)"
-              aria-haspopup="dialog"
-              onClick={() => {
-                setPalette(true);
-                setQuery("");
-              }}
-            >
-              <CommandIcon size={17} />
-            </button>
-            <details
+            <ActionsMenu
+              // A phone hides the conversation's header: its actions menu shows here,
+              // with New thread and Open shell, whose own buttons a phone hides.
               className="conversation-menu"
-              onToggle={(event) => {
-                const menu = event.currentTarget;
-                // Keyboard users land on the first action; pointer users keep focus.
-                if (menu.open && menu.dataset.keyboard === "true")
-                  menu
-                    .querySelector<HTMLElement>("div > button:not(:disabled)")
-                    ?.focus();
-                delete menu.dataset.keyboard;
-              }}
-            >
-              <summary
-                aria-label={
-                  section === "chat" ? "Thread actions" : "More actions"
-                }
-                title={section === "chat" ? "Thread actions" : "More actions"}
-                onKeyDown={(event) => {
-                  const menu = event.currentTarget
-                    .parentElement as HTMLDetailsElement;
-                  if (["Enter", " "].includes(event.key))
-                    menu.dataset.keyboard = "true";
-                  if (event.key === "ArrowDown") {
-                    event.preventDefault();
-                    menu.dataset.keyboard = "true";
-                    if (!menu.open) menu.open = true;
-                    else
-                      menu
-                        .querySelector<HTMLElement>(
-                          "div > button:not(:disabled)",
-                        )
-                        ?.focus();
-                  }
-                }}
-              >
-                <MoreHorizontal size={18} />
-              </summary>
-              <div
-                onKeyDown={(event) =>
-                  handleRovingKey(event, event.currentTarget, ":scope > button")
-                }
-                onClick={(event) =>
-                  (
-                    event.currentTarget.parentElement as HTMLDetailsElement
-                  ).removeAttribute("open")
-                }
-              >
-                <button
-                  aria-controls="twr-sidebar"
-                  onClick={() => setSidebar(true)}
-                >
-                  <PanelLeftOpen size={16} />
-                  Threads and navigation
-                </button>
-                <button
-                  disabled={!permitted("operate")}
-                  onClick={() => action("new")}
-                >
-                  <Plus size={16} />
-                  New thread
-                </button>
-                <button
-                  disabled={!permitted("terminal")}
-                  onClick={() =>
-                    void openTerminal({
-                      shell: true,
-                      cwd: localWorkingDirectory(target, homePath) || undefined,
-                    })
-                  }
-                >
-                  <TerminalSquare size={16} />
-                  Open shell
-                </button>
-                {section === "chat" && (
-                  <>
-                    <button
-                      aria-pressed={showTools}
-                      onClick={() => setShowTools((v) => !v)}
-                    >
-                      <Wrench size={16} />
-                      Tool calls
-                    </button>
-                    <button
-                      aria-pressed={showThinking}
-                      onClick={() => setShowThinking((v) => !v)}
-                    >
-                      <Eye size={16} />
-                      Reasoning
-                    </button>
-                    {target && (
-                      <button onClick={() => void exportConversation()}>
-                        <Download size={16} />
-                        Export conversation
-                      </button>
-                    )}
-                    <button
-                      onClick={() =>
-                        action(
-                          destination ? "model" : "orch",
-                          destination ? { thread: destination } : {},
-                        )
-                      }
-                    >
-                      <Settings2 size={16} />
-                      {destination
-                        ? "Thread settings"
-                        : "Orchestrator settings"}
-                    </button>
-                  </>
-                )}
-                <button
-                  onClick={() => {
-                    setPalette(true);
-                    setQuery("");
-                  }}
-                >
-                  <Search size={16} />
-                  Commands
-                </button>
-              </div>
-            </details>
+              label="More actions"
+              items={[
+                ...conversationMenu,
+                {
+                  key: "new",
+                  label: "New thread",
+                  icon: <Plus size={16} aria-hidden="true" />,
+                  dialog: true,
+                  disabled: !permitted("operate"),
+                  group: conversationMenu.length > 0,
+                  onSelect: () => action("new"),
+                },
+                {
+                  key: "shell",
+                  label: "Open shell",
+                  icon: <TerminalSquare size={16} aria-hidden="true" />,
+                  disabled: !permitted("terminal"),
+                  onSelect: openShell,
+                },
+              ]}
+            />
             <button
               className="topbar-new-thread"
               aria-label="New thread"
@@ -3159,36 +3833,13 @@ export default function App({
               disabled={!permitted("operate")}
               onClick={() => action("new")}
             >
-              <Plus size={14} />
-              New thread
+              <Plus size={14} aria-hidden="true" />
+              {/* Icon alone in a narrow window (style.css); the button keeps its name. */}
+              <span className="topbar-new-thread-label">New thread</span>
             </button>
           </div>
         </header>
-        {paths?.versionMismatch && (
-          <div className="connection-banner warning">
-            <AlertCircle size={15} />
-            <span>
-              The app bundles twr {paths.version}; this hub still runs{" "}
-              {paths.hubVersion}. Stop and reconnect when you’re ready to use
-              the new engine.
-            </span>
-            <button onClick={() => action("hub-stop")}>Stop hub…</button>
-          </div>
-        )}
-        {(connectionError || connecting) && (
-          <div
-            className={`connection-banner ${connectionError ? "warning" : ""}`}
-            aria-busy={connecting || undefined}
-          >
-            {connecting ? <Spinner /> : <AlertCircle size={15} />}
-            <span>
-              {connecting ? "Connecting to your workspace…" : connectionError}
-            </span>
-            {!connecting && (
-              <button onClick={() => void connect(workspace)}>Reconnect</button>
-            )}
-          </div>
-        )}
+        <StatusStrip items={notices} />
         <div className="work-area">
           <div className="content-column">
             {section === "chat" && (
@@ -3225,56 +3876,57 @@ export default function App({
                     </div>
                   </div>
                   <div className="conversation-actions">
-                    <button
-                      className={`icon-button ${showTools ? "on" : ""}`}
-                      aria-label="Toggle tool calls"
-                      aria-pressed={showTools}
-                      title="Show tool calls"
-                      onClick={() => setShowTools((v) => !v)}
-                    >
-                      <Wrench size={16} />
-                    </button>
-                    <button
-                      className={`icon-button ${showThinking ? "on" : ""}`}
-                      aria-label="Toggle reasoning"
-                      aria-pressed={showThinking}
-                      title="Show reasoning"
-                      onClick={() => setShowThinking((v) => !v)}
-                    >
-                      <Eye size={16} />
-                    </button>
-                    {target && (
-                      <button
-                        className="icon-button"
-                        aria-label="Export conversation"
-                        title="Export conversation"
-                        onClick={() => void exportConversation()}
-                      >
-                        <Download size={16} />
-                      </button>
-                    )}
-                    <button
-                      className="icon-button"
-                      aria-label={
-                        destination
-                          ? "Thread settings"
-                          : "Orchestrator settings"
-                      }
-                      title={
-                        destination
-                          ? "Thread settings"
-                          : "Orchestrator settings"
-                      }
-                      aria-haspopup="dialog"
-                      onClick={() =>
-                        action(
-                          destination ? "model" : "orch",
-                          destination ? { thread: destination } : {},
-                        )
-                      }
-                    >
-                      <MoreHorizontal size={18} />
-                    </button>
+                    <ReadAloudControl
+                      key={workspace}
+                      host={hostApi}
+                      rpc={rpc}
+                      workspace={workspace}
+                      connected={connected}
+                    />
+                    <UsageButton
+                      // Each workspace's limits from its own hub: a switch starts afresh.
+                      // (Its own key: the read-aloud control beside it is keyed by workspace.)
+                      key={`usage:${workspace}`}
+                      rpc={rpc}
+                      revision={usageRevision}
+                      connected={connected}
+                      onOpenPage={() => setSection("usage")}
+                    />
+                    {destination &&
+                      target &&
+                      document.documentElement.dataset.mobile !== "true" && (
+                        <button
+                          ref={detailsToggle}
+                          className={`icon-button ${selected === target.id ? "on" : ""}`}
+                          aria-label={
+                            selected === target.id
+                              ? "Hide thread details"
+                              : "Show thread details"
+                          }
+                          title={
+                            selected === target.id
+                              ? "Hide thread details"
+                              : "Show thread details"
+                          }
+                          aria-expanded={selected === target.id}
+                          aria-controls="twr-inspector"
+                          onClick={() =>
+                            setSelected((id) =>
+                              id === target.id ? undefined : target.id,
+                            )
+                          }
+                        >
+                          {selected === target.id ? (
+                            <PanelRightClose size={16} />
+                          ) : (
+                            <PanelRightOpen size={16} />
+                          )}
+                        </button>
+                      )}
+                    <ActionsMenu
+                      label="Conversation actions"
+                      items={conversationMenu}
+                    />
                   </div>
                 </header>
                 <div
@@ -3312,16 +3964,18 @@ export default function App({
                   showTools={showTools}
                   showThinking={showThinking}
                   loading={transcriptLoading && !presentedEvents.length}
-                  error={transcriptError}
+                  error={transcriptError || earlierError}
                   earlier={
                     earliestTurn && earliestTurn > 1 ? earlier : undefined
                   }
                   earlierBusy={earlierBusy}
                   target={target}
+                  threads={view.threads}
                   onSetup={setupOrchestrator}
                   connected={connected}
                   summaries={assistance.summaries}
                   onError={fail}
+                  sentImage={uploads.sentImage}
                   onVisibleRoutines={setVisibleRoutines}
                   offer={
                     destination &&
@@ -3370,13 +4024,12 @@ export default function App({
                   threads={view.threads}
                   onSent={(result) => {
                     setQueueRefresh((n) => n + 1);
-                    for (const restored of [
+                    const back = [
                       ...(result.restored_drafts || []),
                       ...(result.restored_draft ? [result.restored_draft] : []),
-                    ])
-                      drafts.set(restored.key, (old) =>
-                        appendDraft(old, restored.text),
-                      );
+                    ];
+                    for (const restored of journal?.claim(back) || [])
+                      restoreDraft(restored.key, restored.text);
                   }}
                   onCopy={(message) => {
                     const key =
@@ -3385,17 +4038,9 @@ export default function App({
                       (message.method === "say"
                         ? "orchestrator"
                         : message.params.thread);
-                    const text = messageDraft(message);
-                    drafts.set(key, (old) => appendDraft(old, text));
+                    restoreDraft(key, messageDraft(message));
                   }}
                 />
-                {target && (
-                  <AttachmentManager
-                    controller={uploads}
-                    thread={target.id}
-                    workspace={workspace}
-                  />
-                )}
                 {queued.length > 0 && (
                   <section className="queue" aria-label="Queued messages">
                     <div className="eyebrow">
@@ -3407,11 +4052,13 @@ export default function App({
                         className="queued-message"
                         key={message.ref || message.id || i}
                       >
-                        <span>
-                          {message.prompt ||
+                        <QueuedText
+                          text={
+                            message.prompt ||
                             message.message ||
-                            JSON.stringify(message)}
-                        </span>
+                            JSON.stringify(message)
+                          }
+                        />
                         <button
                           disabled={
                             !message.mine || queueBusy.includes(message.ref)
@@ -3468,32 +4115,21 @@ export default function App({
                     </div>
                   ))}
                 </div>
-                {assistance.needsDisclosure && (
-                  <AssistanceNotice
-                    settings={assistance.settings}
-                    acknowledge={assistance.acknowledge}
-                    disable={() => {
-                      void Promise.all([
-                        hostApi.configSet(["tui"], "suggest", false),
-                        hostApi.configSet(["tui"], "summaries", false),
-                      ])
-                        .then(() => setRefresh((n) => n + 1))
-                        .catch(fail);
+                {usagePanel && (
+                  <UsagePanel
+                    // Each workspace's limits from its own hub: a switch starts afresh.
+                    key={`usage:${workspace}`}
+                    rpc={rpc}
+                    revision={usageRevision}
+                    onClose={() => {
+                      setUsagePanel(false);
+                      input.current?.focus();
+                    }}
+                    onOpenPage={() => {
+                      setUsagePanel(false);
+                      setSection("usage");
                     }}
                   />
-                )}
-                {assistance.notice && (
-                  <div className="assistance-status" role="status">
-                    {assistance.notice}
-                    <button onClick={assistance.retry}>Retry assistance</button>
-                    <button
-                      onClick={assistance.clearNotice}
-                      aria-label="Dismiss assistance notice"
-                      title="Dismiss"
-                    >
-                      <X size={12} />
-                    </button>
-                  </div>
                 )}
                 <Composer
                   drafts={drafts}
@@ -3512,9 +4148,7 @@ export default function App({
                   setDestination={setDestination}
                   orchestrator={orchestrator}
                   workers={workers}
-                  slashCommands={
-                    slashCommands.length ? slashCommands : commands
-                  }
+                  slashCommands={composerCommands}
                   shellCwd={shellCwd}
                   assistance={assistance}
                   acceptSuggestion={acceptSuggestion}
@@ -3532,6 +4166,33 @@ export default function App({
                   spokenLately={spokenLately}
                   onDismissKeyboard={onDismissKeyboard}
                   fail={fail}
+                  modelPicker={
+                    <ModelPicker
+                      target={target}
+                      kind={target?.is_orchestrator ? "orchestrator" : "thread"}
+                      catalog={modelCatalog}
+                      rpc={rpc}
+                      connected={connected}
+                      operate={permitted("operate")}
+                      // The local app has no device scopes: it is the user, with all of them.
+                      admin={permitted("admin")}
+                      confirm={setConfirmation}
+                      withdraw={(asked) => {
+                        if (confirmation !== asked) return false;
+                        setConfirmation(undefined);
+                        return true;
+                      }}
+                      fail={fail}
+                      input={input}
+                      queued={
+                        destination
+                          ? 0
+                          : Number(queueInfo.total) || queued.length
+                      }
+                      switched={afterSwitch}
+                      notify={setNotice}
+                    />
+                  }
                 />
               </>
             )}
@@ -3545,14 +4206,6 @@ export default function App({
                       Live work, clear outcomes, and the things waiting on you.
                     </p>
                   </div>
-                  <button
-                    className="primary grid-new-thread"
-                    disabled={!permitted("operate")}
-                    onClick={() => action("new")}
-                  >
-                    <Plus size={16} />
-                    New thread
-                  </button>
                 </header>
                 <div
                   className="manager-actions"
@@ -3698,6 +4351,8 @@ export default function App({
                 canAdmin={permitted("admin")}
                 workspace={workspace}
                 refreshKey={refresh}
+                orchestratorAccess={info?.orchestrator?.access}
+                infoChanged={() => void refreshInfo().catch(() => {})}
                 rpc={rpc}
                 action={action}
                 cliAction={cliAction}
@@ -3719,7 +4374,11 @@ export default function App({
                   className="icon-button"
                   aria-label="Close thread details"
                   title="Close thread details"
-                  onClick={() => setSelected(undefined)}
+                  onClick={() => {
+                    setSelected(undefined);
+                    if (selected === destination && section === "chat")
+                      detailsToggle.current?.focus();
+                  }}
                 >
                   <X size={17} />
                 </button>
@@ -3779,17 +4438,56 @@ export default function App({
                   <TerminalSquare size={15} />
                   Attach agent terminal
                 </button>
+                <ThreadActions
+                  thread={selectedThread}
+                  has={has}
+                  pinned={pins.includes(selectedThread.id)}
+                  onPin={() => togglePin(selectedThread.id)}
+                  action={action}
+                  more={threadMenu(selectedThread.id, true)}
+                />
                 <div className="inspector-meta">
                   <span>Project</span>
                   <b>{selectedThread.project || "—"}</b>
                   <span>Model</span>
-                  <b>
-                    {selectedThread.model_actual ||
-                      selectedThread.model ||
-                      "Default"}
-                  </b>
-                  <span>Permission mode</span>
-                  <b>{selectedThread.mode}</b>
+                  <span className="inspector-value">
+                    <b>
+                      {selectedThread.model_actual ||
+                        selectedThread.model ||
+                        "Default"}
+                    </b>
+                    {has("model") && (
+                      <button
+                        className="text-button"
+                        aria-haspopup="dialog"
+                        aria-label={`Change model of ${selectedThread.name}`}
+                        onClick={() =>
+                          // The conversation shown: its composer's model picker.
+                          section === "chat" && target?.id === selectedThread.id
+                            ? openModelPicker()
+                            : action(
+                                "model",
+                                { thread: selectedThread.id },
+                                { fixed: true },
+                              )
+                        }
+                      >
+                        Change…
+                      </button>
+                    )}
+                  </span>
+                  <label htmlFor="twr-inspector-mode">Permission mode</label>
+                  <PermissionModePicker
+                    id="twr-inspector-mode"
+                    thread={selectedThread}
+                    admin={permitted("admin")}
+                    editable={has("mode") && connected && permitted("operate")}
+                    rpc={rpc}
+                    fail={fail}
+                    onChanged={(label) =>
+                      setNotice(`${selectedThread.name} now: ${label}.`)
+                    }
+                  />
                   <span>Worktree</span>
                   <button
                     className="text-button path"
@@ -3832,38 +4530,6 @@ export default function App({
                     <Markdown text={selectedThread.last_report.summary || ""} />
                   </section>
                 )}
-                <div className="inspector-actions">
-                  <button
-                    aria-pressed={pins.includes(selectedThread.id)}
-                    onClick={() => togglePin(selectedThread.id)}
-                  >
-                    <Pin size={14} />
-                    {pins.includes(selectedThread.id) ? "Unpin" : "Pin"} thread
-                  </button>
-                  {[
-                    "mode",
-                    "model",
-                    "rename",
-                    "compact",
-                    "resume",
-                    "stop",
-                    "park",
-                    "trim",
-                    "delete",
-                  ]
-                    .filter((id) => commands.some((c) => c.id === id))
-                    .map((id) => (
-                      <button
-                        className={id === "delete" ? "danger-quiet" : ""}
-                        key={id}
-                        onClick={() =>
-                          action(id, { thread: selectedThread.id })
-                        }
-                      >
-                        {commands.find((c) => c.id === id)?.title}
-                      </button>
-                    ))}
-                </div>
                 <details>
                   <summary>Full thread state</summary>
                   <DataView value={selectedThread} />
@@ -3988,14 +4654,6 @@ export default function App({
                   </button>
                 </div>
               ))}
-              <button
-                className="icon-button"
-                aria-label="New shell terminal"
-                title="New shell terminal"
-                onClick={() => void openTerminal({ shell: true })}
-              >
-                <Plus size={15} />
-              </button>
             </div>
             <div
               className="terminal-content"
@@ -4062,7 +4720,7 @@ export default function App({
       {palette && (
         <Dialog
           title="Commands"
-          subtitle="Every workflow, one place. CLI actions run in an embedded terminal."
+          subtitle="Search actions and settings"
           onClose={() => setPalette(false)}
         >
           <div className="palette-search">
@@ -4079,7 +4737,7 @@ export default function App({
               }
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search commands, settings, or CLI actions…"
+              placeholder="Search actions…"
               onKeyDown={(e) => {
                 if (e.key === "ArrowDown" || e.key === "ArrowUp") {
                   e.preventDefault();
@@ -4136,215 +4794,229 @@ export default function App({
                 No matching commands.
               </p>
             )}
-            {!cliCommands.length && (
-              <button
-                onClick={() =>
-                  void hostApi.catalog().then(setCliCommands).catch(fail)
-                }
-              >
-                Reload CLI workflows
-              </button>
+            {permitted("terminal") && (
+              <div className="palette-cli">
+                <label>
+                  <input
+                    type="checkbox"
+                    role="switch"
+                    checked={paletteCli}
+                    aria-describedby="twr-palette-cli-hint"
+                    onChange={(event) => setPaletteCli(event.target.checked)}
+                  />
+                  Show CLI commands
+                </label>
+                <small id="twr-palette-cli-hint">
+                  Each runs in a terminal here.
+                </small>
+                {(paletteCli || query.trim()) && !cliCommands.length && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void hostApi.catalog().then(setCliCommands).catch(fail)
+                    }
+                  >
+                    Reload CLI commands
+                  </button>
+                )}
+              </div>
             )}
           </div>
-          <footer className="dialog-footer">
-            <span>
-              {cliCommands.length} CLI workflows · {commands.length} application
-              actions
-            </span>
-          </footer>
         </Dialog>
       )}
-      {operation && (
-        <Dialog
-          title={operation.title}
-          subtitle={operation.description}
-          onClose={() => {
-            if (!operationBusy) setOperation(undefined);
-          }}
-          wide={operation.fields.some((f) => f.type === "textarea")}
-        >
-          {operationError && (
-            <div className="operation-error error-banner" role="alert">
-              {operationError}
-            </div>
-          )}
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              void execute();
-            }}
-          >
-            <div className="operation-fields">
-              {operation.fields
-                .filter(
-                  (field) =>
-                    // The setup card choice goes with the New thread form's loop only.
-                    !(
-                      operation.id === "new" &&
-                      field.key === "loop_setup" &&
-                      !values.implement
-                    ),
-                )
-                .map((field) => (
-                  <Fragment key={field.key}>
-                    <FieldInput
-                      field={
-                        field.key === "runtime"
-                          ? {
-                              ...field,
-                              options: [
-                                ...new Set([
-                                  "claude-code",
-                                  "codex",
-                                  "grok-build",
-                                  ...(info?.agents || []).map(
-                                    (a: Json) => a.runtime,
-                                  ),
-                                ]),
-                              ],
-                            }
-                          : field.type === "model" || field.type === "effort"
-                            ? {
-                                ...field,
-                                choices: (field.type === "model"
-                                  ? modelChoices
-                                  : effortChoices)(
-                                  modelCatalog,
-                                  formRuntime(
-                                    operation,
-                                    values,
-                                    view.threads,
-                                    info?.orchestrator?.configured?.explicit ===
-                                      false
-                                      ? info.orchestrator.configured.runtime
-                                      : undefined,
-                                  ),
-                                ),
-                              }
-                            : field.key === "mode" && !permitted("admin")
-                              ? {
-                                  ...field,
-                                  options: [
-                                    "manual",
-                                    "plan",
-                                    "read-only",
-                                    "dontAsk",
-                                  ],
-                                }
-                              : field
-                      }
-                      value={values[field.key]}
-                      onChange={(value) =>
-                        setValues((old) => ({ ...old, [field.key]: value }))
-                      }
-                    />
-                    {operation.id === "new" &&
-                      field.key === "implement" &&
-                      values.implement && (
-                        <NewThreadLoopLine
-                          project={values.project}
-                          connected={connected}
-                        />
-                      )}
-                  </Fragment>
-                ))}
-              {(operation.cli || operation.method === "thread.new") && (
-                <FieldInput
-                  field={{
-                    key: "_cwd",
-                    label: "Working directory",
-                    type: "directory",
-                    required: true,
-                    description:
-                      "Relative paths in this command are resolved from this folder.",
-                  }}
-                  value={values._cwd}
-                  onChange={(value) =>
-                    setValues((old) => ({ ...old, _cwd: value }))
-                  }
-                />
-              )}
-              {operation.cli && (
-                <p className="form-note">
-                  Runs in this workspace’s embedded terminal. Any interactive
-                  confirmation or login stays there.
-                </p>
-              )}
-
-              {result !== undefined && (
-                <div className="operation-result">
-                  {operation.id === "job-log" ? (
-                    <JobLog job={values.job} rpc={rpc} />
-                  ) : operation.id === "app-update" ? (
-                    <>
-                      <DataView value={result} />
-                      {result?.releaseUrl && (
-                        <button
-                          onClick={() =>
-                            void hostApi
-                              .openExternal(
-                                result.download?.url || result.releaseUrl,
-                              )
-                              .catch(fail)
-                          }
-                        >
-                          {result.download
-                            ? `Download ${result.download.name}`
-                            : "Open release page"}{" "}
-                          <ExternalLink size={14} aria-hidden="true" />
-                        </button>
-                      )}
-                      <button onClick={() => setSection("settings")}>
-                        Update settings
-                      </button>
-                    </>
-                  ) : operation.id === "context-read" ? (
-                    <ContextEditor
-                      key={values.project + ":" + result.hash}
-                      value={result}
-                      project={values.project}
-                      rpc={rpc}
-                      fail={fail}
-                    />
-                  ) : (
-                    <DataView value={result} />
-                  )}
+      {operation &&
+        (() => {
+          const context = {
+            command: operation,
+            values,
+            threads: view.threads,
+            info,
+            admin: permitted("admin"),
+            modelCatalog,
+            lists: pickerLists,
+            orchestrator: Boolean(orchestrator),
+          };
+          const shown = operation.fields.filter(
+            (field) =>
+              // The setup card choice goes with the New thread form's loop only.
+              !(
+                operation.id === "new" &&
+                field.key === "loop_setup" &&
+                !values.implement
+              ) &&
+              // A form opened for a thread names it in its subtitle instead.
+              !(field.key === "thread" && fixedThread),
+          );
+          const { essential, advanced } = splitFields(shown, values);
+          const renderField = (field: (typeof shown)[number]) => (
+            <Fragment key={field.key}>
+              <FieldInput
+                field={resolveField(field, context)}
+                value={values[field.key]}
+                onChange={(value) =>
+                  setValues((old) => ({ ...old, [field.key]: value }))
+                }
+              />
+              {operation.id === "new" &&
+                field.key === "implement" &&
+                values.implement && (
+                  <NewThreadLoopLine
+                    project={values.project}
+                    connected={connected}
+                  />
+                )}
+            </Fragment>
+          );
+          const cwd = (operation.cli || operation.method === "thread.new") && (
+            <FieldInput
+              field={{
+                key: "_cwd",
+                label:
+                  operation.method === "thread.new"
+                    ? "Resolve project paths from"
+                    : "Working directory",
+                type: "directory",
+                required: true,
+                description:
+                  "Relative paths in this command are resolved from this folder.",
+              }}
+              value={values._cwd}
+              onChange={(value) =>
+                setValues((old) => ({ ...old, _cwd: value }))
+              }
+            />
+          );
+          // New thread's folder for relative paths goes under More options with the rest.
+          const cwdAdvanced = operation.method === "thread.new";
+          return (
+            <Dialog
+              title={operation.title}
+              subtitle={
+                fixedThread
+                  ? `For ${fixedThread}.${operation.description ? " " + operation.description : ""}`
+                  : operation.description
+              }
+              onClose={() => {
+                if (!operationBusy) setOperation(undefined);
+              }}
+              wide={operation.fields.some((f) => f.type === "textarea")}
+            >
+              {operationError && (
+                <div className="operation-error error-banner" role="alert">
+                  {operationError}
                 </div>
               )}
-            </div>
-            <footer className="dialog-footer">
-              <span>In {workspace}</span>
-              <div>
-                <button
-                  type="button"
-                  onClick={() => setOperation(undefined)}
-                  disabled={operationBusy}
-                >
-                  {result !== undefined ? "Close" : "Cancel"}
-                </button>
-                <button
-                  className="primary"
-                  type="submit"
-                  disabled={operationBusy}
-                >
-                  {operationBusy ? (
-                    <Spinner />
-                  ) : operation.cli ? (
-                    <TerminalSquare size={15} />
-                  ) : operation.id === "new" ? (
-                    <Plus size={15} />
-                  ) : (
-                    <ArrowUpRight size={15} />
-                  )}{" "}
-                  {operation.cli
-                    ? "Open terminal"
-                    : operationAction(operation, result !== undefined)}
-                </button>
-              </div>
-            </footer>
-          </form>
-        </Dialog>
-      )}
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void execute();
+                }}
+              >
+                <div className="operation-fields">
+                  {fixedThread && (
+                    // Still the form's value, for the QA suites and the hub.
+                    <input
+                      type="hidden"
+                      id="field-thread"
+                      value={values.thread ?? ""}
+                    />
+                  )}
+                  {essential.map(renderField)}
+                  {(advanced.length > 0 || (cwd && cwdAdvanced)) && (
+                    <details
+                      className="more-options"
+                      open={moreOpen}
+                      onToggle={(event) =>
+                        setMoreOpen(event.currentTarget.open)
+                      }
+                    >
+                      <summary>More options</summary>
+                      <div className="more-options-fields">
+                        {advanced.map(renderField)}
+                        {cwdAdvanced && cwd}
+                      </div>
+                    </details>
+                  )}
+                  {!cwdAdvanced && cwd}
+                  {operation.cli && (
+                    <p className="form-note">
+                      Runs in this workspace’s embedded terminal. Any
+                      interactive confirmation or login stays there.
+                    </p>
+                  )}
+
+                  {result !== undefined && (
+                    <div className="operation-result">
+                      {operation.id === "job-log" ? (
+                        <JobLog job={values.job} rpc={rpc} />
+                      ) : operation.id === "access" ? (
+                        <AccessResult value={result} />
+                      ) : operation.id === "context-read" ? (
+                        <ContextEditor
+                          key={values.project + ":" + result.hash}
+                          value={result}
+                          project={values.project}
+                          rpc={rpc}
+                          fail={fail}
+                        />
+                      ) : (
+                        <CommandResult
+                          method={operation.method}
+                          value={result}
+                          values={values}
+                          onOpenThread={(id) => {
+                            setOperation(undefined);
+                            setDestination(id);
+                            setSelected(undefined);
+                            setSection("chat");
+                          }}
+                          onOpenLink={(url) =>
+                            void hostApi.openExternal(url).catch(fail)
+                          }
+                          onUpdateSettings={() => {
+                            setOperation(undefined);
+                            setSection("settings");
+                          }}
+                          onError={fail}
+                        />
+                      )}
+                    </div>
+                  )}
+                </div>
+                <footer className="dialog-footer">
+                  <span>In {workspace}</span>
+                  <div>
+                    <button
+                      type="button"
+                      onClick={() => setOperation(undefined)}
+                      disabled={operationBusy}
+                    >
+                      {result !== undefined ? "Close" : "Cancel"}
+                    </button>
+                    <button
+                      className="primary"
+                      type="submit"
+                      disabled={operationBusy}
+                    >
+                      {operationBusy ? (
+                        <Spinner />
+                      ) : operation.cli ? (
+                        <TerminalSquare size={15} />
+                      ) : operation.id === "new" ? (
+                        <Plus size={15} />
+                      ) : (
+                        <ArrowUpRight size={15} />
+                      )}{" "}
+                      {operation.cli
+                        ? "Open terminal"
+                        : operationAction(operation, result !== undefined)}
+                    </button>
+                  </div>
+                </footer>
+              </form>
+            </Dialog>
+          );
+        })()}
       {confirmation && (
         <Dialog
           title={confirmation.title}
@@ -4355,6 +5027,17 @@ export default function App({
             <span />
             <div>
               <button onClick={() => setConfirmation(undefined)}>Cancel</button>
+              {confirmation.alt && (
+                <button
+                  onClick={() => {
+                    const run = confirmation.alt!.run;
+                    setConfirmation(undefined);
+                    run();
+                  }}
+                >
+                  {confirmation.alt.action}
+                </button>
+              )}
               <button
                 className={confirmation.destructive ? "danger" : "primary"}
                 onClick={() => {
@@ -4445,11 +5128,11 @@ export default function App({
                   required
                   placeholder="e.g. client-project"
                 />
-                <span className="visually-hidden" id="twr-workspace-name-hint">
-                  Lowercase letters, numbers and hyphens, starting with a letter
-                  or number; up to 32 characters.
-                </span>
               </label>
+              <span className="visually-hidden" id="twr-workspace-name-hint">
+                Lowercase letters, numbers and hyphens, starting with a letter
+                or number; up to 32 characters.
+              </span>
               <button className="primary">
                 <Plus size={15} />
                 Create workspace
@@ -4596,11 +5279,12 @@ function ThreadCardButton({
 }) {
   const git = thread.git || thread.git_snapshot;
   const report = thread.last_report;
+  const mobile = document.documentElement.dataset.mobile === "true";
   return (
     <button
       className={`thread-card ${selected ? "selected" : ""} ${dived ? "dived" : ""} ${large ? "large" : ""}`}
       aria-current={dived ? "location" : undefined}
-      aria-describedby={selected ? "twr-thread-open-hint" : undefined}
+      aria-describedby={mobile && selected ? "twr-thread-open-hint" : undefined}
       style={threadStyle(thread.accent)}
       onClick={(event) => {
         // A click on the loop chip opens the inspector at the loop's progress.
@@ -4612,7 +5296,7 @@ function ThreadCardButton({
           onLoop();
         else onSelect();
       }}
-      onDoubleClick={onOpen}
+      onDoubleClick={mobile ? onOpen : undefined}
       onKeyDown={(e) => {
         if (e.key === "Enter" && selected) {
           e.preventDefault();
@@ -4950,15 +5634,19 @@ const Conversation = memo(function Conversation({
   earlier,
   earlierBusy,
   target,
+  threads,
   onSetup,
   connected,
   summaries,
   onVisibleRoutines,
   onError,
   offer,
+  sentImage,
 }: {
   /** The thread whose finished turn with changes the conversation offers a review loop. */
   offer?: Thread;
+  /** The preview this client still holds of a file a message named, by its path. */
+  sentImage?: (path: string) => string | undefined;
   onVisibleRoutines: (threads: string[]) => void;
   onError: (error: unknown) => void;
   summaries: Summary[];
@@ -4970,12 +5658,20 @@ const Conversation = memo(function Conversation({
   earlier?: () => void;
   earlierBusy: boolean;
   target?: Thread;
+  threads: Thread[];
   onSetup: () => void;
   connected: boolean;
 }) {
   const hostApi = useHostAPI();
   const parent = useRef<HTMLDivElement>(null);
-  const anchor = useRef<{ height: number; top: number } | undefined>(undefined);
+  const list = useRef<HTMLDivElement>(null);
+  const [scrollMargin, setScrollMargin] = useState(0);
+  const [jumpTarget, setJumpTarget] = useState<string>();
+  // A jump can be clamped at the bottom of a short history. Remember the
+  // clicked message so another activation still steps back in that case.
+  const [steppedFrom, setSteppedFrom] = useState<string>();
+  const [, readScrollPosition] = useState(0);
+  const hasScrolled = useRef(false);
   const follow = useRef(true);
   const [following, setFollowing] = useState(true);
   // Expanded messages and open tool details, by block: rows scrolled out of the virtual
@@ -5007,7 +5703,144 @@ const Conversation = memo(function Conversation({
     estimateSize: () => 120,
     overscan: 8,
     getItemKey: (index) => blocks[index].id,
+    scrollMargin,
+    // Preserve the current message and pixel offset on every prepend, including
+    // background loads and scrolling during a request. Bottom-follow stays ours.
+    anchorTo: "end",
+    followOnAppend: false,
   });
+  // Controls and loading/error notices precede the virtual rows in the scroller.
+  // Include their height when locating a message, including after a resize.
+  useLayoutEffect(() => {
+    const measure = () => {
+      const margin = list.current?.offsetTop ?? 0;
+      const delta = margin - virtual.options.scrollMargin;
+      // The last prepend removes Load earlier. Keep the reading position when
+      // that control (or a notice above the rows) changes the list's offset too.
+      // Relative scrolling includes prepend adjustments held during iOS gestures;
+      // DOM scrollTop can lag behind the virtualizer's layout position.
+      if (delta && !follow.current && parent.current)
+        virtual.scrollBy(delta, { behavior: "auto" });
+      setScrollMargin(margin);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    if (parent.current) observer.observe(parent.current);
+    return () => observer.disconnect();
+  }, [loading, error, earlier, earlierBusy, virtual]);
+  useLayoutEffect(() => {
+    if (!jumpTarget) return;
+    const index = blocks.findIndex((block) => block.id === jumpTarget);
+    if (index < 0) {
+      virtual.cancelScroll();
+      setJumpTarget(undefined);
+      return;
+    }
+    const message = parent.current?.querySelector<HTMLElement>(
+      `[data-index="${index}"]`,
+    );
+    const destination = virtual.getOffsetForIndex(index, "start")?.[0];
+    if (
+      !message ||
+      destination == null ||
+      Math.abs((virtual.scrollOffset ?? 0) - destination) > 1
+    ) {
+      // Resolve the ID again on every pending layout: an in-flight history
+      // prepend can move it while the virtualizer still retains a numeric index.
+      virtual.scrollToIndex(index, { align: "start", behavior: "auto" });
+      return;
+    }
+    // Alignment can precede the virtualizer's final reconciliation frames.
+    // Retire that numeric command before a fast predecessor lookup prepends
+    // rows under it. Subsequent measurements use normal prepend anchoring.
+    virtual.cancelScroll();
+    message.focus({ preventScroll: true });
+    setJumpTarget(undefined);
+  });
+  const userIndexes = useMemo(
+    () =>
+      blocks.flatMap((block, index) => (block.kind === "user" ? [index] : [])),
+    [blocks],
+  );
+  // Work in the virtualizer's layout coordinates. DOM scrollTop and rendered
+  // row starts omit held iOS prepend corrections and cannot be mixed with them.
+  const offset = virtual.scrollOffset ?? 0;
+  const readingRow = virtual.getVirtualItemForOffset(offset - 1);
+  const atBottom =
+    (!hasScrolled.current && follow.current) ||
+    !virtual.scrollRect?.height ||
+    virtual.isAtEnd(1);
+  // At the bottom offer the latest user message. Otherwise its start must be
+  // above the viewport's top edge (1 CSS px tolerance); reaching that start
+  // while scrolling upward advances to the preceding user message.
+  let beforeIndex = atBottom
+    ? blocks.length
+    : readingRow && readingRow.start <= offset - 1
+      ? readingRow.index + 1
+      : 0;
+  const steppedIndex = steppedFrom
+    ? blocks.findIndex((block) => block.id === steppedFrom)
+    : -1;
+  const stepOffset =
+    steppedIndex < 0
+      ? undefined
+      : virtual.getOffsetForIndex(steppedIndex, "start")?.[0];
+  const atStep = stepOffset != null && Math.abs(offset - stepOffset) <= 1;
+  if (steppedIndex >= 0 && (jumpTarget || atStep))
+    beforeIndex = Math.min(beforeIndex, steppedIndex);
+  const previousIndex = userIndexes.findLast((index) => index < beforeIndex);
+  const previousUser =
+    previousIndex == null ? undefined : blocks[previousIndex];
+  // A message of files only reads as their names (never their paths).
+  const previousUserLine = previousUser
+    ? ((sent) =>
+        sent.body.split(/\r\n|\r|\n/, 1)[0].trim() ||
+        (sent.files.length
+          ? "Attached " + sent.files.map((file) => file.name).join(", ")
+          : "Blank first line"))(splitAttachments(previousUser.text))
+    : "";
+  const boundaryText =
+    loading || (earlier && !error && connected)
+      ? "Loading your previous message…"
+      : error
+        ? "Previous message unavailable"
+        : earlier
+          ? "Connect to load earlier messages"
+          : userIndexes.length
+            ? "No earlier messages from you"
+            : "No messages from you yet";
+  useEffect(() => {
+    // Lookup must not turn off bottom-follow, move focus, or scroll. The parent
+    // serializes/pages requests and fences their results on thread switches.
+    if (
+      !previousUser &&
+      !jumpTarget &&
+      earlier &&
+      !earlierBusy &&
+      !loading &&
+      !error &&
+      connected
+    ) {
+      const frame = requestAnimationFrame(() => earlier());
+      return () => cancelAnimationFrame(frame);
+    }
+  }, [
+    previousUser,
+    jumpTarget,
+    earlier,
+    earlierBusy,
+    loading,
+    error,
+    connected,
+  ]);
+  useEffect(() => {
+    if (steppedFrom && !jumpTarget && !atStep) setSteppedFrom(undefined);
+  }, [steppedFrom, jumpTarget, atStep]);
+  function cancelMessageJump() {
+    setSteppedFrom(undefined);
+    setJumpTarget(undefined);
+    virtual.cancelScroll();
+  }
   const totalSize = virtual.getTotalSize();
   useLayoutEffect(() => {
     const element = parent.current;
@@ -5036,30 +5869,19 @@ const Conversation = memo(function Conversation({
   const last = blocks.at(-1);
   function loadEarlier() {
     if (!earlier || earlierBusy || !parent.current) return;
-    anchor.current = {
-      height: parent.current.scrollHeight,
-      top: parent.current.scrollTop,
-    };
     follow.current = false;
     setFollowing(false);
     earlier();
   }
-  useLayoutEffect(() => {
-    if (anchor.current && parent.current) {
-      const saved = anchor.current;
-      anchor.current = undefined;
-      parent.current.scrollTop =
-        saved.top + Math.max(0, parent.current.scrollHeight - saved.height);
-    }
-  }, [blocks[0]?.id]);
   useEffect(() => {
-    if (follow.current && blocks.length)
-      requestAnimationFrame(() => {
-        if (parent.current)
-          parent.current.scrollTop = parent.current.scrollHeight;
-      });
+    if (!follow.current || !blocks.length) return;
+    const frame = requestAnimationFrame(() => {
+      if (follow.current && parent.current)
+        parent.current.scrollTop = parent.current.scrollHeight;
+    });
+    return () => cancelAnimationFrame(frame);
   }, [blocks.length, last?.text, totalSize]);
-  return (
+  const history = (
     <div
       className="conversation-scroll"
       ref={parent}
@@ -5067,10 +5889,36 @@ const Conversation = memo(function Conversation({
       aria-label={`Conversation with ${target?.name || "orchestrator"}`}
       aria-busy={loading || undefined}
       tabIndex={0}
+      onWheel={cancelMessageJump}
+      onTouchStart={cancelMessageJump}
+      onPointerDown={cancelMessageJump}
+      onKeyDown={(event) => {
+        if (
+          [
+            "ArrowUp",
+            "ArrowDown",
+            "PageUp",
+            "PageDown",
+            "Home",
+            "End",
+            " ",
+          ].includes(event.key)
+        )
+          cancelMessageJump();
+      }}
       onScroll={() => {
         const p = parent.current!;
-        follow.current = p.scrollHeight - p.scrollTop - p.clientHeight < 100;
+        hasScrolled.current = true;
+        // A clamped jump near the bottom is still a deliberate history jump.
+        // Resume follow only when navigation leaves that jump position.
+        follow.current =
+          !jumpTarget &&
+          !steppedFrom &&
+          p.scrollHeight - p.scrollTop - p.clientHeight < 100;
         setFollowing(follow.current);
+        // A boundary can be crossed within the same virtual range (even within
+        // one tall message), where the virtualizer need not rerender itself.
+        readScrollPosition((position) => position + 1);
         if (p.scrollTop < 40 && !loading && !earlierBusy && earlier)
           loadEarlier();
       }}
@@ -5135,6 +5983,7 @@ const Conversation = memo(function Conversation({
         </Empty>
       )}
       <div
+        ref={list}
         className="transcript-virtual"
         style={{ height: totalSize, position: "relative" }}
       >
@@ -5146,12 +5995,14 @@ const Conversation = memo(function Conversation({
               data-index={row.index}
               ref={virtual.measureElement}
               className={`transcript-block block-${block.kind}`}
+              tabIndex={block.kind === "user" ? -1 : undefined}
+              aria-label={block.kind === "user" ? "Your message" : undefined}
               style={{
                 position: "absolute",
                 top: 0,
                 left: 0,
                 width: "100%",
-                transform: `translateY(${row.start}px)`,
+                transform: `translateY(${row.start - scrollMargin}px)`,
               }}
             >
               <div className="message-meta">
@@ -5249,11 +6100,24 @@ const Conversation = memo(function Conversation({
                     onExpandedChange={(open) => setOpen(block.id, open)}
                   />
                 </details>
+              ) : block.kind === "user" || block.kind === "notice" ? (
+                // A prompt the orchestrator forwarded is a notice: the files it names show as
+                // chips too, never their paths.
+                <SentMessage
+                  text={block.text}
+                  sentImage={sentImage}
+                  expanded={opened.get(block.id) ?? false}
+                  onExpandedChange={(open) => setOpen(block.id, open)}
+                />
               ) : (
                 <MessageBody
                   text={block.text}
-                  clamp={block.kind === "user" || block.kind === "notice"}
                   streaming={block.kind === "assistant" && !!block.pending}
+                  threadTags={
+                    block.kind === "assistant" && !!target?.is_orchestrator
+                  }
+                  threads={threads}
+                  turnStartedAt={block.turnStartedAt}
                   expanded={opened.get(block.id) ?? false}
                   onExpandedChange={(open) => setOpen(block.id, open)}
                 />
@@ -5274,6 +6138,7 @@ const Conversation = memo(function Conversation({
         <button
           className="jump-latest"
           onClick={() => {
+            cancelMessageJump();
             follow.current = true;
             setFollowing(true);
             parent.current?.scrollTo({
@@ -5287,6 +6152,44 @@ const Conversation = memo(function Conversation({
         </button>
       )}
     </div>
+  );
+  return (
+    <>
+      <div className="latest-user-message">
+        {previousUser || userIndexes.length ? (
+          <button
+            type="button"
+            title={previousUser ? previousUserLine : boundaryText}
+            aria-label={
+              previousUser
+                ? `Jump to your previous message: ${previousUserLine}`
+                : boundaryText
+            }
+            // Keep keyboard focus stable while a predecessor loads or at the
+            // earliest boundary. An unavailable action remains a no-op.
+            aria-disabled={!previousUser || undefined}
+            onClick={() => {
+              if (!previousUser || previousIndex == null) return;
+              follow.current = false;
+              setFollowing(false);
+              setJumpTarget(previousUser.id);
+              setSteppedFrom(previousUser.id);
+            }}
+          >
+            <ArrowUpRight size={14} aria-hidden="true" />
+            <span className="latest-user-label">You</span>
+            <span className="latest-user-preview">
+              {previousUser ? previousUserLine : boundaryText}
+            </span>
+          </button>
+        ) : (
+          <span className="latest-user-empty" role="status">
+            {boundaryText}
+          </span>
+        )}
+      </div>
+      {history}
+    </>
   );
 });
 function ContextEditor({

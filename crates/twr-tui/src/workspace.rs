@@ -816,6 +816,18 @@ impl AppState {
     /// The settings overlay's keys: ↑↓ select a row, Enter, Space or → change it, ← back, Esc
     /// (or q) closes. It takes every key.
     pub(crate) fn settings_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        // The question a row asked (full access) takes the next key: `y` runs it, anything
+        // else cancels, and the overlay stays.
+        if let Some(c) = self.view.confirm.take() {
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('y' | 'Y'))
+            {
+                self.view.status = Some(c.pending);
+                return vec![c.action];
+            }
+            self.view.status = Some("cancelled".into());
+            return Vec::new();
+        }
         let Some(s) = self.view.settings.as_mut() else {
             return Vec::new();
         };
@@ -864,6 +876,19 @@ impl AppState {
         if key == Key::Loops {
             return self.open_loop_settings(None, false);
         }
+        // The orchestrator's access, the hub's: set through it, now (full asks first).
+        if key == Key::OrchAccess {
+            let to = match self.view.orch_access.as_deref() {
+                Some("full") => "limited",
+                Some(_) => "full",
+                None => {
+                    self.view.status =
+                        Some("the hub has not said the orchestrator's access yet".into());
+                    return Vec::new();
+                }
+            };
+            return self.set_access(to);
+        }
         if let Some(agent) = &self.agent {
             self.view.status = Some(format!("this TUI runs for {agent}: it changes no setting"));
             return Vec::new();
@@ -904,6 +929,34 @@ impl AppState {
         }
         self.view.status = Some("saving the setting…".into());
         vec![Action::Setting(change)]
+    }
+
+    /// `/access <level>`, the settings' Orchestrator access row: sets the orchestrator's access
+    /// level through the hub (`orchestrator.access`: it applies now, the orchestrator
+    /// restarting with it after its current turn, and the hub keeps it in config.toml). `full`
+    /// asks `y` first, naming what it gives; `limited` goes at once. A TUI an agent runs
+    /// changes nothing.
+    pub(crate) fn set_access(&mut self, level: &str) -> Vec<Action> {
+        if let Some(agent) = &self.agent {
+            self.view.status = Some(format!("this TUI runs for {agent}: it changes no setting"));
+            return Vec::new();
+        }
+        let action = Action::OrchestratorAccess {
+            access: Some(level.to_string()),
+        };
+        let pending = format!("setting the orchestrator's access to {level}: waiting for the hub");
+        if level == "full" && self.view.orch_access.as_deref() != Some("full") {
+            self.view.confirm = Some(Confirm {
+                action,
+                prompt: crate::settings::FULL_ACCESS_PROMPT.into(),
+                pending,
+                alt: None,
+                offer: false,
+            });
+            return Vec::new();
+        }
+        self.view.status = Some(pending);
+        vec![action]
     }
 
     /// Setting `change` was written to the config file (`Ok`: its path as shown) or left
@@ -1849,6 +1902,7 @@ mod tests {
             default: "claude-code".into(),
             model: None,
             switch: false,
+            in_place: false,
             step: None,
         });
         assert!(st.picker_open());

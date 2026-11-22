@@ -74,12 +74,18 @@ impl OwnSpeaker {
     /// start: the engine's program is looked for on `PATH`. A failure to start is told on
     /// `notices`, once.
     pub fn start(speech: Option<LocalSpeech>, place: Place, notices: Notices) -> OwnSpeaker {
+        // twr's own voices are installed under the data directory.
+        let data = speech
+            .as_ref()
+            .map(|s| s.paths.root().data_dir.clone())
+            .unwrap_or_default();
+        let data2 = data.clone();
         Self::start_with(
             speech,
             place,
             notices,
-            twr_speech::engine_available,
-            |cfg| twr_speech::from_config(cfg, None),
+            move |cfg| twr_speech::engine_available(cfg, &data),
+            move |cfg| twr_speech::from_config(cfg, None, &data2),
         )
     }
 
@@ -122,10 +128,14 @@ impl OwnSpeaker {
             let opts = SpeakerOpts {
                 tty_keys_once_attached: false,
                 observe: None,
+                // A voice chosen meanwhile (the desktop app's settings, an edit of
+                // `[speech]`) is heard from the next sentence on.
+                voices_source: Some(twr_speech::config_voices(root.config_file.clone())),
                 name: speaker_name(&crate::speech::host()),
                 config,
                 voice: None,
                 rate: None,
+                voices: Default::default(),
                 state: StateStore::in_data_dir(&root.data_dir),
                 // The log: never the terminal the TUI draws on.
                 report: None,

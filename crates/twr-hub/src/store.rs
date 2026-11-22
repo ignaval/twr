@@ -1821,7 +1821,9 @@ pub(crate) fn write_line(
     Ok(())
 }
 
-/// Semantic transcript rows. Hidden streaming text never consumes a page slot.
+/// Semantic transcript rows. Hidden streaming text never consumes a page slot. Thinking is
+/// in (one row per block, logged only with `[threads] thinking`): clients show it on request,
+/// and `read_transcript` (twr-mcp) skips it.
 pub fn read_transcript_events(
     conn: &Connection,
     thread: &str,
@@ -1831,11 +1833,12 @@ pub fn read_transcript_events(
 ) -> anyhow::Result<Vec<Event>> {
     let mut st = conn.prepare_cached(&format!(
         "SELECT {EVENT_COLS} FROM events WHERE thread = ?1 AND seq > ?2 AND seq < ?3
-         AND (kind IN ('turn.started', 'turn.ended', 'agent.tool_call', 'agent.tool_result',
+         AND (kind IN ('turn.started', 'turn.ended', 'agent.thinking', 'agent.tool_call',
+              'agent.tool_result',
               'attention.raised', 'attention.resolved', 'attention.annotated', 'report.ready',
               'thread.stopped', 'thread.crashed', 'thread.mode_changed', 'thread.model_changed',
               'thread.renamed', 'conversation.update', 'thread.deleted', 'thread.restored',
-              'project.read', 'memory.changed', 'context.compacted')
+              'project.read', 'memory.changed', 'config.changed', 'context.compacted')
               OR (kind = 'task.updated' AND COALESCE(json_extract(data, '$.heartbeat'), 0) = 0)
               OR (kind = 'agent.text' AND json_extract(data, '$.final') = 1))
          ORDER BY seq LIMIT ?4"
@@ -3204,6 +3207,40 @@ mod tests {
         assert_eq!(
             search_candidates(store.conn(), Some("thread"), &final_message.id, 1).unwrap()[0].id,
             standalone.id
+        );
+    }
+
+    /// A transcript page holds the thinking and final texts, never the streamed deltas.
+    #[test]
+    fn transcript_reads_thinking_but_not_deltas() {
+        use twr_core::event::AgentThinking;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("twr.db")).unwrap();
+        let thinking = ev(
+            "t",
+            1,
+            EventBody::AgentThinking(AgentThinking {
+                text: "weighing it".into(),
+                ..Default::default()
+            }),
+        );
+        let delta = ev(
+            "t",
+            2,
+            EventBody::AgentText(AgentText {
+                text: "part".into(),
+                delta: true,
+                ..Default::default()
+            }),
+        );
+        let reply = ev("t", 3, text("done"));
+        for event in [&thinking, &delta, &reply] {
+            store.append(event, false, AppendExtras::default()).unwrap();
+        }
+        let read = read_transcript_events(store.conn(), "t", 0, i64::MAX as u64, 10).unwrap();
+        assert_eq!(
+            read.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            [thinking.id.as_str(), reply.id.as_str()]
         );
     }
 

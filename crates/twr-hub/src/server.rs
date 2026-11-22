@@ -14,11 +14,12 @@
 //! | `box.agents`        | `{box, refresh?}` (`refresh`: users only)           | `{box, online, agents}`: the box's agent CLIs (`local`: the hub's own), probed again first with `refresh` (`hub::box_agents`); the orchestrator and agents see `runtime, found, login` of each |
 //! | `hub.shutdown`      | -                                                   | `{ok: true}` (then the hub stops) |
 //! | `config.show`       | -                                                   | the configuration the hub loaded, from an allowlist (`hub::config_view`): no token, `env` value, preset command line, `ssh` destination or TLS file; `env` tables as `env_names` (not for agents) |
+//! | `config.set`        | `{key, value}` (`key` dotted, `value` a boolean, number or string; a device needs `admin`; not for agents) | `{status: "applied", key, value, before, effect}`, or for the orchestrator and a key that goes on the confirm card `{status: "needs_confirmation", key, value, before, effect, message}`: one key of `config.toml` set, its comments and the rest of the file kept, and `config.changed` recorded (`hub::config_set`). The orchestrator's only in a turn of the user's latest message (`relay_forbidden` otherwise); boxes, `hub.tls`, `env` entries, command lines and secret-looking values are refused for everyone (`bad_request`) |
 //! | `thread.spawn` | `{operation_id, request: <thread.new params>, prompt?}` | durable operation (pending/complete/error) |
 //! | `thread.spawn_status` | `{operation_id}` | durable operation |
 //! | `conversation.search` | `{query, thread?, before?:event_id, limit?}` | literal case-insensitive search across messages, tool output and decisions, including archive; `{items, next, more, workspace}` |
 //! | `thread.event_context` | `{thread, event_id, before?, after?, query?}` | exact event plus nearby events in its recorded workspace/thread, including archive |
-//! | `thread.transcript` | `{thread, turn?, since_seq?, limit?}` | filtered semantic events, default latest turn |
+//! | `thread.transcript` | `{thread, turn?, since_seq?, limit?}` | filtered semantic events (reasoning included, streamed deltas not), default latest turn |
 //! | `thread.new`        | `{project, runtime?, name?, mode?, model?, effort?, aliases?, box?, worktree?, no_worktree?, base?}` | thread object |
 //! | `thread.list`       | -                                                   | `[thread object]` |
 //! | `thread.get`        | `{thread}`                                          | thread object + `attention: [item]` |
@@ -34,7 +35,7 @@
 //! | `summary.thread`    | `{thread, models?, every_secs}` (users only)        | `{thread, summary, basis, runtime, model, cached, reason?, next_after_secs?, stats}`: one line on where a worker thread stands, from its state, activity and routine updates, by the small model a suggestion uses (`hub::summary`, `twr_core::proto::SummaryThreadResult`) |
 //! | `thread.stop`       | `{thread}`                                          | `{thread, stopping, box_offline?, dropped_prompts}` |
 //! | `thread.set_mode`   | `{thread, mode}`                                    | `{thread, thread_name, mode, previous, changed, applies?, message?, dispatch_error?}` (the orchestrator: or `{status: "needs_confirmation", ...}`) |
-//! | `thread.set_model`  | `{thread, runtime?, model?, effort?}` (at least one; blank or `default` = the runtime's default; with another `runtime`, one left out is that runtime's default) | `{thread, thread_name, runtime, previous_runtime, runtime_changed, model, effort, previous_model, previous_effort, changed, applies?, message?, dispatch_error?}` |
+//! | `thread.set_model`  | `{thread, runtime?, account?, outside_pin?, model?, effort?}` (at least one; blank or `default` = the runtime's default; with another `runtime`, one left out is that runtime's default; the orchestrator's thread: the user's model and effort only, changed in place, `hub::model`) | `{thread, thread_name, runtime, previous_runtime, runtime_changed, model, effort, previous_model, previous_effort, changed, applies?, message?, dispatch_error?}` |
 //! | `thread.rename`     | `{thread, name}` (a worker thread; the name free and valid as for `thread.new`) | `{thread, thread_name, previous, changed, worktree, branch, message}` (`thread.renamed`; the worktree and branch keep their names) |
 //! | `thread.delete`     | `{thread}` or `{threads: [string]}` (one to 32)      | `{status: "needs_confirmation", threads: [{thread, thread_name, pending, worktree?, branch?, dirty_files?, hidden_changes?, ignored?, ignored_entries?, head_only_commits?, branch_only_commits?, checkout?, checkout_only_commits?, shared?, existing_branch?, worktree_missing?, worktree_unchecked?}], thread, thread_name, attn_id, revision, summary, options, existing, replaces?, message}` (a delete card for all of them; nothing is deleted until the user confirms it; `thread` / `thread_name`: the first thread's) |
 //! | `trash.list`        | -                                                   | `{items: [{item, short, thread, thread_name, project, box, deleted_at, deleted_at_ms, purge_at, purge_at_ms, bytes, size, losses, worktree, branch, dir, incomplete?, kept?, box_offline?}], keep_days, bytes, size, unavailable: [{box, error}], message}` (oldest first) |
@@ -42,9 +43,10 @@
 //! | `trash.restore`     | `{item, as?}` (users only)                          | `{thread, thread_name, previous_name, item, box, worktree, branch, checkout?, notes, skipped, session_id, message}` |
 //! | `log.compact`       | `{vacuum?, drop_checkpoints?}` (users only)         | `{rows, bytes, kinds, purged_threads, turns, blobs, blob_bytes, archived, batches, longest_batch_ms, plan_ms, copy_ms, delete_ms, sweep_ms, total_ms, freed_pages, vacuum?: {ms, before, after, incremental_set}, checkpoints_dropped, skipped?}`: the agent events `[log]` lets go moved to `archive.db` now (`hub::prune`) |
 //! | `log.stats`         | - (users only)                                      | `{db, archive, checkpoints, backlog: {head, full, compacted}, retention_days, archive_on, next}`: sizes of the log and what the next compaction moves (`hub::prune`) |
-//! | `orchestrator.show` | -                                                   | `{available, runtime, model, account, account_shown, account_removed?, thread, name, status, live, configured: {runtime, model, account}, retired, runtimes}` (`account_removed`: true while the current orchestrator's account is removed) |
+//! | `orchestrator.show` | -                                                   | `{available, runtime, model, model_actual, effort, account, account_shown, account_removed?, thread, name, status, live, configured: {runtime, model, account}, access, running_access, retired, runtimes}` (`account_removed`: true while the current orchestrator's account is removed; `access`: its access level as last set, `limited` or `full`; `running_access`: the level its live runtime started with, null when none runs, another one only while it restarts with `access` after its turn) |
 //! | `orchestrator.reset` | - (users only)                                      | Fresh session on the current runtime/model, no handoff; same result as `orchestrator.use` with `handoff: null` |
-//! | `orchestrator.use`  | `{runtime, model?, summary?, wait_secs?}` (users only) | `{thread, name, runtime, model, previous: {thread, name, runtime, model, stopping, dropped_prompts} \| null, started, start_error?, handoff: {turn, bytes, summary, summary_note, exchanges, dropped_exchanges} \| null}` |
+//! | `orchestrator.access` | `{access?: "limited" \| "full"}` (users only; a device needs `admin`) | without `access`: `{access}`; with it: `{access, previous, persisted, persist_error?, restart: "now" \| "after_turn" \| "none"}`: the orchestrator's access level, applied at once (its runtime restarts on its session, after its running turn) and written to `config.toml` (`hub::orch_access`) |
+//! | `orchestrator.use`  | `{runtime, model?, effort?, summary?, wait_secs?}` (users only) | `{thread, name, runtime, model, model_actual, effort, previous: {thread, name, runtime, model, model_actual, effort, stopping, dropped_prompts, dropped_messages, dropped_messages_omitted} \| null, started, start_error?, handoff: {turn, bytes, summary, summary_note, exchanges, dropped_exchanges} \| null}` |
 //! | `thread.park`       | `{thread, keep?, force?}`                           | `{thread, parked: true, worktree?, worktree_removed, kept_dirty, dirty_files?, kept_reason?, kept, worktree_missing?, worktree_error?, pending}` |
 //! | `thread.resume`     | `{thread}`                                          | `{thread, resumed: true, worktree?, worktree_recreated, turn, pending}` |
 //! | `attention.respond` | `{attn_id, revision?, answer: "allow" \| {decision, message?}, message?}` or `{attn_id, revision?, option_index, message?}` | the `attention.resolved` event (the orchestrator: or `{status: "needs_confirmation", attn_id, answer, message}`) |
@@ -131,7 +133,8 @@
 //! process that both left its parent (reparented to init) and exec'd again without the marker
 //! is not recognized, nor is a command a daemon of the user's that already runs (tmux, screen,
 //! `systemd-run --user`, an IDE server) starts for an agent.
-//! `orchestrator.use` switches the orchestrator to another runtime (and model): a new
+//! `orchestrator.use` switches the orchestrator to another runtime (and model and reasoning
+//! effort: one the runtime takes, unset or `default` for its own): a new
 //! orchestrator thread with a new session (no conversation moves between runtimes); the
 //! current one is stopped and retired (`hub::orch`). The new one starts with a handoff turn
 //! (`hub::handoff`): the previous one's own summary, asked for first unless `summary: false`
@@ -220,6 +223,9 @@
 //! (`hub::switch`): the same thread, worktree and branch, a new session of the new runtime
 //! from its next turn, whose prompt carries a handoff of what the previous session did. The
 //! orchestrator may only name an agent runtime or a configured preset (as for `thread.new`).
+//! On the orchestrator's own thread it changes the model and effort in place (the user's call
+//! only; its runtime restarts on its session when free): another runtime or account is
+//! `orchestrator.use`.
 //! `thread.delete` deletes nothing itself: it raises one delete card on the `hub` thread for
 //! the threads it names, which only the user answers (`hub::delete`); `Delete` deletes them
 //! one after another: stops the runtime, moves the worktree (also with uncommitted changes;
@@ -723,6 +729,7 @@ pub const METHODS: &[&str] = &[
     "hub.glance",
     "hub.shutdown",
     "config.show",
+    "config.set",
     "runner.manage",
     "runner.status",
     "runner.connect",
@@ -786,6 +793,7 @@ pub const METHODS: &[&str] = &[
     "orchestrator.show",
     "orchestrator.reset",
     "orchestrator.use",
+    "orchestrator.access",
     "orchestrator.watch",
     "orchestrator.unwatch",
     "orchestrator.watches",
@@ -834,6 +842,9 @@ pub const ORCHESTRATOR_METHODS: &[&str] = &[
     "hub.glance",
     "box.agents",
     "config.show",
+    // In a turn of the user's latest message only; most keys go on the confirm card
+    // (`hub::config_set`).
+    "config.set",
     "thread.new",
     "thread.spawn",
     "thread.spawn_status",
@@ -891,6 +902,7 @@ pub const ORCHESTRATOR_METHODS: &[&str] = &[
 /// as having acted, and is refused once the user took back that turn's message
 /// ([`Hub::orchestrator_acts`]).
 const ORCHESTRATOR_CHANGES: &[&str] = &[
+    "config.set",
     "thread.new",
     "thread.spawn",
     "thread.send",
@@ -1324,16 +1336,49 @@ async fn connection(
                     break;
                 }
             }
-            "thread.pull" | "thread.new" | "thread.park" | "thread.resume" | "thread.delete"
-            | "thread.trim" | "usage.threads" | "context.read" | "context.set"
-            | "orchestrator.use" | "orchestrator.reset" | "trash.list" | "trash.empty"
-            | "trash.restore" | "log.compact" | "log.stats" | "project.files" | "project.read"
-            | "project.search" | "memory.list" | "memory.read" | "box.add" | "box.install"
-            | "box.restart" | "runner.manage" | "runner.status" | "runner.connect"
-            | "runner.recover" | "runner.revoke" | "runner.forget" | "box.projects"
-            | "box.token" | "account.status" | "account.remove" | "thread.set_model"
-            | "speech.request" | "speech.control" | "loop.request" | "loop.setup.update"
-            | "loop.settings.get" | "loop.settings.set" => {
+            "thread.pull"
+            | "thread.new"
+            | "thread.park"
+            | "thread.resume"
+            | "thread.delete"
+            | "thread.trim"
+            | "usage.threads"
+            | "context.read"
+            | "context.set"
+            | "orchestrator.use"
+            | "orchestrator.reset"
+            | "orchestrator.access"
+            | "trash.list"
+            | "trash.empty"
+            | "trash.restore"
+            | "log.compact"
+            | "log.stats"
+            | "project.files"
+            | "project.read"
+            | "project.search"
+            | "memory.list"
+            | "memory.read"
+            | "box.add"
+            | "box.install"
+            | "box.restart"
+            | "runner.manage"
+            | "runner.status"
+            | "runner.connect"
+            | "runner.recover"
+            | "runner.revoke"
+            | "runner.forget"
+            | "box.projects"
+            | "box.token"
+            | "account.status"
+            | "account.remove"
+            | "thread.set_model"
+            | "speech.request"
+            | "speech.control"
+            | "loop.request"
+            | "loop.setup.update"
+            | "loop.settings.get"
+            | "loop.settings.set"
+            | "config.set" => {
                 let result =
                     call_async(&hub, &caller, &req.method, req.params, received.as_ref()).await;
                 let resp = match result {
@@ -1475,6 +1520,9 @@ struct UseOrchestratorParams {
     runtime: String,
     #[serde(default)]
     model: Option<String>,
+    /// Reasoning effort for the new orchestrator (`default`: the runtime's own).
+    #[serde(default)]
+    effort: Option<String>,
     /// Ask the previous orchestrator for a handoff summary (default true).
     #[serde(default = "yes")]
     summary: bool,
@@ -2504,6 +2552,12 @@ async fn call_async(
         // A move looks the thread's project up first when its log does not say it, as git
         // has it (`hub::thread_account`).
         "account.remove" => hub.account_remove(params(p)?, caller).await,
+        // The file is read and written off the async threads (`hub::config_set`).
+        "config.set" => {
+            let p: crate::hub::config_set::ConfigSetParams = params(p)?;
+            hub.config_set_bound(&p.key, p.value, caller, received)
+                .await
+        }
         "thread.set_model" => {
             let p: SetModelParams = params(p)?;
             let req = crate::hub::ModelRequest {
@@ -2525,11 +2579,17 @@ async fn call_async(
             let _: EmptyParams = params(p)?;
             hub.reset_orchestrator(caller).await
         }
+        // Reads or sets the orchestrator's access level (`hub::orch_access`).
+        "orchestrator.access" => {
+            let p: crate::hub::orch_access::AccessParams = params(p)?;
+            hub.orchestrator_access(p.access.as_deref(), caller).await
+        }
         // Waits for the previous orchestrator's handoff summary (`hub::handoff`).
         "orchestrator.use" => {
             let p: UseOrchestratorParams = params(p)?;
             let mut opts = SwitchOptions {
                 summary: p.summary,
+                effort: p.effort,
                 ..SwitchOptions::default()
             };
             if let Some(w) = p.wait_secs {

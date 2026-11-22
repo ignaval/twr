@@ -461,7 +461,6 @@ try {
     .filter({ hasText: "packaged" })
     .first()
     .click();
-  await page.getByRole("button", { name: "Talk to this thread" }).click();
   await page
     .getByRole("textbox", { name: "Message packaged directly" })
     .fill("PACKAGED_AGENT_OK");
@@ -483,12 +482,15 @@ try {
     ),
   });
   const attachment = page
-    .locator(".attachment-item")
+    .locator(".composer-attachments li")
     .filter({ hasText: "preview.txt" });
-  await attachment.getByText("Ready to send", { exact: false }).waitFor();
-  await attachment.getByText("Preview text", { exact: false }).click();
+  await attachment.and(page.locator('[data-phase="ready"]')).waitFor();
+  await attachment
+    .getByRole("button", { name: "Show preview.txt", exact: true })
+    .click();
+  const preview = page.getByRole("dialog", { name: "preview.txt" });
   assert(
-    (await attachment.locator("pre").innerText()).includes(
+    (await preview.locator("pre").innerText()).includes(
       "<script>window.unsafePreview=true</script>",
     ),
   );
@@ -497,8 +499,12 @@ try {
     undefined,
     "Text previews must remain inert",
   );
+  await preview.getByRole("button", { name: "Done", exact: true }).click();
+  // The file shows in the message box, never as a path, and never in the draft.
+  assert.equal(await directComposer.inputValue(), "");
   assert(
-    (await directComposer.inputValue()).includes("Uploaded file: preview.txt"),
+    !(await page.locator("form.composer").innerText()).includes(".twr-uploads"),
+    "The message box must not show an attachment's path",
   );
   assert.equal(
     await page.locator(".block-assistant").count(),
@@ -506,9 +512,9 @@ try {
     "Selecting a file must not send a prompt",
   );
   await attachment
-    .getByRole("button", { name: "Dismiss", exact: true })
+    .getByRole("button", { name: "Remove preview.txt", exact: true })
     .click();
-  await directComposer.fill("");
+  await attachment.waitFor({ state: "detached" });
   console.log(
     "PASS: packaged attachment preview is inert, progresses to ready, and waits for explicit send",
   );
@@ -616,8 +622,10 @@ try {
       .getByRole("button", { name: "Settings", exact: true })
       .first()
       .click();
+    await page.getByRole("tab", { name: "General", exact: true }).click();
     await page.getByRole("heading", { name: "Application" }).waitFor();
     await page.getByRole("switch", { name: "Launch at login" }).waitFor();
+    await page.getByRole("tab", { name: "Advanced", exact: true }).click();
     await page.getByRole("heading", { name: "Diagnostics" }).waitFor();
     console.log(
       `PASS: packaged tray settings, background close/reopen, redacted diagnostics and ad hoc update policy${signing === "adhoc" ? "" : " (QA copy of a Developer ID build)"}`,

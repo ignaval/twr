@@ -1,5 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { Markdown } from "./ui";
+import { ThreadMessage } from "./ThreadMessage";
+import type { Thread } from "./types";
 
 /** How often a still-streaming reply is parsed as Markdown again: each parse covers the
  * whole reply, so longer replies are parsed less often (250 ms, up to once a second). */
@@ -38,6 +40,9 @@ export function MessageBody({
   mono = false,
   clamp = true,
   streaming = false,
+  threadTags = false,
+  threads,
+  turnStartedAt,
   expanded: controlled,
   onExpandedChange,
 }: {
@@ -45,6 +50,11 @@ export function MessageBody({
   mono?: boolean;
   clamp?: boolean;
   streaming?: boolean;
+  /** Only orchestrator assistant replies use the thread section protocol. */
+  threadTags?: boolean;
+  threads?: Thread[];
+  /** Conservative identity cutoff from the matching turn.started, also present in filtered history. */
+  turnStartedAt?: string;
   expanded?: boolean;
   onExpandedChange?: (expanded: boolean) => void;
 }) {
@@ -81,7 +91,18 @@ export function MessageBody({
   return (
     <>
       <div className={`message-body ${collapsed ? "clamped" : ""}`} id={id}>
-        {mono ? <pre>{content}</pre> : <Markdown text={content} />}
+        {mono ? (
+          <pre>{content}</pre>
+        ) : threadTags ? (
+          <ThreadMessage
+            text={content}
+            streaming={streaming}
+            threads={threads}
+            turnStartedAt={turnStartedAt}
+          />
+        ) : (
+          <Markdown text={content} />
+        )}
       </div>
       {long && (
         <button

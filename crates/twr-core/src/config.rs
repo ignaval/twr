@@ -16,6 +16,8 @@
 //! autostart = false
 //! model = "sonnet"          # unset = threads.model, else the runtime's default
 //! account = "work"          # the first orchestrator's account; unset = the policy's default
+//! access = "limited"        # limited (default): only twr's tools and web search; "full": every
+//!                           # tool, like a worker in bypassPermissions (read when it starts)
 //!
 //! [hub]
 //! socket = "/run/user/1000/twr/hub.sock"   # defaults to the resolved path
@@ -355,6 +357,37 @@ pub struct OrchestratorConfig {
     /// them that can be used); `None`: the policy's default, else the native account. `twr
     /// orchestrator use <runtime>:<account>` switches it (the switch is kept in the log).
     pub account: Option<Pin>,
+    /// What the orchestrator's own tools may do ([`OrchestratorAccess`]; default `limited`).
+    /// The level the hub starts with; `orchestrator.access` changes it while the hub runs (and
+    /// writes it back here), the orchestrator's runtime restarting with it after its turn
+    /// (`twr-hub`'s `hub::orch_access`).
+    pub access: OrchestratorAccess,
+}
+
+/// `[orchestrator] access`: what the orchestrator's runtime may do with its own tools, besides
+/// twr's (`twr-hub`'s `hub::orch::restrict`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestratorAccess {
+    /// twr's tools and a web search only: no shell, no file tools (Claude Code keeps Read,
+    /// Write and Edit for its memory directory), none of the user's own MCP servers, and a
+    /// mode that never runs anything else unasked.
+    #[default]
+    Limited,
+    /// Every tool, like a worker in `bypassPermissions`: its runtime's shell, files and web,
+    /// and the user's own MCP servers, plugins and apps, in every turn. A generic ACP agent is
+    /// unchanged (ACP cannot take its tools away, nor give it more than it has).
+    Full,
+}
+
+impl OrchestratorAccess {
+    /// The config spelling: `limited`, `full`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OrchestratorAccess::Limited => "limited",
+            OrchestratorAccess::Full => "full",
+        }
+    }
 }
 
 impl Default for OrchestratorConfig {
@@ -369,6 +402,7 @@ impl Default for OrchestratorConfig {
             read_deny: Vec::new(),
             memory: true,
             account: None,
+            access: OrchestratorAccess::Limited,
         }
     }
 }
@@ -599,8 +633,17 @@ pub enum SpeechLocal {
 pub struct SpeechConfig {
     /// What speaks ([`SpeechEngine`]).
     pub engine: SpeechEngine,
-    /// The engine's voice; empty: the system's default.
+    /// The engine's voice; empty: the system's default. A local neural voice is named
+    /// `<model>/<voice>` (`kokoro/af_heart`, `twr voices list`): `auto` speaks it with twr's
+    /// own engine and any other voice with the system's.
     pub voice: String,
+    /// A voice per language (`{ en = "Ava (Premium)", es = "kokoro/ef_dora" }`), as
+    /// `twr_core::speech::LANGUAGES` names them: a message in one of them is read with its
+    /// voice, any other with `voice`.
+    pub voices: BTreeMap<String, String>,
+    /// The `espeak-ng` program that spells words out for the Kokoro and Piper voices; empty:
+    /// `espeak-ng` on `PATH`.
+    pub espeak: String,
     /// Words per minute; 0: the engine's default.
     pub rate: u32,
     /// Volume, 0.0 to 1.0, where the engine has one.
@@ -630,6 +673,8 @@ impl Default for SpeechConfig {
         SpeechConfig {
             engine: SpeechEngine::Auto,
             voice: String::new(),
+            voices: BTreeMap::new(),
+            espeak: String::new(),
             rate: 0,
             volume: 1.0,
             read: crate::speech::default_read(),
@@ -676,6 +721,18 @@ impl SpeechConfig {
             .flatten()
         {
             anyhow::bail!(e);
+        }
+        for (lang, voice) in &self.voices {
+            if !crate::speech::LANGUAGES.contains(&lang.as_str()) {
+                anyhow::bail!(
+                    "speech.voices: {lang:?} is not a language twr tells apart ({})",
+                    crate::speech::LANGUAGES.join(", ")
+                );
+            }
+            if let Some(e) = crate::speech::name_error(&format!("speech.voices.{lang}"), voice, 128)
+            {
+                anyhow::bail!(e);
+            }
         }
         Ok(())
     }
@@ -2856,7 +2913,16 @@ mod tests {
         assert_eq!(c.speech.read.len(), 3);
         let c = Config::from_toml_str("[speech]\nread = [\"attention\"]\n").unwrap();
         assert_eq!(c.speech.read, vec![crate::speech::ReadKind::Attention]);
+        let c = Config::from_toml_str(
+            "[speech]\nvoice = \"Ava (Premium)\"\nespeak = \"/opt/homebrew/bin/espeak-ng\"\n\
+             voices = { en = \"Ava (Premium)\", es = \"kokoro/ef_dora\" }\n",
+        )
+        .unwrap();
+        assert_eq!(c.speech.voices["es"], "kokoro/ef_dora");
+        assert_eq!(c.speech.espeak, "/opt/homebrew/bin/espeak-ng");
         for bad in [
+            "[speech]\nvoices = { fr = \"Thomas\" }\n",
+            "[speech]\nvoices = { es = \"\" }\n",
             "[speech]\nengine = \"command\"\n",
             "[speech]\nvolume = 2.0\n",
             "[speech]\nrate = 20\n",
@@ -3610,6 +3676,26 @@ account = "gpu-work"
             let c = Config::from_toml_str(&format!("[orchestrator]\n{toml}")).unwrap();
             let want = Pin(want.into_iter().map(str::to_string).collect());
             assert_eq!(c.orchestrator_account(), Some(&want), "{toml}");
+        }
+    }
+
+    /// `[orchestrator] access` is `limited` unless the config says `full`; anything else is
+    /// refused.
+    #[test]
+    fn the_orchestrators_access_is_limited_by_default() {
+        let d = Config::from_toml_str("").unwrap();
+        assert_eq!(d.orchestrator.access, OrchestratorAccess::Limited);
+        for (toml, want) in [
+            ("access = \"limited\"", OrchestratorAccess::Limited),
+            ("access = \"full\"", OrchestratorAccess::Full),
+        ] {
+            let c = Config::from_toml_str(&format!("[orchestrator]\n{toml}")).unwrap();
+            assert_eq!(c.orchestrator.access, want, "{toml}");
+            assert_eq!(format!("access = \"{}\"", want.as_str()), toml);
+        }
+        for bad in ["\"Full\"", "\"bypass\"", "true"] {
+            let err = Config::from_toml_str(&format!("[orchestrator]\naccess = {bad}"));
+            assert!(err.is_err(), "{bad}");
         }
     }
 

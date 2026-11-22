@@ -1084,6 +1084,7 @@ fn open_codex() -> codex::Translator {
                 "sandbox": "workspace-write"}),
             mode_note: None,
             added_instructions: None,
+            keep_own_mcp: false,
         },
     );
     tr.start();

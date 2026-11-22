@@ -123,6 +123,8 @@ struct Server {
     observers: Mutex<std::collections::HashSet<String>>,
     receipts: remote::receipts::Receipts,
     receipt_waiters: Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<Value>>>>,
+    /// twr's natural voices, made here for phones that read aloud with one.
+    renderer: Arc<remote::voice::Renderer>,
 }
 type OrderedInput = (Call, mpsc::Sender<Value>, u64);
 fn stamp(mut event: Value, generation: u64) -> Value {
@@ -790,6 +792,7 @@ impl Server {
             ),
             connections: remote::limits::Connections::new(limits),
             terminal_slots: Arc::new(Semaphore::new(8)),
+            renderer: remote::voice::Renderer::new(binary.clone()),
             binary,
             companion,
             owner: Mutex::new(owner),
@@ -1666,11 +1669,61 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
                     .control(op, || self.voice_start(server, &workspace))
                     .await
             }
+            // The phone's read-aloud voices: its choice per language, and twr's natural voices
+            // this machine can make for it.
+            "voice-voices" => {
+                remote::voice::allowed(&self.device)?;
+                let chosen = self.voice_store(&workspace)?.load()?.voices;
+                let natural = match remote::voice::natural_listing(&server.binary).await {
+                    Ok(listing) => listing,
+                    Err(e) => json!({"voices": [], "models": [], "error": format!("{e:#}")}),
+                };
+                Ok(json!({
+                    "by_language": chosen,
+                    "natural": natural,
+                    "can_install": self.device.scopes.iter().any(|s| s == "operate"),
+                }))
+            }
+            "voice-select" => {
+                remote::voice::allowed(&self.device)?;
+                let lang = p["lang"].as_str().context("Language required")?;
+                let voice = p["voice"].as_str().filter(|v| !v.is_empty());
+                let chosen = remote::voice::select(&self.voice_store(&workspace)?, lang, voice)?;
+                Ok(json!({"by_language": chosen}))
+            }
+            // Downloads a model onto this machine: as much as `operate` may change here.
+            "voice-install" => {
+                remote::voice::allowed(&self.device)?;
+                anyhow::ensure!(
+                    self.device.scopes.iter().any(|s| s == "operate"),
+                    "Downloading a voice on the hub's computer requires operate permission"
+                );
+                let model = p["model"].as_str().context("Model required")?;
+                self.voice.start_install(server.binary.clone(), model)?;
+                Ok(json!({"started": true}))
+            }
+            "voice-preview" => {
+                remote::voice::allowed(&self.device)?;
+                let voice = p["voice"].as_str().context("Voice required")?;
+                let lang = p["lang"].as_str().unwrap_or("en");
+                let id = self.voice.preview(&server.renderer, voice, lang)?;
+                Ok(json!({"id": id}))
+            }
+            "voice-preview-stop" => {
+                self.voice.stop_preview();
+                Ok(Value::Null)
+            }
             _ => anyhow::bail!("Unsupported mobile operation"),
         }
     }
 }
 impl Session {
+    /// The state file of this device's speaker (its voices too).
+    fn voice_store(&self, workspace: &str) -> Result<twr_speech::StateStore> {
+        let paths = twr_core::paths::Paths::from_env_in(Some(workspace))?;
+        remote::voice::state_store(&paths.root().data_dir.join("mobile"), &self.device.id)
+    }
+
     /// The phone's speaker for `workspace`: this machine's hub of it, the device's own state
     /// file, `[speech]`'s choices of what is read and attention announcements (its engine
     /// settings are this machine's and play no part: the phone speaks). It ends once the device is revoked or loses `read`.
@@ -1696,6 +1749,7 @@ impl Session {
                 workspaces: twr_speech::Workspaces::One(workspace.to_owned()),
             },
             config,
+            renderer: Some(server.renderer.clone()),
             allowed: Arc::new(move || {
                 !auth.current(&device).revoked() && remote::voice::allowed(&device).is_ok()
             }),

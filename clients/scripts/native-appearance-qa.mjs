@@ -144,6 +144,7 @@ try {
     .locator(".sidebar-footer")
     .getByRole("button", { name: "Settings", exact: true })
     .click();
+  await page.getByRole("tab", { name: "General", exact: true }).click();
   await page.getByRole("button", { name: "Light", exact: true }).click();
   await verify(page, "light");
   await page.screenshot({

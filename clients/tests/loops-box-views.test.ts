@@ -187,8 +187,12 @@ describe("the inspector's Loops section on a box thread", () => {
     for (const name of ["Review loop", "Implementation loop…"]) {
       const button = m.find(".loop-starts button", name)!;
       expect(button.getAttribute("disabled")).not.toBeNull();
-      expect(button.getAttribute("aria-describedby")).toBe(
-        why!.getAttribute("id"),
+      // Described by what it does, then by why it waits.
+      const described = button.getAttribute("aria-describedby")!.split(" ");
+      expect(described).toHaveLength(2);
+      expect(described[1]).toBe(why!.getAttribute("id"));
+      expect(m.find(`#${described[0]}`)?.textContent).toMatch(
+        name === "Review loop" ? /^Review loop: / : /^Implementation loop: /,
       );
     }
     await m.unmount();
@@ -211,31 +215,51 @@ describe("the inspector's Loops section on a box thread", () => {
   });
 });
 
-describe("Send as implementation loop that can't be made", () => {
-  it("takes the focus to its panel, which says why, and Escape closes it", async () => {
-    const m = await mount(
+describe("Run as loop that can't be used", () => {
+  const sendAsLoop = (on: boolean, changed: boolean[]) =>
+    mount(
       (v, h) =>
         h(v.SendAsLoop, {
           thread: boxThread(),
           phone: false,
           busy: false,
-          onSend: () => {},
+          on,
+          onChange: (next: boolean) => changed.push(next),
         }),
       async () => ({}),
     );
-    const opener = m.find('button[aria-label="More ways to send"]')!;
-    await m.click(opener);
-    const panel = m.find(".send-loop-panel")!;
-    const choice = m.find("button", "Send as implementation loop")!;
-    expect(choice.getAttribute("disabled")).not.toBeNull();
-    expect(m.document.activeElement).toBe(panel);
-    const said = m.find(`#${panel.getAttribute("aria-describedby")}`);
+
+  it("can't be turned on, and says why", async () => {
+    const changed: boolean[] = [];
+    const m = await sendAsLoop(false, changed);
+    const toggle = m.find('button[role="switch"]', "Run as loop")!;
+    expect(toggle.getAttribute("disabled")).not.toBeNull();
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    const said = m.find(`#${toggle.getAttribute("aria-describedby")}`);
     expect(said?.textContent).toBe(
       "Box devbox is away: a loop can start once it is back.",
     );
-    await m.key(panel, "Escape");
-    expect(m.find(".send-loop-panel")).toBeUndefined();
-    expect(m.document.activeElement).toBe(opener);
+    expect(toggle.getAttribute("title")).toBe(said?.textContent);
+    await m.click(toggle);
+    expect(changed).toEqual([]);
+    await m.unmount();
+  });
+
+  it("stays on when turned on before the box went away, and can be turned off", async () => {
+    const changed: boolean[] = [];
+    const m = await sendAsLoop(true, changed);
+    const toggle = m.find('button[role="switch"]', "Run as loop")!;
+    // Never off by itself: Send would then send the task as an ordinary message.
+    expect(changed).toEqual([]);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    expect(toggle.getAttribute("disabled")).toBeNull();
+    expect(
+      m.find(`#${toggle.getAttribute("aria-describedby")}`)?.textContent,
+    ).toBe(
+      "Box devbox is away: a loop can start once it is back. Send waits until a loop can start; turn this off to send your message as an ordinary one.",
+    );
+    await m.click(toggle);
+    expect(changed).toEqual([false]);
     await m.unmount();
   });
 });
@@ -393,5 +417,74 @@ describe("a setup card shown in two places on a phone", () => {
         ?.getAttribute("aria-expanded"),
     ).toBe("false");
     await act(async () => root.unmount());
+  });
+});
+
+describe("the settings editor's preset and Customize", () => {
+  const preset = {
+    id: "opus",
+    label: "Opus",
+    implementer: {
+      runtime: "claude-code",
+      model: "claude-opus-5-5",
+      effort: "xhigh",
+    },
+    workers: { model: "claude-opus-5-5", effort: "medium" },
+    reviewer: { runtime: "claude-code", model: "claude-opus-5-5" },
+  };
+  const editor = (settings: Json, presets: Json[] = [preset]) =>
+    mount(
+      (v, h) =>
+        h(v.LoopSettingsForm, { source: { kind: "saved" }, inline: true }),
+      async (method) => {
+        if (method === "loop.settings.get")
+          return {
+            settings,
+            source: "workspace",
+            first_card: settings,
+            projects: [],
+            presets,
+            profiles: ["low", "medium", "high"],
+            runtimes,
+            warnings: [],
+            problems: [],
+          };
+        throw new Error(`unexpected ${method}`);
+      },
+    );
+
+  it("shows the preset alone when the settings are one, the rest behind Customize", async () => {
+    const m = await editor({
+      profile: "low",
+      implementer: preset.implementer,
+      workers: preset.workers,
+      reviewer: preset.reviewer,
+    });
+    const toggle = m.find("button", "Customize")!;
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    const region = m.find(`#${toggle.getAttribute("aria-controls")}`)!;
+    expect(region.hasAttribute("hidden")).toBe(true);
+    expect(region.textContent).toContain("Implementer");
+    expect(m.find(".loop-customize-summary")?.textContent).toContain(
+      "reviewed by",
+    );
+    await m.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(region.hasAttribute("hidden")).toBe(false);
+    await m.unmount();
+  });
+
+  it("opens Customize when the settings match no preset", async () => {
+    const m = await editor({
+      profile: "low",
+      implementer: null,
+      workers: preset.workers,
+      reviewer: preset.reviewer,
+    });
+    expect(m.find("button", "Customize")!.getAttribute("aria-expanded")).toBe(
+      "true",
+    );
+    expect(m.find(".loop-customize-summary")).toBeUndefined();
+    await m.unmount();
   });
 });

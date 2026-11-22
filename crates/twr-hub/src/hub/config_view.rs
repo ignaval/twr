@@ -77,6 +77,7 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
         read_deny,
         memory,
         account: orch_account,
+        access: orch_access,
     } = orchestrator;
     let HubConfig {
         socket,
@@ -302,6 +303,7 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
             "read_deny": read_deny,
             "memory": memory,
             "account": orch_account,
+            "access": orch_access.as_str(),
         },
         "threads": {
             "default_mode": default_mode,

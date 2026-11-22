@@ -52,6 +52,7 @@ import { parseLoginEnvironment, runLoginShell } from "./login-env";
 import { discoverCatalog } from "./catalog";
 import { AppServices } from "./app-services";
 import { DesktopVoice } from "./voice";
+import { DesktopVoices } from "./voices";
 import { RendererRecovery } from "./crash-recovery";
 import { testAutomation } from "./automation";
 import { contextMenuTemplate } from "./context-menu";
@@ -61,6 +62,7 @@ import {
   windowStateSchema,
   type RestoredWindow,
 } from "./window-state";
+import { SaveBeforeClose } from "./save-before-close";
 
 if (process.platform === "linux" && !app.commandLine.hasSwitch("class"))
   app.commandLine.appendSwitch("class", "tools.twr.desktop");
@@ -100,6 +102,13 @@ let workspace = process.env.TWR_WORKSPACE || "default";
 let binaries: { twr: string; bridge: string; gateway: string };
 let quitting = false;
 let quitRequested = false;
+// The page saves its drafts before the window closes or the app quits.
+const saveBeforeClose = new SaveBeforeClose((id) => {
+  if (!window || window.isDestroyed() || window.webContents.isCrashed())
+    return false;
+  window.webContents.send("twr:app-save-now", id);
+  return true;
+});
 let connectTail: Promise<any> = Promise.resolve();
 let loginEnv: NodeJS.ProcessEnv = { ...process.env };
 let workspaceReady = false;
@@ -110,6 +119,7 @@ let remoteTransport: DesktopTransport;
 let services: AppServices | undefined;
 let hubVersion: string | undefined;
 let voice: DesktopVoice | undefined;
+let voices: DesktopVoices | undefined;
 // The microphone is granted only after the user turned voice mode on (`voice-arm`), and only
 // for audio, to the app's own page.
 let microphoneArmed = false;
@@ -652,6 +662,35 @@ function register() {
     voice!.transcribe(recording, hint),
   );
   handleWithEnvironment("voice-speaker", (op) => voice!.speakerControl(op));
+  // Settings › Read-aloud voice (desktop/voices.ts): the config edit goes through the
+  // companion's locked, hash-checked save, like Settings › Configuration.
+  voices = new DesktopVoices(
+    () => binaries.twr,
+    env,
+    () => ({
+      read: () => companion().call("desktop.config.read"),
+      save: async (content, hash) => {
+        await companion().call("desktop.config.save", { content, hash });
+      },
+    }),
+    emit,
+  );
+  handleWithEnvironment("voices-list", () => voices!.list());
+  handleWithEnvironment("voices-install", (model) => voices!.install(model));
+  handleWithEnvironment("voices-select", (lang, voice) =>
+    voices!.select(lang, voice),
+  );
+  handleWithEnvironment("voices-preview", (voice, lang) =>
+    voices!.preview(voice, lang),
+  );
+  handle("voices-preview-stop", () => voices?.stopPreview());
+  handle("voices-system", () => {
+    // macOS's Spoken Content settings, where its Premium and Enhanced voices download.
+    if (process.platform !== "darwin") throw new Error("Only on macOS");
+    return shell.openExternal(
+      "x-apple.systempreferences:com.apple.Accessibility-Settings.extension?SpokenContent",
+    );
+  });
   let catalog: ReturnType<typeof discoverCatalog> | undefined;
   handleWithEnvironment(
     "catalog",
@@ -747,13 +786,45 @@ function register() {
       table: z.array(z.string().min(1).max(64)).max(8).parse(table),
       key: z.string().min(1).max(64).parse(key),
       value: z
-        .union([z.string().max(4096), z.number().int(), z.boolean()])
+        .union([
+          z.string().max(4096),
+          z.number().int(),
+          z.boolean(),
+          z.array(z.string().min(1).max(4096)).max(32),
+        ])
         .parse(value),
     }),
   );
   handle("pick-directory", async () => {
     const result = await dialog.showOpenDialog(window, {
       properties: ["openDirectory"],
+    });
+    return result.canceled ? null : result.filePaths[0];
+  });
+  handle("pick-file", async (request) => {
+    const { title, filters = [] } =
+      z
+        .object({
+          title: z.string().max(120).optional(),
+          filters: z
+            .array(
+              z.object({
+                name: z.string().max(80),
+                extensions: z
+                  .array(z.string().regex(/^[a-zA-Z0-9]{1,16}$/))
+                  .max(16),
+              }),
+            )
+            .max(8)
+            .optional(),
+        })
+        .strict()
+        .optional()
+        .parse(request) ?? {};
+    const result = await dialog.showOpenDialog(window, {
+      title,
+      properties: ["openFile", "showHiddenFiles"],
+      filters: [...filters, { name: "All files", extensions: ["*"] }],
     });
     return result.canceled ? null : result.filePaths[0];
   });
@@ -911,6 +982,12 @@ function register() {
     if (session.timer) clearTimeout(session.timer);
     if (!session.exited) session.process.kill();
     terminals.delete(key);
+  });
+  ipcMain.on("twr:app-saved", (event, id) => {
+    try {
+      trusted(event);
+      saveBeforeClose.saved(z.number().int().parse(id));
+    } catch {}
   });
   ipcMain.on("twr:terminal-focus", (event, focused) => {
     try {
@@ -1070,6 +1147,7 @@ function rememberPlacement(
 }
 async function createWindow(hidden = false) {
   quitting = false;
+  saveBeforeClose.reset();
   applyNativeAppearance();
   const primary = screen.getPrimaryDisplay();
   const placement = restoreWindow(desktopSettings.window, [
@@ -1242,7 +1320,18 @@ async function createWindow(hidden = false) {
         if (quitRequested) app.quit();
         else window.close();
       } else quitRequested = false;
+      return;
     }
+    // The drafts save a moment after they change: the page saves them now, then the
+    // window closes (or the app quits) once more.
+    if (
+      !saveBeforeClose.close(() => {
+        if (window.isDestroyed()) return;
+        if (quitRequested) app.quit();
+        else window.close();
+      })
+    )
+      event.preventDefault();
   });
   window.on("closed", () => {
     services?.closed();
@@ -1296,7 +1385,9 @@ else {
           cancelQuit: () => {
             quitting = false;
             quitRequested = false;
+            saveBeforeClose.reset();
           },
+          saveBeforeClosing: () => saveBeforeClose.beforeClosing(),
           activeTerminals: () =>
             [...terminals.values()].filter((t) => !t.exited).length,
           facts: () => ({
@@ -1463,5 +1554,6 @@ else {
   app.on("before-quit", () => {
     quitRequested = true;
     voice?.dispose();
+    voices?.dispose();
   });
 }

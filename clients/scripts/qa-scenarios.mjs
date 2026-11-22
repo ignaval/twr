@@ -25,7 +25,8 @@ export async function runMacQA(page, { fixture, hubPids }) {
   };
   const open = async (title, values = {}) => {
     await page
-      .getByRole("button", { name: "Open command palette", exact: true })
+      .locator(".sidebar-footer")
+      .getByRole("button", { name: "Commands", exact: true })
       .click();
     await page.getByRole("textbox", { name: "Search commands" }).fill(title);
     await page
@@ -35,18 +36,64 @@ export async function runMacQA(page, { fixture, hubPids }) {
     const dialog = page.getByRole("dialog").last();
     for (const [key, value] of Object.entries(values)) {
       const field = dialog.locator("#field-" + key);
+      // A form opened for one thread (the inspector, its ⋯ menu, a slash command naming
+      // it) keeps that thread in a hidden field and names it in its subtitle: check it is
+      // the one meant. The palette's forms ask, the current conversation's thread first.
+      if ((await field.getAttribute("type")) === "hidden") {
+        const [fixed, wanted] = await Promise.all([
+          rpc("thread.get", { thread: await field.inputValue() }),
+          rpc("thread.get", { thread: String(value) }),
+        ]);
+        assert.equal(fixed.id, wanted.id, `the form is for ${value}`);
+        continue;
+      }
+      // Less common fields wait under More options: open it for one of those only.
+      if (
+        !(await field.isVisible()) &&
+        (await dialog.locator(".more-options #field-" + key).count())
+      )
+        await dialog.locator(".more-options:not([open]) > summary").click();
       if ((await field.getAttribute("type")) === "checkbox")
         await field.setChecked(value);
       else if (
         (await field.evaluate((element) => element.tagName)) === "SELECT"
-      )
-        await field.selectOption(value);
-      else await field.fill(String(value));
+      ) {
+        // Pickers list ids under names: `thread: "api"` picks "api · running". The
+        // list loads as the form opens.
+        await field.locator("option:not([disabled])").first().waitFor({
+          state: "attached",
+        });
+        await expect
+          .poll(() => field.isEnabled(), { message: `#field-${key} loads` })
+          .toBe(true);
+        const option = await field.evaluate(
+          (select, wanted) =>
+            [...select.options].find(
+              (o) =>
+                o.value === wanted ||
+                o.text === wanted ||
+                o.text.startsWith(wanted + " · "),
+            )?.value,
+          String(value),
+        );
+        const other = field.locator("option", { hasText: "Other…" });
+        if (option === undefined && (await other.count())) {
+          // A value the list lacks (a pool, an acp: runtime, a runtime's own mode) is
+          // typed under Other….
+          await field.selectOption({ label: "Other…" });
+          await dialog.locator("input#field-" + key).fill(String(value));
+          continue;
+        }
+        assert(option !== undefined, `#field-${key} offers ${value}`);
+        await field.selectOption(option);
+      } else await field.fill(String(value));
     }
     return dialog;
   };
-  const run = async (title, values = {}, confirm = false) => {
-    const dialog = await open(title, values);
+  const run = async (title, values = {}, confirm = false) =>
+    finish(await open(title, values), confirm);
+  /** Submits an open form (confirming when asked), waits for its result and closes it. */
+  const finish = async (dialog, confirm = false) => {
     await dialog.locator('button[type="submit"]').click();
     if (confirm)
       await page
@@ -62,21 +109,14 @@ export async function runMacQA(page, { fixture, hubPids }) {
       .locator(".thread-list .thread-card")
       .filter({ hasText: name })
       .click();
-    await page
-      .getByRole("button", { name: "Talk to this thread", exact: true })
-      .click();
   };
 
   // Open every manager on the release app, checking that the view renders successfully.
   for (const name of [
-    "Accounts",
-    "Boxes",
-    "Jobs",
-    "Usage",
+    "Machines & accounts",
+    "Activity",
     "Context & memory",
-    "Read aloud",
     "Trash",
-    "Hub & storage",
     "Settings",
     "Decisions",
   ]) {
@@ -116,7 +156,17 @@ export async function runMacQA(page, { fixture, hubPids }) {
   );
   console.log("QA: native New shortcut and relative project directory");
 
-  await run("Rename thread", { thread: "packaged", name: "qa-agent" });
+  const rename = await open("Rename thread", {
+    thread: "packaged",
+    name: "qa-agent",
+  });
+  // The palette's forms ask which thread (the current conversation's first); only one
+  // opened from a thread is fixed to it.
+  assert(
+    await rename.locator("select#field-thread").isVisible(),
+    "The palette's Rename asks which thread",
+  );
+  await finish(rename);
   await run("Change permission mode", { thread: "qa-agent", mode: "plan" });
   await talk("qa-agent");
   assert.equal((await rpc("thread.get", { thread: "qa-agent" })).mode, "plan");
@@ -249,7 +299,7 @@ export async function runMacQA(page, { fixture, hubPids }) {
     .waitFor();
   console.log("QA: queue take-back restores the original message");
 
-  await nav("Jobs");
+  await nav("Activity");
   await run("Run a job", {
     thread: "qa-agent",
     argv: "sh -c 'printf DESKTOP_JOB_OK; sleep 60'",
@@ -276,7 +326,7 @@ export async function runMacQA(page, { fixture, hubPids }) {
   await page
     .getByLabel("Note", { exact: true })
     .fill("Unsaved body that must survive navigation");
-  await nav("Jobs");
+  await nav("Activity");
   await nav("Context & memory");
   await note.getByRole("button", { name: "Read / edit", exact: true }).click();
   assert.equal(
@@ -433,13 +483,23 @@ export async function runMacQA(page, { fixture, hubPids }) {
       .filter({ hasText: "qa-agent" })
       .click();
     assert(
-      await orchestrator.isVisible(),
-      "Selecting a thread must keep the orchestrator destination",
+      await page
+        .getByRole("textbox", {
+          name: "Message qa-agent directly",
+          exact: true,
+        })
+        .isVisible(),
+      "One click must open the thread conversation",
     );
-    // On smaller displays details overlay the composer. Dismiss them through
-    // the same control a user uses before returning to the conversation.
+    await page
+      .getByRole("button", { name: "Show thread details", exact: true })
+      .click();
+    // Details use the existing overlay on smaller displays.
     await page
       .getByRole("button", { name: "Close thread details", exact: true })
+      .click();
+    await page
+      .getByRole("button", { name: "Back to orchestrator", exact: true })
       .click();
     const message = `QA_STILL_TO_ORCHESTRATOR_${width}`;
     await orchestrator.fill(message);

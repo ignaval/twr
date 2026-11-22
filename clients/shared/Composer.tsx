@@ -3,22 +3,34 @@
 // as you type: the drafts live in a store outside React state (`Drafts`), and only this
 // component subscribes to the one on screen, so a keystroke re-renders the box, not the
 // whole app. App reads the drafts when it acts on them (sending, slash commands) and
-// writes them when something else fills the box (take back, uploads, the outbox).
+// writes them when something else fills the box (take back, the outbox). Attached files
+// show inside the box (ComposerAttachments) and join the text only as it is sent.
 import {
   useEffect,
   useLayoutEffect,
+  useRef,
   useState,
   useSyncExternalStore,
   type FormEvent,
+  type ReactNode,
   type RefObject,
 } from "react";
-import { ArrowUp, ChevronDown, Paperclip, X } from "lucide-react";
-import { appendDraft, type OfflineJournal } from "./offline";
-import type { UploadController } from "./uploads";
+import { ArrowUp, ChevronDown, Paperclip, RotateCw } from "lucide-react";
+import {
+  appendDraft,
+  isCommandDraft,
+  isShellDraft,
+  isSlashDraft,
+  type OfflineJournal,
+} from "./offline";
+import { unfinished, type UploadController } from "./uploads";
+import { ComposerAttachments, attachmentWait } from "./ComposerAttachments";
 import { takesSuggestion, type useAssistance } from "./assistance";
 import { VoiceControl } from "./VoiceControl";
 import { Spinner } from "./ui";
-import { SendAsLoop } from "./LoopViews";
+import { SendAsLoop, useLoops } from "./LoopViews";
+import { startAccess } from "./loops";
+import { announce } from "./a11y";
 import type { DesktopAPI, Json, Thread } from "./types";
 
 /**
@@ -64,6 +76,30 @@ export function fitToText(field: HTMLTextAreaElement | null) {
  */
 export class Drafts {
   private values: Record<string, string> = {};
+  private speech: Record<string, boolean> = {};
+  /** Dictation remains spoken until explicitly reviewed, even after edits or reload. */
+  isSpoken(key: string) {
+    return Boolean(this.get(key) && this.speech[key]);
+  }
+  spoken() {
+    return { ...this.speech };
+  }
+  restoreSpoken(saved: Record<string, boolean> = {}) {
+    this.speech = { ...saved, ...this.speech };
+  }
+  dictate(key: string, text: string) {
+    this.speech[key] = true;
+    this.set(key, (old) =>
+      old ? old + (/\s$/.test(old) ? "" : " ") + text : text,
+    );
+  }
+  review(key: string, text: string) {
+    // A review only covers the exact text shown. New speech still needs review.
+    if (this.get(key) === text) {
+      delete this.speech[key];
+      for (const listener of [...this.listeners]) listener();
+    }
+  }
   private listeners = new Set<() => void>();
   /** The draft for one destination, `""` when there is none. */
   get(key: string): string {
@@ -89,6 +125,9 @@ export class Drafts {
   /** Replaces the whole record, from what it was. */
   update(change: (old: Record<string, string>) => Record<string, string>) {
     this.values = change(this.values);
+    this.speech = Object.fromEntries(
+      Object.entries(this.speech).filter(([key]) => this.values[key]),
+    );
     for (const listener of [...this.listeners]) listener();
   }
   subscribe = (listener: () => void) => {
@@ -157,6 +196,7 @@ export function Composer({
   spokenLately,
   onDismissKeyboard,
   fail,
+  modelPicker,
 }: {
   drafts: Drafts;
   /** The destination on screen: its draft is the box's text. */
@@ -187,20 +227,75 @@ export function Composer({
   send: (event?: FormEvent) => Promise<void>;
   submitSlash: (text: string) => Promise<void>;
   /** Send as implementation loop: the composer's draft is the task. Only while the
-   * destination is a thread. */
-  sendAsLoop?: () => void;
+   * destination is a thread. `started` is called once the hub took the loop. */
+  sendAsLoop?: (started: () => void) => void;
   uploads: UploadController;
   submitVoice: (text: string) => Promise<Json>;
   voiceHint: string[];
   spokenLately: () => string[];
   onDismissKeyboard?: () => void;
   fail: (error: unknown) => void;
+  /** The model and effort picker (`ModelPicker`), at the footer row's right. */
+  modelPicker?: ReactNode;
 }) {
   const draft = useDraft(drafts, draftKey);
+  // The conversation's attached files: a message carries the uploaded ones (not a
+  // command or a shell line), and waits while any is still on its way. They are keyed as
+  // the draft is: the orchestrator's stay with it when its thread changes.
+  const conversation = destination || "orchestrator";
+  const attached = useSyncExternalStore(
+    uploads.subscribe,
+    uploads.getSnapshot,
+  ).filter(
+    (item) =>
+      !!target &&
+      item.conversation === conversation &&
+      item.workspace === workspace,
+  );
+  const carriesFiles = !isCommandDraft(draft);
+  const filesWait = carriesFiles && attached.some(unfinished);
+  const filesReady =
+    carriesFiles && attached.some((item) => item.phase === "ready");
+  const [voiceStatusContainer, setVoiceStatusContainer] =
+    useState<HTMLDivElement | null>(null);
+  const spokenDraft = useSyncExternalStore(drafts.subscribe, () =>
+    drafts.isSpoken(draftKey),
+  );
+  const voiceContext = useRef(draftKey);
+  voiceContext.current = draftKey;
   const [slashHidden, setSlashHidden] = useState(memory.slashHidden);
   const [mentionIndex, setMentionIndex] = useState(memory.mentionIndex);
   const [mentionHidden, setMentionHidden] = useState(memory.mentionHidden);
   const [slashIndex, setSlashIndex] = useState(memory.slashIndex);
+  // Run as loop: Send starts an implementation loop with the message as its task. It
+  // goes with the conversation it was turned on in, and turns off once the loop started
+  // (or you turn it off). Losing the connection leaves it on: Send then waits, so the
+  // task never goes out, or to the outbox, as an ordinary message.
+  const [asLoop, setAsLoop] = useState(false);
+  useEffect(() => setAsLoop(false), [draftKey]);
+  const loops = useLoops();
+  const loopOn = asLoop && !!sendAsLoop && !!target && !target.is_orchestrator;
+  const loopAccess = startAccess(loops.access, target);
+  const loopWhy = !loopAccess.act
+    ? loopAccess.why || "A loop can't start now."
+    : !connected
+      ? "Loop actions need a live connection."
+      : "";
+  const submit = (event?: FormEvent) => {
+    if (loopOn) {
+      event?.preventDefault();
+      if (loopWhy) {
+        announce(
+          `${loopWhy} Turn off Run as loop to send it as a message.`,
+          "assertive",
+        );
+        return;
+      }
+      sendAsLoop(() => setAsLoop(false));
+      return;
+    }
+    void send(event);
+  };
   // The field grows and shrinks with its text (fitToText): on every change of the text
   // (typing, sending, a draft put back), of its width (a resized window, a rotated phone)
   // and of the text size.
@@ -243,12 +338,11 @@ export function Composer({
         .filter((t) => t.name.startsWith(draft.match(/@([\w-]*)$/)?.[1] || ""))
         .slice(0, 6)
     : [];
-  const slashMatches =
-    draft.startsWith("/") && !draft.startsWith("//")
-      ? slashCommands
-          .filter((c) => c.id.startsWith(draft.slice(1).split(/\s/)[0]))
-          .slice(0, 6)
-      : [];
+  const slashMatches = isSlashDraft(draft)
+    ? slashCommands
+        .filter((c) => c.id.startsWith(draft.slice(1).split(/\s/)[0]))
+        .slice(0, 6)
+    : [];
   return (
     <>
       {!draft &&
@@ -261,16 +355,16 @@ export function Composer({
           </button>
         )}
       <form
-        className={`composer ${draft.startsWith("!") && !draft.startsWith("!!!") ? "shell-mode" : ""}`}
+        className={`composer ${isShellDraft(draft) ? "shell-mode" : ""}`}
         aria-label="Message composer"
-        onSubmit={(event) => void send(event)}
+        onSubmit={submit}
       >
         <div className="composer-label">
           <span className="destination-chip">
             <span className="destination-dot" aria-hidden="true" />
             To:{" "}
             <b>
-              {draft.startsWith("!") && !draft.startsWith("!!!")
+              {isShellDraft(draft)
                 ? "Shell · " +
                   (destination
                     ? target?.name
@@ -280,16 +374,6 @@ export function Composer({
                   ? target?.name
                   : "Orchestrator"}
             </b>
-            {destination && (
-              <button
-                type="button"
-                aria-label="Return to orchestrator"
-                title="Return to orchestrator"
-                onClick={() => setDestination(undefined)}
-              >
-                <X size={12} />
-              </button>
-            )}
           </span>
 
           <span>
@@ -310,6 +394,11 @@ export function Composer({
             </button>
           )}
         </div>
+        <ComposerAttachments
+          controller={uploads}
+          conversation={target ? conversation : undefined}
+          workspace={workspace}
+        />
         <textarea
           ref={input}
           aria-label={
@@ -440,7 +529,7 @@ export function Composer({
               !e.nativeEvent.isComposing
             ) {
               e.preventDefault();
-              void send();
+              submit();
             }
           }}
         />
@@ -462,7 +551,7 @@ export function Composer({
                   event.target.value = "";
                   if (target) {
                     try {
-                      uploads.add(files, target.id, workspace);
+                      uploads.add(files, target.id, workspace, conversation);
                     } catch (error) {
                       fail(error);
                     }
@@ -471,32 +560,55 @@ export function Composer({
               />
             </label>
           )}
+          {/* The hints show while the box is empty (they describe what typing can do), and
+              once it starts with `!`, what the shell prefixes do. */}
           <span id="twr-composer-hints">
-            <kbd>/</kbd> commands <span>·</span> <kbd>@</kbd> reference a thread{" "}
-            <span>·</span> Shift Enter for a new line
-            {!draft && assistance.suggestion && (
-              <span>
-                {" "}
-                · <kbd>Tab</kbd> or <kbd>→</kbd> takes the suggestion
-              </span>
-            )}
-            {assistance.stats && (
-              <small
-                title={`${assistance.stats.calls} calls · ${assistance.stats.failures} failed`}
-              >
-                {" "}
-                · {assistance.stats.source} $
-                {Number(assistance.stats.cost_usd || 0).toFixed(4)} USD
-              </small>
-            )}
+            {draft.startsWith("!") ? (
+              <>
+                <kbd>!</kbd> runs a shell command <span>·</span> <kbd>!!</kbd>{" "}
+                also shares its output <span>·</span> <kbd>!!!</kbd> sends it as
+                a message
+              </>
+            ) : !draft ? (
+              <>
+                <kbd>/</kbd> commands <span>·</span> <kbd>@</kbd> reference a
+                thread <span>·</span> Shift Enter for a new line
+                {assistance.suggestion && (
+                  <span>
+                    {" "}
+                    · <kbd>Tab</kbd> or <kbd>→</kbd> takes the suggestion
+                  </span>
+                )}
+              </>
+            ) : null}
           </span>
+          {modelPicker}
           <div className="composer-actions">
             <VoiceControl
+              context={draftKey + ":" + target?.id}
               host={hostApi}
+              statusContainer={voiceStatusContainer}
               rpc={rpc}
               connected={connected}
-              allowed={operate && Boolean(orchestrator)}
+              allowed={operate && Boolean(target)}
+              conversationAllowed={Boolean(orchestrator)}
               submit={submitVoice}
+              draft={(text) => {
+                if (voiceContext.current !== draftKey) return;
+                onEdit();
+                drafts.dictate(draftKey, text);
+                const field = input.current;
+                field?.focus();
+                // React applies the controlled value before placing the caret.
+                requestAnimationFrame(() => {
+                  if (voiceContext.current !== draftKey || !field?.isConnected)
+                    return;
+                  field.setSelectionRange(
+                    field.value.length,
+                    field.value.length,
+                  );
+                });
+              }}
               hint={voiceHint}
               spoken={spokenLately}
               edit={(text) => {
@@ -508,38 +620,62 @@ export function Composer({
               }}
               onError={fail}
             />
-            <button
-              className="send-button"
-              type="submit"
-              disabled={
-                !operate ||
-                !draft.trim() ||
-                (!connected &&
-                  (!journal ||
-                    draft.startsWith("/") ||
-                    draft.startsWith("!"))) ||
-                (!target && !draft.startsWith("/")) ||
-                sending
-              }
-              aria-label={connected ? "Send message" : "Save message for later"}
-              title={
-                connected
-                  ? "Send message"
-                  : "Save on this device until the hub reconnects"
-              }
-            >
-              {sending ? <Spinner /> : <ArrowUp size={18} />}
-            </button>
             {sendAsLoop && target && !target.is_orchestrator && (
               <SendAsLoop
                 thread={target}
                 phone={document.documentElement.dataset.mobile === "true"}
                 busy={sending}
-                onSend={sendAsLoop}
+                on={asLoop}
+                onChange={setAsLoop}
               />
             )}
+            <button
+              className={`send-button ${loopOn ? "as-loop" : ""}`}
+              type="submit"
+              disabled={
+                loopOn
+                  ? !operate || !!loopWhy || filesWait || sending
+                  : !operate ||
+                    (!draft.trim() && !filesReady) ||
+                    filesWait ||
+                    (!connected &&
+                      (spokenDraft || !journal || isCommandDraft(draft))) ||
+                    (!target && !isSlashDraft(draft)) ||
+                    sending
+              }
+              aria-label={
+                loopOn
+                  ? "Start implementation loop"
+                  : connected
+                    ? "Send message"
+                    : "Save message for later"
+              }
+              aria-describedby={filesWait ? "twr-attachment-wait" : undefined}
+              title={
+                filesWait
+                  ? attachmentWait(attached)
+                  : loopOn
+                    ? loopWhy
+                      ? `${loopWhy} Turn off Run as loop to send it as a message.`
+                      : "Start an implementation loop with this message as its task"
+                    : !connected && spokenDraft
+                      ? "Reconnect to send dictated text"
+                      : connected
+                        ? "Send message"
+                        : "Save on this device until the hub reconnects"
+              }
+            >
+              {sending ? (
+                <Spinner />
+              ) : loopOn ? (
+                <RotateCw size={18} />
+              ) : (
+                <ArrowUp size={18} />
+              )}
+            </button>
           </div>
         </div>
+        <div className="composer-voice-status" ref={setVoiceStatusContainer} />
         {mentions.length > 0 && !mentionHidden && (
           <div
             className="mentions"

@@ -52,6 +52,50 @@ select {
 [data-mobile="true"] .manage-nav > summary {
   min-height: 44px;
 }
+/* A switch on the phone: the input itself is the 44-point target; its ::after draws the
+ * 44 x 26 track inside it and its ::before the thumb, so what is measured and tapped is the
+ * whole target, not only the track. */
+[data-mobile="true"] input[type="checkbox"][role="switch"],
+[data-mobile="true"] input[type="checkbox"][role="switch"]:checked {
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  min-height: 44px;
+  border: 0;
+  border-radius: 13px;
+  background: transparent;
+}
+[data-mobile="true"] input[type="checkbox"][role="switch"]::after {
+  content: "";
+  position: absolute;
+  top: 9px;
+  left: 0;
+  width: 44px;
+  height: 26px;
+  box-sizing: border-box;
+  border: 1px solid var(--field-border);
+  border-radius: 999px;
+  background: var(--bg);
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease;
+}
+[data-mobile="true"] input[type="checkbox"][role="switch"]:checked::after {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+[data-mobile="true"] input[type="checkbox"][role="switch"]::before {
+  z-index: 1;
+  top: 13px;
+  left: 4px;
+  width: 18px;
+  height: 18px;
+}
+[data-mobile="true"] input[type="checkbox"][role="switch"]:checked::before {
+  width: 18px;
+  height: 18px;
+  transform: translateX(18px);
+}
 [data-mobile="true"] .icon-button {
   min-width: 44px;
 }
@@ -495,7 +539,7 @@ select {
   [data-mobile="true"] .workspace-breadcrumb,
   [data-mobile="true"] .topbar-left > .workspace-breadcrumb + svg,
   [data-mobile="true"] .live-indicator,
-  [data-mobile="true"] .topbar-actions > [aria-label="Open command palette"],
+  [data-mobile="true"] .topbar-actions > [aria-label="Open shell"],
   [data-mobile="true"] .topbar-new-thread {
     display: none;
   }
@@ -523,6 +567,10 @@ select {
   [data-mobile="true"] .conversation-scroll {
     padding: 8px 12px 12px;
   }
+  [data-mobile="true"] .latest-user-message > button,
+  [data-mobile="true"] .latest-user-empty {
+    padding-inline: 12px;
+  }
   [data-mobile="true"] .dialog {
     width: 100%;
     max-height: calc(100% - 12px);
@@ -543,7 +591,7 @@ select {
   [data-mobile="true"] .workspace-breadcrumb,
   [data-mobile="true"] .topbar-left > .workspace-breadcrumb + svg,
   [data-mobile="true"] .live-indicator,
-  [data-mobile="true"] .topbar-actions > [aria-label="Open command palette"],
+  [data-mobile="true"] .topbar-actions > [aria-label="Open shell"],
   [data-mobile="true"] .topbar-new-thread {
     display: none;
   }
@@ -560,9 +608,6 @@ select {
     min-width: 44px;
     min-height: 44px;
   }
-}
-[data-mobile="true"] .grid-new-thread {
-  display: inline-flex;
 }
 @media (max-width: 1099px) {
   [data-mobile="true"] .mobile-runtime {
@@ -633,7 +678,7 @@ select {
 [data-fold="vertical"] .topbar-left > .workspace-breadcrumb + svg,
 [data-fold="vertical"] .topbar-left > .live-indicator,
 [data-fold="vertical"] .topbar-left > [aria-label="Show sidebar"],
-[data-fold="vertical"] .topbar-actions > [aria-label="Open command palette"],
+[data-fold="vertical"] .topbar-actions > [aria-label="Open shell"],
 [data-fold="vertical"] .topbar-new-thread {
   display: none;
 }
@@ -723,13 +768,25 @@ select {
 :root[data-mobile="true"].short-content .queue,
 :root[data-mobile="true"].short-content .shell-runs,
 :root[data-mobile="true"].short-content .reports,
-:root[data-mobile="true"].short-content .assistance-notice,
-:root[data-mobile="true"].short-content .assistance-status,
+:root[data-mobile="true"].short-content .status-strip,
 :root[data-mobile="true"].short-content .suggested-message {
   min-height: 0;
   max-height: 25%;
   overflow: auto;
   flex-shrink: 1;
+}
+/* The latest-user shortcut is a convenience: while typing (an open keyboard) or in a short
+   viewport its fixed row would take the composer's room to grow, or push it under the
+   navigation, so the composer keeps that space. */
+:root[data-mobile="true"][data-keyboard="true"] .latest-user-message,
+:root[data-mobile="true"].short-content .latest-user-message {
+  display: none;
+}
+/* The `/usage` panel shrinks before the message box (shared/usage.css), down to its padding:
+   in a tiny viewport with the keyboard open even that would push the message box down, so
+   the panel steps aside while you type and comes back when the keyboard closes. */
+:root[data-mobile="true"].tiny-content[data-keyboard="true"] .usage-panel {
+  display: none;
 }
 :root[data-mobile="true"].tiny-content .toast {
   top: calc(max(env(safe-area-inset-top), var(--occlusion-top, 0px)) + 8px);
@@ -826,11 +883,6 @@ select {
   max-height: 5em;
   overflow: auto;
 }
-@media (max-width: 799px) {
-  [data-mobile="true"] .topbar-actions > [aria-label="Open shell"] {
-    display: none;
-  }
-}
 
 :root[data-mobile="true"].tiny-content .composer > textarea {
   height: auto;
@@ -921,22 +973,76 @@ select {
   min-width: 44px;
 }
 
-/* Send as implementation loop: the ↻ button beside Send, and the choice it opens. */
+/* Run as loop: the ↻ switch beside Send. */
 [data-mobile="true"] .send-loop-button {
   min-width: 44px;
   min-height: 44px;
   width: 44px;
   height: 44px;
 }
-[data-mobile="true"] .send-loop-panel {
-  width: min(
-    320px,
-    calc(100vw - 24px - env(safe-area-inset-left) - env(safe-area-inset-right))
-  );
-}
-[data-mobile="true"] .send-loop-panel > button,
 [data-mobile="true"] .inspector-notice > button,
 [data-mobile="true"] .loop-starts > button {
   min-height: 44px;
   min-width: 44px;
+}
+/* Attached files (shared/ComposerAttachments.tsx) sit in the message box above the text,
+ * across its width: the text and the controls move down a row. The ✕ on a tile or chip,
+ * and a chip itself, are 44-point targets. */
+[data-mobile="true"] .composer-attachments {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+[data-mobile="true"] .composer:has(> .composer-attachments) > textarea,
+[data-mobile="true"] .composer:has(> .composer-attachments) > .composer-bottom {
+  grid-row: 3;
+}
+[data-mobile="true"]
+  .composer:has(> .composer-attachments)
+  > .composer-voice-status {
+  grid-row: 5;
+}
+@media (max-width: 519px) {
+  [data-mobile="true"]
+    .composer:has(> .composer-attachments)
+    > .composer-bottom {
+    grid-row: 4;
+  }
+}
+[data-mobile="true"][data-fold="vertical"]
+  .composer:has(> .composer-attachments)
+  > .composer-bottom {
+  grid-row: 4;
+}
+/* The strip scrolls past two rows of chips, and sooner on a short screen (a phone sideways
+ * with the keyboard open): it gets the height the keyboard leaves after the top bar, the
+ * conversation at its least and the rest of the composer (the destination, the message at
+ * its least, the controls' row), 220 points in all, and at least one row of chips. So Send
+ * and the model stay on screen. */
+[data-mobile="true"] .composer-attachments > ul {
+  max-height: clamp(52px, calc(var(--viewport-height, 100dvh) - 220px), 128px);
+  padding: 8px 8px 0;
+}
+/* With the `/usage` panel open, the panel's least height (its padding and margin, 34
+   points) comes off the strip's room too. */
+:root[data-mobile="true"]:has(.usage-panel) .composer-attachments > ul {
+  max-height: clamp(52px, calc(var(--viewport-height, 100dvh) - 254px), 128px);
+}
+[data-mobile="true"] .attachment-remove {
+  width: 44px;
+  height: 44px;
+  min-width: 44px;
+  min-height: 44px;
+}
+[data-mobile="true"] .attachment-chip {
+  height: 44px;
+}
+[data-mobile="true"] .attachment-chip > .attachment-open {
+  min-height: 44px;
+  padding-right: 44px;
+}
+[data-mobile="true"] .attachment-chip > .attachment-remove {
+  top: 0;
+  right: 0;
+  align-items: center;
+  justify-content: center;
 }

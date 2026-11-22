@@ -126,6 +126,56 @@ fn is_dry_run(result: &Value) -> bool {
 /// `thread.new`, `thread.stop`, `thread.park`, `thread.resume`, `thread.delete`,
 /// `trash.empty`, `trash.restore` or `orchestrator.use` did (`None` for other methods, and for a `thread.send` that started a
 /// turn: the transcript shows it).
+/// The status line of an `orchestrator.access` change: the level, when the orchestrator picks
+/// it up, and whether config.toml keeps it. `None` for a read (no `previous`).
+pub fn access_status(r: &Value) -> Option<String> {
+    let previous = r["previous"].as_str()?;
+    let access = r["access"].as_str().unwrap_or("?");
+    if previous == access {
+        return Some(format!("orchestrator access is already {access}"));
+    }
+    let when = match r["restart"].as_str() {
+        Some("now") => "the orchestrator restarts with it now",
+        Some("after_turn") => "the orchestrator restarts with it after its current turn",
+        _ => "the orchestrator starts with it next time",
+    };
+    let kept = match r["persist_error"].as_str() {
+        _ if r["persisted"].as_bool() == Some(true) => "kept in config.toml".to_string(),
+        Some(e) => format!("for this hub run only, config.toml was left alone: {e}"),
+        None => "for this hub run only".to_string(),
+    };
+    Some(format!(
+        "orchestrator access: {access} (was {previous}); {when}; {kept}"
+    ))
+}
+
+/// What an orchestrator switch or reset (`result`) dropped, for its status line: empty when
+/// nothing; the user's own come back in the history ([`crate::app::AppState::apply_result`]).
+fn dropped_by_switch(result: &Value) -> String {
+    let p = &result["previous"];
+    let Some(n) = p["dropped_prompts"].as_u64().filter(|n| *n > 0) else {
+        return String::new();
+    };
+    let mut out = format!("; dropped {n} queued message(s) the previous one hadn't started");
+    let mine = p["dropped_messages"].as_array().map_or(0, Vec::len);
+    // Left out by the hub, too long for its answer: in no history.
+    let lost = p["dropped_messages_omitted"].as_u64().unwrap_or(0);
+    match (mine, lost) {
+        (0, 0) => {}
+        (_, 0) => out.push_str(&format!(
+            " ({mine} of yours: in the history, ↑ to send again)"
+        )),
+        (0, _) => out.push_str(&format!(
+            " ({lost} of yours, too long to return: they can't be sent again)"
+        )),
+        _ => out.push_str(&format!(
+            " ({mine} of yours: in the history, ↑ to send again; {lost} more of yours, too \
+             long to return, can't be)"
+        )),
+    }
+    out
+}
+
 pub fn result_status(method: &str, result: &Value) -> Option<String> {
     // The hub's advisory on a call that makes, changes, restarts or starts a thread's runtime
     // (its box reports the runtime's CLI missing): said after what was done, alone when
@@ -356,6 +406,9 @@ fn method_status(method: &str, result: &Value) -> Option<String> {
                  until you answer Delete on it"
             ));
         }
+        // A change of the orchestrator's access (a read says nothing here: the view does,
+        // [`crate::app::AppState::apply_result`]).
+        "orchestrator.access" => return access_status(result),
         "orchestrator.reset" => {
             let mut msg = match result["start_error"].as_str() {
                 Some(e) => {
@@ -363,6 +416,7 @@ fn method_status(method: &str, result: &Value) -> Option<String> {
                 }
                 None => "conversation cleared; fresh session, no handoff (history kept)".into(),
             };
+            msg.push_str(&dropped_by_switch(result));
             if let Some(w) = result["warning"].as_str() {
                 msg.push_str(&format!("; warning: {w}"));
             }
@@ -387,6 +441,7 @@ fn method_status(method: &str, result: &Value) -> Option<String> {
                 _ => rt.to_string(),
             };
             let mut msg = format!("the orchestrator is now {runtime} (a new session{handoff})");
+            msg.push_str(&dropped_by_switch(result));
             if let Some(w) = result["warning"].as_str() {
                 msg.push_str(&format!("; warning: {w}"));
             }
@@ -581,14 +636,25 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
         Action::Trim { thread } => Some(("thread.trim", json!({"thread": thread}))),
         Action::CompactContext { thread } => Some(("thread.compact", json!({"thread": thread}))),
         Action::ResetOrchestrator => Some(("orchestrator.reset", json!({}))),
+        Action::OrchestratorAccess { access } => Some((
+            "orchestrator.access",
+            match access {
+                Some(a) => json!({ "access": a }),
+                None => json!({}),
+            },
+        )),
         Action::UseOrchestrator {
             runtime,
             model,
+            effort,
             summary,
         } => {
             let mut p = json!({ "runtime": runtime });
             if let Some(m) = model {
                 p["model"] = json!(m);
+            }
+            if let Some(e) = effort {
+                p["effort"] = json!(e);
             }
             if !summary {
                 p["summary"] = json!(false);
@@ -2361,6 +2427,7 @@ async fn serve_calls(
                 if FOLLOWED.contains(&method) {
                     let _ = results.followed.send((method, r));
                 } else if method == "orchestrator.reset"
+                    || method == "orchestrator.access"
                     || method == "thread.activity"
                     || method == "thread.queue"
                     || method == "message.send_now"
@@ -3024,6 +3091,7 @@ where
     state.view.model_choices = show["models"].clone();
     state.view.orch_default = orch_default;
     state.view.orch_default_account = show["account"].as_str().map(str::to_string);
+    state.view.orch_access = show["access"].as_str().map(str::to_string);
     state.view.default_runtime = crate::app::default_runtime(&show);
     state.accounts_answered(&accounts, std::time::Instant::now());
     state.view.mouse = carried.mouse;
@@ -6015,6 +6083,7 @@ mod tests {
         let (m, p) = action_request(&Action::UseOrchestrator {
             runtime: "codex".into(),
             model: Some("o5".into()),
+            effort: None,
             summary: true,
         })
         .unwrap();
@@ -6028,6 +6097,7 @@ mod tests {
         let (_, p) = action_request(&Action::UseOrchestrator {
             runtime: "grok-build".into(),
             model: None,
+            effort: None,
             summary: false,
         })
         .unwrap();
@@ -6036,6 +6106,38 @@ mod tests {
             result_status("orchestrator.use", &json!({"runtime": "codex"})).as_deref(),
             Some("the orchestrator is now codex (a new session)")
         );
+        assert_eq!(
+            result_status(
+                "orchestrator.use",
+                &json!({"runtime": "codex", "previous": {"dropped_prompts": 2,
+                        "dropped_messages": ["and the deploys"]}})
+            )
+            .as_deref(),
+            Some(
+                "the orchestrator is now codex (a new session); dropped 2 queued message(s) the \
+                 previous one hadn't started (1 of yours: in the history, ↑ to send again)"
+            )
+        );
+        assert_eq!(
+            result_status(
+                "orchestrator.use",
+                &json!({"runtime": "codex", "previous": {"dropped_prompts": 5,
+                        "dropped_messages": ["and the deploys"], "dropped_messages_omitted": 3}})
+            )
+            .as_deref(),
+            Some(
+                "the orchestrator is now codex (a new session); dropped 5 queued message(s) the \
+                 previous one hadn't started (1 of yours: in the history, ↑ to send again; 3 \
+                 more of yours, too long to return, can't be)"
+            )
+        );
+        assert!(result_status(
+            "orchestrator.use",
+            &json!({"runtime": "codex", "previous": {"dropped_prompts": 2,
+                    "dropped_messages": [], "dropped_messages_omitted": 2}})
+        )
+        .unwrap()
+        .ends_with("(2 of yours, too long to return: they can't be sent again)"));
         assert_eq!(
             result_status(
                 "orchestrator.use",

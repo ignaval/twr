@@ -490,6 +490,7 @@ describe("the stylesheet draws only checked pairs", () => {
   const sheets = [
     "shared/style.css",
     "shared/attachments.css",
+    "shared/usage.css",
     "shared/inbox-search.css",
     "desktop/app-shell.css",
     "desktop/connections.css",
@@ -517,13 +518,17 @@ describe("the stylesheet draws only checked pairs", () => {
     "var(--terminal-bg)",
     "var(--terminal-panel)",
     // Fills that hold a label checked above (.primary, .danger, their hovers, recording) or
-    // nothing to read (dots, meters, the resize grip, a slider's track).
+    // nothing to read (dots, meters, the resize grip, a slider's track, a switch's thumb,
+    // tests/css-contrast.ts).
     "var(--accent)",
+    "var(--accent-fg)",
     "var(--field-border)",
     "var(--danger)",
     "var(--warning)",
     "var(--thread-color)",
     "var(--destination)",
+    // The usage bars' even-pace tick: a line, nothing to read.
+    "var(--text)",
     "color-mix(in srgb, var(--accent) 90%, var(--text))",
     "color-mix(in srgb, var(--danger) 88%, var(--text))",
     "color-mix(in srgb, var(--destination) 12%, transparent)",

@@ -1,0 +1,23 @@
+/* The command palette's Show CLI commands switch, after the list. */
+.palette-cli {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  margin-top: 8px;
+  padding: 12px 12px 4px;
+  border-top: 1px solid var(--border);
+}
+.palette-cli > label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 1rem;
+}
+.palette-cli > small {
+  color: var(--muted);
+  font-size: 0.923077rem;
+}
+.palette-cli > button {
+  margin-left: auto;
+}

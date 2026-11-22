@@ -15,7 +15,9 @@ import { externalLink, linkConfirmation } from "./links";
 import { X, LoaderCircle, FolderOpen, Copy, Check, List } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import type { PluggableList } from "unified";
 import type { Field } from "./commands";
+import "./forms.css";
 export function Spinner() {
   return (
     <LoaderCircle size={16} className="spin" role="img" aria-label="Loading" />
@@ -83,6 +85,10 @@ export function Dialog({
     </div>
   );
 }
+/** One field of a command form: its label (naming the control alone), the control, and
+ * its description, which describes the control (`aria-describedby`). The label wraps
+ * neither the description nor a button beside the control (Choose folder), so neither
+ * becomes part of the control's name. */
 export function FieldInput({
   field,
   value,
@@ -94,12 +100,10 @@ export function FieldInput({
 }) {
   const hostApi = useHostAPI();
   const id = `field-${field.key}`;
+  const describedBy = field.description ? `${id}-description` : undefined;
   return (
-    <label
-      className={`field ${field.type === "boolean" ? "check-field" : ""}`}
-      htmlFor={id}
-    >
-      <span>
+    <div className={`field ${field.type === "boolean" ? "check-field" : ""}`}>
+      <label htmlFor={id} className="field-label">
         {field.label}
         {field.required && (
           <span className="required" aria-hidden="true">
@@ -107,13 +111,14 @@ export function FieldInput({
             *
           </span>
         )}
-      </span>
+      </label>
       {field.type === "boolean" ? (
         <input
           id={id}
           type="checkbox"
           role={field.switch ? "switch" : undefined}
           checked={!!value}
+          aria-describedby={describedBy}
           onChange={(e) => onChange(e.target.checked)}
         />
       ) : (field.type === "model" || field.type === "effort") &&
@@ -124,27 +129,24 @@ export function FieldInput({
           onChange={onChange}
           choices={field.choices}
           keep={field.keep}
+          unset={field.unset}
           custom={field.type === "model"}
           required={field.required}
+          describedBy={describedBy}
         />
-      ) : field.type === "select" ? (
-        <select
+      ) : field.type === "select" || (isPicker(field) && field.choices) ? (
+        <ChoiceSelect
           id={id}
-          aria-required={field.required || undefined}
-          value={value ?? ""}
-          onChange={(e) => onChange(e.target.value)}
-        >
-          <option value="">
-            {field.required ? "Choose…" : "Keep default"}
-          </option>
-          {field.options?.map((o) => (
-            <option key={o}>{o}</option>
-          ))}
-        </select>
+          field={field}
+          value={value}
+          onChange={onChange}
+          describedBy={describedBy}
+        />
       ) : field.type === "textarea" ? (
         <textarea
           id={id}
           aria-required={field.required || undefined}
+          aria-describedby={describedBy}
           rows={5}
           value={value ?? ""}
           placeholder={field.placeholder}
@@ -155,6 +157,7 @@ export function FieldInput({
           <input
             id={id}
             aria-required={field.required || undefined}
+            aria-describedby={describedBy}
             type={field.type === "number" ? "number" : "text"}
             value={value ?? ""}
             placeholder={field.placeholder}
@@ -185,8 +188,140 @@ export function FieldInput({
           )}
         </div>
       )}
-      {field.description && <small>{field.description}</small>}
-    </label>
+      {field.description && <small id={describedBy}>{field.description}</small>}
+    </div>
+  );
+}
+/** Field types drawn as a list of what the hub has (`shared/fieldChoices.ts`). */
+const PICKERS = new Set([
+  "thread",
+  "runtime",
+  "box",
+  "account",
+  "permission-mode",
+  "speaker",
+  "job",
+  "trash-item",
+  "watch",
+  "device",
+  "memory-note",
+  "held",
+  "scopes",
+]);
+function isPicker(field: Field) {
+  return !!field.type && PICKERS.has(field.type);
+}
+/** A select of `field`'s choices (labelled), or its plain `options`: an empty choice first
+ * ("Choose…" when required, else what leaving it empty does), and the current value even
+ * when the list doesn't have it, so the form sends what it shows. A `custom` picker ends
+ * with **Other…** instead, which turns it into a text box (a button turns it back), and
+ * shows a value the list lacks there. */
+function ChoiceSelect({
+  id,
+  field,
+  value,
+  onChange,
+  describedBy,
+}: {
+  id: string;
+  field: Field;
+  value: any;
+  onChange: (v: any) => void;
+  describedBy?: string;
+}) {
+  const current = value === undefined || value === null ? "" : String(value);
+  const choices: NonNullable<Field["choices"]> =
+    field.choices ?? (field.options || []).map((o) => ({ value: o, label: o }));
+  const listed = current === "" || choices.some((c) => c.value === current);
+  const custom = !!field.custom && !field.loading;
+  const [typing, setTyping] = useState(false);
+  // Where focus goes once the control is swapped: the text box after Other…, the list
+  // after "Choose from the list".
+  const refocus = useRef(false);
+  const control = useRef<HTMLInputElement & HTMLSelectElement>(null);
+  const asText = custom && (typing || !listed);
+  useEffect(() => {
+    if (!refocus.current) return;
+    refocus.current = false;
+    control.current?.focus();
+  }, [asText]);
+  const empty = field.required
+    ? "Choose…"
+    : field.empty || (field.keep ? "Keep current" : "Keep default");
+  if (asText)
+    return (
+      <div className="input-with-button">
+        <input
+          ref={control}
+          id={id}
+          aria-label={field.label}
+          aria-required={field.required || undefined}
+          aria-describedby={describedBy}
+          type="text"
+          value={current}
+          placeholder={field.placeholder}
+          onChange={(e) => onChange(e.target.value)}
+          autoComplete="off"
+          spellCheck={false}
+        />
+        <button
+          type="button"
+          aria-label={`Choose ${field.label.toLowerCase()} from the list`}
+          title="Choose from the list"
+          onClick={() => {
+            refocus.current = true;
+            setTyping(false);
+            onChange("");
+          }}
+        >
+          <List size={16} aria-hidden="true" />
+        </button>
+      </div>
+    );
+  // A required field whose value is set and listed needs no empty choice; a form opened
+  // with a default (`initial`) keeps its "Choose…" only while it has no value. A field
+  // whose default is one of its choices ("The project's default") needs none either: an
+  // empty "Keep default" would say the same thing twice.
+  const explicitDefault =
+    field.initial !== undefined &&
+    field.initial !== "" &&
+    choices.some((c) => c.value === String(field.initial));
+  return (
+    <select
+      ref={control}
+      id={id}
+      // Named by the field alone: a wrapping label would add the chosen option's text.
+      aria-label={field.label}
+      aria-required={field.required || undefined}
+      aria-describedby={describedBy}
+      aria-busy={field.loading || undefined}
+      disabled={field.loading}
+      value={current}
+      onChange={(e) => {
+        if (e.target.value === CUSTOM) {
+          refocus.current = true;
+          setTyping(true);
+          onChange("");
+        } else onChange(e.target.value);
+      }}
+    >
+      {field.loading ? (
+        <option value={current}>Loading…</option>
+      ) : (
+        <>
+          {((!field.required && !explicitDefault) || current === "") && (
+            <option value="">{empty}</option>
+          )}
+          {choices.map((c) => (
+            <option key={c.value} value={c.value} title={c.description}>
+              {c.label || c.value}
+            </option>
+          ))}
+          {!listed && <option value={current}>{current}</option>}
+          {custom && <option value={CUSTOM}>Other…</option>}
+        </>
+      )}
+    </select>
   );
 }
 const CUSTOM = "\u0000custom";
@@ -200,24 +335,35 @@ export function ModelSelect({
   onChange,
   choices,
   keep = false,
+  unset,
   custom = true,
   required = false,
   label,
+  describedBy,
 }: {
   id?: string;
   value: string;
   onChange: (v: string) => void;
   choices: { value: string; description?: string }[];
   keep?: boolean;
+  /** The empty choice takes a configured value, labelled this; `default` is then its own. */
+  unset?: string;
   custom?: boolean;
   required?: boolean;
   label?: string;
+  describedBy?: string;
 }) {
+  const named = keep || Boolean(unset);
   const listed =
     value === "" ||
-    (keep && value === "default") ||
+    (named && value === "default") ||
     choices.some((c) => c.value === value);
   const [typing, setTyping] = useState(!listed);
+  // A value this list doesn't have, with no custom id to show it in (an effort another
+  // runtime took, its runtime since changed), would go out unseen: it goes.
+  useEffect(() => {
+    if (!custom && value && !listed) onChange("");
+  }, [custom, value, listed]);
   if (custom && (typing || !listed))
     return (
       <div className="input-with-button">
@@ -225,6 +371,7 @@ export function ModelSelect({
           id={id}
           aria-label={label}
           aria-required={required || undefined}
+          aria-describedby={describedBy}
           type="text"
           value={value}
           placeholder="Model id, as the runtime names it"
@@ -250,6 +397,7 @@ export function ModelSelect({
       id={id}
       aria-label={label}
       aria-required={required || undefined}
+      aria-describedby={describedBy}
       value={listed ? value : ""}
       onChange={(e) => {
         if (e.target.value === CUSTOM) {
@@ -258,8 +406,10 @@ export function ModelSelect({
         } else onChange(e.target.value);
       }}
     >
-      <option value="">{keep ? "Keep current" : "Runtime default"}</option>
-      {keep && <option value="default">Runtime default</option>}
+      <option value="">
+        {keep ? "Keep current" : unset || "Runtime default"}
+      </option>
+      {named && <option value="default">Runtime default</option>}
       {choices.map((c) => (
         <option key={c.value} value={c.value}>
           {c.description ? `${c.value} — ${c.description}` : c.value}
@@ -479,11 +629,19 @@ const markdownComponents = {
     </div>
   ),
 };
-export const Markdown = memo(function Markdown({ text }: { text: string }) {
+export const Markdown = memo(function Markdown({
+  text,
+  className = "markdown",
+  remarkPlugins = [],
+}: {
+  text: string;
+  className?: string;
+  remarkPlugins?: PluggableList;
+}) {
   return (
-    <div className="markdown">
+    <div className={className}>
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, ...remarkPlugins]}
         components={markdownComponents}
       >
         {text}

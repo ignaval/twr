@@ -124,6 +124,9 @@ struct Current {
     play: u64,
     entry: Entry,
     utterances: Vec<String>,
+    /// Each utterance's language: the message's for its chunks, none for twr's own words
+    /// around them ("Reading 3 messages.").
+    langs: Vec<Option<&'static str>>,
     chunk: usize,
     /// Its place in the batch, if it is a batch message: (n from 1, of).
     batch: Option<(u32, u32)>,
@@ -208,6 +211,29 @@ impl Machine {
     /// Whether live reading is on for `ws`.
     pub fn live(&self, ws: &str) -> bool {
         self.live.get(ws).copied().unwrap_or(false)
+    }
+
+    /// The prefs the current chunk is said with: the voice of its language, if `voices` has
+    /// one ([`Prefs::for_language`]).
+    pub fn current_prefs(&self) -> Prefs {
+        let lang = self
+            .current
+            .as_ref()
+            .and_then(|c| c.langs.get(c.chunk).copied().flatten());
+        self.prefs.for_language(lang)
+    }
+
+    /// The chunk said after the current one, if it is of the same entry, with its prefs (for
+    /// [`Engine::prepare`]).
+    pub fn upcoming(&self) -> Option<(&str, Prefs)> {
+        let c = self.current.as_ref()?;
+        let next = c.chunk + 1;
+        let text = c.utterances.get(next)?;
+        Some((
+            text,
+            self.prefs
+                .for_language(c.langs.get(next).copied().flatten()),
+        ))
     }
 
     /// The chunk that should be audible now (if not paused), and its text.
@@ -619,6 +645,11 @@ impl Machine {
         self.prefs.voice = voice;
     }
 
+    /// Use `voices` (a voice per language) from the next chunk on.
+    pub fn set_voices(&mut self, voices: BTreeMap<String, String>) {
+        self.prefs.voices = voices;
+    }
+
     /// Speak at `rate` words per minute from the next chunk on.
     pub fn set_rate(&mut self, rate: u32) {
         self.prefs.rate = rate;
@@ -666,6 +697,7 @@ impl Machine {
         }
         let several_live = self.live.values().filter(|on| **on).count() > 1;
         let mut utterances = Vec::new();
+        let mut langs = Vec::new();
         let mut batch = None;
         if in_batch {
             if let Some(b) = &mut self.batch {
@@ -688,7 +720,10 @@ impl Machine {
                         secs.div_ceil(60)
                     ));
                 }
+                let lang = twr_core::speech::language(&m.chunks.join(" "));
+                langs.resize(utterances.len(), None);
                 utterances.extend(m.chunks.iter().cloned());
+                langs.resize(utterances.len(), lang);
                 if m.truncated {
                     utterances.push("message cut short; the rest is on screen.".into());
                 }
@@ -702,10 +737,12 @@ impl Machine {
         }
         let play = self.next_play;
         self.next_play += 1;
+        langs.resize(utterances.len(), None);
         self.current = Some(Current {
             play,
             entry,
             utterances,
+            langs,
             chunk: 0,
             batch,
         });
@@ -814,12 +851,15 @@ impl Player {
         }
         if self.active.is_none() && !paused {
             if let Some((key, text)) = self.machine.current() {
-                let future = self.engine.speak(text, self.machine.prefs());
+                let future = self.engine.speak(text, &self.machine.current_prefs());
                 self.active = Some(Active {
                     key,
                     future,
                     native_paused: false,
                 });
+                if let Some((next, prefs)) = self.machine.upcoming() {
+                    self.engine.prepare(next, &prefs);
+                }
             }
         }
     }
@@ -842,6 +882,7 @@ impl Player {
 mod tests {
     use super::*;
     use crate::engine::{FakeEngine, FakeEvent};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     fn msg(ws: &str, seq: u64, chunks: &[&str], origin: Origin) -> Msg {
@@ -1510,6 +1551,72 @@ mod tests {
         assert_eq!(prefs[0], Prefs::default());
         assert_eq!(prefs[1].voice.as_deref(), Some("Ava"));
         assert_eq!(prefs[1].rate, 220);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_message_is_read_with_the_voice_of_its_language() {
+        let (e, h) = FakeEngine::timed(Duration::from_secs(1));
+        let mut p = Player::new(Box::new(e), Prefs::default());
+        p.machine.set_voice(Some("Ava".into()));
+        p.machine.set_voices(BTreeMap::from([(
+            "es".to_string(),
+            "kokoro/ef_dora".to_string(),
+        )]));
+        p.machine.set_live("w", true);
+        p.machine.push(live(
+            "w",
+            1,
+            &[
+                "Revisé el cambio y pasan las pruebas.",
+                "¿Quieres que lo publique ahora?",
+            ],
+        ));
+        p.machine
+            .push(live("w", 2, &["The build is green and the tests pass."]));
+        p.machine.push(live("w", 3, &["ok"]));
+        run_for(&mut p, Duration::from_secs(60)).await;
+        let said: Vec<(String, Option<String>, Option<String>)> = h
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                FakeEvent::Speak { chunk, prefs } => Some((chunk, prefs.voice, prefs.lang)),
+                _ => None,
+            })
+            .collect();
+        let es = (Some("kokoro/ef_dora".to_string()), Some("es".to_string()));
+        assert_eq!((said[0].1.clone(), said[0].2.clone()), es);
+        assert_eq!((said[1].1.clone(), said[1].2.clone()), es);
+        assert_eq!(said[2].1.as_deref(), Some("Ava"));
+        assert_eq!(said[2].2.as_deref(), Some("en"));
+        // Too short to tell: the default voice, no language.
+        assert_eq!(
+            (said[3].1.as_deref(), said[3].2.as_deref()),
+            (Some("Ava"), None)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_engine_hears_of_the_next_chunk_while_one_plays() {
+        let (e, _h) = FakeEngine::timed(Duration::from_secs(1));
+        let prepared = Arc::new(Mutex::new(Vec::new()));
+        struct Spy(FakeEngine, Arc<Mutex<Vec<String>>>);
+        impl Engine for Spy {
+            fn name(&self) -> &str {
+                "spy"
+            }
+            fn speak(&mut self, chunk: &str, prefs: &Prefs) -> crate::engine::SpeakFuture {
+                self.0.speak(chunk, prefs)
+            }
+            fn prepare(&mut self, next: &str, _prefs: &Prefs) {
+                self.1.lock().unwrap().push(next.to_string());
+            }
+        }
+        let mut p = Player::new(Box::new(Spy(e, prepared.clone())), Prefs::default());
+        p.machine.set_live("w", true);
+        p.machine.push(live("w", 1, &["a", "b", "c"]));
+        run_for(&mut p, Duration::from_secs(60)).await;
+        // While "a" plays, "b"; while "b", "c"; nothing after the last.
+        assert_eq!(*prepared.lock().unwrap(), vec!["b", "c"]);
     }
 
     #[tokio::test(start_paused = true)]

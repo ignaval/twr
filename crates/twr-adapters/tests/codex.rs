@@ -1417,6 +1417,7 @@ fn thread_params_for_new_and_resumed_threads() {
         params,
         mode_note,
         added_instructions,
+        keep_own_mcp,
     } = thread_params(&SpawnConfig {
         model: Some("gpt-6-astra".into()),
         system_append: Some("Be brief.".into()),
@@ -1429,6 +1430,7 @@ fn thread_params_for_new_and_resumed_threads() {
         added_instructions, None,
         "the sandbox note is for auto only"
     );
+    assert!(!keep_own_mcp);
     assert_eq!(
         params,
         json!({"cwd": FIXTURE_CWD, "approvalPolicy": "untrusted", "approvalsReviewer": "user",
@@ -2767,6 +2769,43 @@ fn an_mcp_allowlist_turns_the_users_servers_off() {
     let out = tr.translate(r#"{"id":1,"result":{}}"#);
     assert!(!out.replies.iter().any(|l| l.contains("config/read")));
     assert!(tr.translate(&status("anything")).fatal.is_none());
+}
+
+/// A thread that keeps the user's own servers (`keep_own_mcp`, the orchestrator with full
+/// access) gets twr's server added with no allowlist: no config read before it opens, nothing
+/// turned off, and a server of the user's starting is fine.
+#[test]
+fn keeping_the_users_servers_adds_twrs_without_an_allowlist() {
+    let own = SpawnConfig {
+        mcp_config: Some(json!({"mcpServers": {"twr": {"command": "twr"}}})),
+        allowed_tools: vec!["mcp__twr".into()],
+        keep_own_mcp: true,
+        mode: "bypassPermissions".into(),
+        ..cfg("manual")
+    };
+    let mut tr = new_translator(&own, TranslatorOptions::default());
+    tr.start();
+    let out = tr.translate(r#"{"id":1,"result":{}}"#);
+    assert!(!out.replies.iter().any(|l| l.contains("config/read")));
+    let start = out
+        .replies
+        .iter()
+        .map(|l| parse(l))
+        .find(|r| r["method"] == "thread/start")
+        .expect("the thread opens at once");
+    let c = &start["params"]["config"];
+    assert_eq!(
+        c["mcp_servers"],
+        json!({"twr": {"command": "twr", "default_tools_approval_mode": "approve"}})
+    );
+    for f in codex::STRICT_MCP_FEATURES_OFF {
+        assert!(c.get(format!("features.{f}")).is_none(), "{f}");
+    }
+    assert_eq!(start["params"]["sandbox"], "danger-full-access");
+    let status = json!({"method": "mcpServer/startupStatus/updated",
+        "params": {"threadId": "th", "name": "github", "status": "starting"}})
+    .to_string();
+    assert!(tr.translate(&status).fatal.is_none());
 }
 
 /// `codex resume` keeps the built-in tool groups the thread turned off (`-c` overrides), and

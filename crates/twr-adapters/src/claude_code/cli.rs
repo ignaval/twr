@@ -3,9 +3,10 @@
 //! Claude Code's options change between versions: `--permission-prompts` first appeared in
 //! 2.1.259 (and defaults to `host` there), and before 2.1.200 the `manual` permission mode was
 //! called `default`. The adapter reads both outputs before the first spawn of a binary and
-//! caches what it found per binary and `PATH` (its resolved path, size and modification time,
-//! so a `claude update` is noticed, and the `PATH` it was probed with: a wrapper such as
-//! `exec claude-real "$@"` runs another `claude` on another `PATH`), then:
+//! caches what it found per binary and `PATH` (the path it was found at, the file that path
+//! leads to with its size and modification time, so a `claude update` is noticed, and the
+//! `PATH` it was probed with: a wrapper such as `exec claude-real "$@"` runs another `claude`
+//! on another `PATH`), then:
 //!
 //! - passes `--permission-prompts host` only when `--help` lists it (`--permission-prompt-tool
 //!   stdio` is always passed: it routes prompts to twr in every version);
@@ -21,7 +22,9 @@
 //! What is found describes this box's binary only: the interactive attach fits its command to
 //! the cache (never probing), and the hub's attach to a thread on another box uses none of it
 //! (`ClaudeCodeAdapter::remote_attach_command`); a runner probes its own box's binary. The
-//! binary probed is the one the spawn runs: resolved as the spawn resolves it
+//! binary probed is the one the spawn runs, by the path the spawn runs (never the file a link
+//! leads to: a multi-call binary such as mise's command wrappers, links named `claude` to
+//! `mise`, is Claude Code only when run by that name): resolved as the spawn resolves it
 //! ([`crate::resolve::resolve`]: on the runtime's `PATH`, its thread's or the one a runner
 //! gave it, else the hub's), and `--help` / `--version` run with that `PATH` too (a Node
 //! script finds its `node` there), in the runtime's working directory. A `PATH` with a
@@ -346,6 +349,11 @@ pub fn refused_options_hint(stderr: &str, program: &Path, unread: Option<&str>) 
 /// the directory is part of it as well.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BinaryId {
+    /// The path the program was found at, as the spawn runs it: what the probe runs, so a
+    /// multi-call binary behind a link (`claude` → `mise`) answers as that program.
+    found: PathBuf,
+    /// The file `found` leads to, links followed: with `len` and `modified`, tells an updated
+    /// binary (`claude update` moves the link).
     path: PathBuf,
     /// The `PATH` the probe runs with, the one the spawn gets: the runtime's
     /// ([`Resolved::path`]), else this process's; `None` when there is none.
@@ -357,14 +365,15 @@ struct BinaryId {
     modified: Option<SystemTime>,
 }
 
-/// What results and probes are kept by: a binary's resolved path, the `PATH` it runs with and,
-/// when that `PATH` depends on it, the working directory ([`BinaryId`]; its size and
-/// modification time tell a result that is out of date).
+/// What results and probes are kept by: the path a binary was found at, the `PATH` it runs
+/// with and, when that `PATH` depends on it, the working directory ([`BinaryId`]; the file it
+/// leads to, with its size and modification time, tells a result that is out of date). Not the
+/// file the path leads to: mise's `claude` and `codex` wrappers are both links to `mise`.
 type Key = (PathBuf, Option<std::ffi::OsString>, Option<PathBuf>);
 
 impl BinaryId {
     fn key(&self) -> Key {
-        (self.path.clone(), self.search.clone(), self.dir.clone())
+        (self.found.clone(), self.search.clone(), self.dir.clone())
     }
 }
 
@@ -505,7 +514,8 @@ pub fn cached(bin: &Resolved, cwd: &Path) -> Option<Support> {
 /// working directory `cwd` (an empty one: this process's, as the spawn inherits it): `None`
 /// when none was found.
 fn identify(bin: &Resolved, cwd: &Path) -> Option<BinaryId> {
-    let path = std::fs::canonicalize(bin.found.as_ref()?).ok()?;
+    let found = bin.found.clone()?;
+    let path = std::fs::canonicalize(&found).ok()?;
     let meta = std::fs::metadata(&path).ok()?;
     let search = bin.path.clone().or_else(|| std::env::var_os("PATH"));
     let dir = relative_entry(search.as_deref()).then(|| {
@@ -516,6 +526,7 @@ fn identify(bin: &Resolved, cwd: &Path) -> Option<BinaryId> {
         }
     });
     Some(BinaryId {
+        found,
         path,
         search,
         dir,
@@ -539,7 +550,7 @@ async fn fly(flight: Arc<Flight>, limit: Duration) {
                 if flight.done.receiver_count() == 0 {
                     land(&mut cache, &flight);
                     tracing::debug!(
-                        program = %flight.id.path.display(),
+                        program = %flight.id.found.display(),
                         "claude-code: no spawn waits for the CLI probe any more; killing it"
                     );
                     return;
@@ -585,8 +596,8 @@ impl Drop for Landed {
 async fn probe(id: &BinaryId, cwd: &Path, limit: Duration) -> (Help, bool) {
     let path = id.search.as_deref();
     let (help, version) = tokio::join!(
-        run_for_output(&id.path, "--help", path, cwd, limit),
-        run_for_output(&id.path, "--version", path, cwd, limit)
+        run_for_output(&id.found, "--help", path, cwd, limit),
+        run_for_output(&id.found, "--version", path, cwd, limit)
     );
     let (version, version_known) = match &version {
         Ran::Exited(0, out) => (Some(out.as_str()), true),
@@ -608,14 +619,14 @@ async fn probe(id: &BinaryId, cwd: &Path, limit: Duration) -> (Help, bool) {
     let definite = matches!(help, Help::Read(_)) && version_known;
     match &help {
         Help::Read(s) => tracing::info!(
-            program = %id.path.display(),
+            program = %id.found.display(),
             version = ?s.version.map(|v| v.to_string()),
             permission_prompts = s.lists(PERMISSION_PROMPTS),
             cached = definite,
             "claude-code: read what the CLI supports"
         ),
         Help::Unread(why) => tracing::warn!(
-            program = %id.path.display(),
+            program = %id.found.display(),
             %why,
             "claude-code: `--help` could not be read; passing every option"
         ),
@@ -1127,6 +1138,57 @@ Commands:
 
     fn cached_support(bin: &Path) -> Option<Support> {
         cached(&at(bin), Path::new("/"))
+    }
+
+    /// A multi-call binary behind a link, as mise's command wrappers are (`claude` → `mise`):
+    /// the probe runs the link, so it answers as Claude Code, not as `mise` (`2026.11.7`, no
+    /// `--input-format`), and two links to it are two programs with results of their own.
+    #[tokio::test]
+    async fn a_linked_multi_call_binary_is_probed_by_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let help = help_of(d);
+        let mise = d.join("mise");
+        install(
+            &mise,
+            format!(
+                "#!/bin/sh
+case \"$(basename \"$0\"):$1\" in\n\
+                 claude:--help) echo probed >> {probes}; {help}; exit 0;;\n\
+                 claude:--version) echo '2.1.327 (Claude Code)'; exit 0;;\n\
+                 *:--version) echo '2026.11.7 linux-x64'; exit 0;;\n\
+                 *:--help) echo 'Usage: mise [OPTIONS] <COMMAND>'; echo; echo 'Options:'; \
+                 echo '  -v, --verbose  Show more'; exit 0;;\n\
+                 esac\nexit 9\n",
+                probes = d.join("probes").display()
+            ),
+        );
+        let bin = d.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let claude = bin.join("claude");
+        let codex = bin.join("codex");
+        std::os::unix::fs::symlink(&mise, &claude).unwrap();
+        std::os::unix::fs::symlink(&mise, &codex).unwrap();
+        for p in [&claude, &codex] {
+            let warm = std::process::Command::new(p)
+                .arg("--warm-up")
+                .status()
+                .unwrap();
+            assert_eq!(warm.code(), Some(9), "{}", p.display());
+        }
+
+        let (h, _) = look(&claude, LIMIT).await;
+        let s = h.support().unwrap();
+        assert_eq!(s.version, Some(Version(2, 1, 327)));
+        assert!(s.lists("--input-format"), "{s:?}");
+        assert!(plan(&claude, Some(s), "default", &args(&Default::default())).is_ok());
+        // The other link to the same file is probed as itself, not served Claude's result.
+        let (other, cached) = look(&codex, LIMIT).await;
+        assert!(!cached);
+        assert_eq!(other.support().unwrap().version, Some(Version(2026, 11, 7)));
+        assert!(!other.support().unwrap().lists("--input-format"));
+        assert_eq!(cached_support(&claude), Some(s.clone()));
+        assert_eq!(probes(d), 1);
     }
 
     /// A `--help` listing its options counts even when it exits non-zero; one that says

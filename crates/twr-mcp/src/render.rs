@@ -342,9 +342,11 @@ pub fn transcript_line(ev: &Value) -> Option<String> {
             }
             format!("text: {}", clip.field(&d, "text", FIELD_CAP))
         }
-        "conversation.update" | "project.read" | "memory.changed" | "context.compacted" => {
-            control_line(ev, &mut clip)
-        }
+        "conversation.update"
+        | "project.read"
+        | "memory.changed"
+        | "config.changed"
+        | "context.compacted" => control_line(ev, &mut clip),
         "agent.tool_call" => {
             let risky = if d.get("risky").and_then(Value::as_bool).unwrap_or(false) {
                 " [risky]"
@@ -405,6 +407,11 @@ fn control_line(ev: &Value, clip: &mut Clip) -> String {
         }
         "memory.changed" => {
             let p: twr_core::event::MemoryChanged =
+                serde_json::from_value(d.clone()).unwrap_or_default();
+            format!("hub: {}", clip.text(&p.line(), FIELD_CAP))
+        }
+        "config.changed" => {
+            let p: twr_core::event::ConfigChanged =
                 serde_json::from_value(d.clone()).unwrap_or_default();
             format!("hub: {}", clip.text(&p.line(), FIELD_CAP))
         }
@@ -1455,9 +1462,48 @@ pub fn loop_settings(s: &Value, kind: &str) -> String {
     out.join(" · ")
 }
 
+/// What a setup card (or a loop request) asks for, as `other` (or the request) gives it:
+/// `a single review pass`, `a review loop over last 2`, `an implementation loop`.
+fn card_work(kind: &str, once: bool, scope: Option<&str>) -> String {
+    let what = match (kind, once) {
+        ("implement", _) => "an implementation loop",
+        (_, true) => "a single review pass",
+        _ => "a review loop",
+    };
+    match scope {
+        Some(s) => format!("{what} over {s}"),
+        None => what.to_string(),
+    }
+}
+
 /// What the orchestrator tells the user when a loop it asked for on thread `name` waits for
-/// the setup card (`why`, `existing`: the card was already open).
-fn setup_words(name: &str, why: &str, existing: bool) -> String {
+/// the setup card (`why`, `existing`: the card was already open; `other`: what that card
+/// starts, when it is other work than this request's).
+fn setup_words(name: &str, why: &str, existing: bool, other: Option<&Value>) -> String {
+    if let Some(o) = other.filter(|o| o.is_object()) {
+        let work = card_work(
+            str_of(o, "kind"),
+            o["once"].as_bool() == Some(true),
+            o["scope"].as_str(),
+        );
+        // The task as the user reads it: its files by name, never their paths.
+        let task = o["task"]
+            .as_str()
+            .map(|t| {
+                let (text, files) = twr_core::upload::split_attachments(t);
+                let mut t = one_line_cut(&text, 200).0;
+                if !files.is_empty() {
+                    t.push_str(&format!(", with {}", files.join(", ")));
+                }
+                format!(" (task: {t})")
+            })
+            .unwrap_or_default();
+        return format!(
+            "{name} already has a setup card waiting for you, for {work}{task}, not what I just \
+             asked for: answering Start on it starts that. To run what I asked for instead, \
+             cancel that card and tell me, and I'll ask again."
+        );
+    }
     if existing {
         return format!(
             "{name}'s loop setup card is already waiting for you: the loop starts once you \
@@ -1500,6 +1546,9 @@ pub fn loop_request(r: &Value, name: &str) -> Value {
             if let Some(p) = r.get("settings_of").filter(|p| p.is_string()) {
                 out["settings_of"] = p.clone();
             }
+            if l.get("once").and_then(Value::as_bool) == Some(true) {
+                out["once"] = Value::Bool(true);
+            }
             out
         }
         "needs_setup" => {
@@ -1508,10 +1557,13 @@ pub fn loop_request(r: &Value, name: &str) -> Value {
                 "status": "needs_setup",
                 "attn_id": r["attn_id"],
                 "why": r["why"],
-                "tell_user": setup_words(name, str_of(r, "why"), existing),
+                "tell_user": setup_words(name, str_of(r, "why"), existing, r.get("other")),
             });
             if existing {
                 out["existing"] = Value::Bool(true);
+            }
+            if let Some(o) = r.get("other").filter(|o| o.is_object()) {
+                out["other"] = o.clone();
             }
             out
         }
@@ -1599,8 +1651,11 @@ const LOOP_ROUNDS: usize = 30;
 pub fn loop_state(r: &Value) -> String {
     let name = str_of(r, "thread_name");
     let kind = str_of(r, "kind");
+    let once = r["started"].get("once").and_then(Value::as_bool) == Some(true);
     let words_of_kind = if kind == "implement" {
         "implementation loop"
+    } else if once {
+        "single review pass"
     } else {
         "review loop"
     };
@@ -2099,6 +2154,23 @@ mod tests {
             control_body(&event),
             "hub: forgot memory short-replies (by you)"
         );
+        let event = json!({"seq": 8, "thread": "orch", "kind": "config.changed",
+            "data": {"key": "tui.suggest", "value": false, "before": true,
+                "by": "orchestrator", "effect": "the next time a TUI starts"}});
+        assert_eq!(
+            transcript_line(&event).as_deref(),
+            Some(
+                "hub: set tui.suggest = false (was true); takes effect the next time a TUI starts"
+            )
+        );
+        let event = json!({"seq": 9, "kind": "config.changed",
+            "data": {"key": "threads.default_mode", "value": "plan", "by": "user",
+                "effect": "when the hub restarts (`twr hub stop`, then `twr`)"}});
+        assert_eq!(
+            control_body(&event),
+            "hub: set threads.default_mode = \"plan\" (was unset) (by you); takes effect when \
+             the hub restarts (`twr hub stop`, then `twr`)"
+        );
     }
 
     /// Every shortened field (a cap cut or a `_capped` preview) ends its line with the hint.
@@ -2574,5 +2646,31 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("export's loop setup card is already waiting for you"));
+        // A card for other work than the request's: what it starts, its files by name.
+        let r = loop_request(
+            &json!({"status": "needs_setup", "attn_id": "A1", "why": "first_run",
+                    "existing": true,
+                    "other": {"kind": "review", "once": false, "scope": "branch", "task": null}}),
+            "api",
+        );
+        assert_eq!(r["other"]["once"], false);
+        assert_eq!(
+            r["tell_user"],
+            "api already has a setup card waiting for you, for a review loop over branch, not \
+             what I just asked for: answering Start on it starts that. To run what I asked for \
+             instead, cancel that card and tell me, and I'll ask again."
+        );
+        let r = loop_request(
+            &json!({"status": "needs_setup", "attn_id": "A1", "why": "asked", "existing": true,
+                    "other": {"kind": "implement", "once": false, "scope": null,
+                              "task": "add CSV export\nUploaded file: spec.md\n/w/.twr-uploads/u1/spec.md"}}),
+            "api",
+        );
+        let words = r["tell_user"].as_str().unwrap();
+        assert!(
+            words.contains("for an implementation loop (task: add CSV export, with spec.md), not")
+                && !words.contains(".twr-uploads"),
+            "{words}"
+        );
     }
 }

@@ -635,6 +635,8 @@ pub struct Speak {
     pub voice: Option<String>,
     /// `--rate` (80 to 500, checked by clap).
     pub rate: Option<u32>,
+    /// `--voice-for LANG=VOICE`, each.
+    pub voice_for: Vec<String>,
     /// `--print-service`.
     pub print_service: bool,
     /// `--control stdio`: controls on stdin, what it plays on stdout ([`stdio_keys`]).
@@ -705,6 +707,30 @@ fn parse_engine(name: &str) -> anyhow::Result<SpeechEngine> {
         .map_err(|_| anyhow::anyhow!("--engine {name:?}: say, avspeech, spd or command"))
 }
 
+/// `--voice-for LANG=VOICE`s as a voice per language, checked as `[speech] voices` is.
+fn parse_voice_for(given: &[String]) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let mut voices = std::collections::BTreeMap::new();
+    for g in given {
+        let Some((lang, voice)) = g.split_once('=') else {
+            anyhow::bail!("--voice-for {g:?}: LANG=VOICE (es=kokoro/ef_dora)");
+        };
+        let (lang, voice) = (lang.trim(), voice.trim());
+        if !twr_core::speech::LANGUAGES.contains(&lang) {
+            anyhow::bail!(
+                "--voice-for {g:?}: {lang:?} is not a language twr tells apart ({})",
+                twr_core::speech::LANGUAGES.join(", ")
+            );
+        }
+        if let Some(e) =
+            twr_core::speech::name_error("--voice-for", voice, twr_speech::speaker::VOICE_MAX)
+        {
+            anyhow::bail!("{e}");
+        }
+        voices.insert(lang.to_string(), voice.to_string());
+    }
+    Ok(voices)
+}
+
 /// `twr speak`: a speaker on this machine until `q`, SIGINT, SIGTERM or SIGHUP; with
 /// `--print-service`, the service that runs it.
 pub async fn speak(args: Speak, paths: &Paths) -> anyhow::Result<()> {
@@ -727,6 +753,7 @@ pub async fn speak(args: Speak, paths: &Paths) -> anyhow::Result<()> {
         anyhow::bail!("{e}");
     }
     let engine_override = args.engine.as_deref().map(parse_engine).transpose()?;
+    let voices = parse_voice_for(&args.voice_for)?;
     if args.print_service {
         return print_service(&args);
     }
@@ -735,7 +762,7 @@ pub async fn speak(args: Speak, paths: &Paths) -> anyhow::Result<()> {
     if args.announce && !config.speech.read.contains(&ReadKind::Attention) {
         config.speech.read.push(ReadKind::Attention);
     }
-    let engine = twr_speech::from_config(&config.speech, engine_override)?;
+    let engine = twr_speech::from_config(&config.speech, engine_override, &root.data_dir)?;
     let (mut sigint, mut sigterm, mut sighup) = (
         signal(SignalKind::interrupt()).context("handling SIGINT")?,
         signal(SignalKind::terminate()).context("handling SIGTERM")?,
@@ -763,10 +790,13 @@ pub async fn speak(args: Speak, paths: &Paths) -> anyhow::Result<()> {
         config: config.speech.clone(),
         voice: args.voice.clone(),
         rate: args.rate,
+        voices,
         state: StateStore::in_data_dir(&root.data_dir),
         report: Some(report),
         tty_keys_once_attached: tty,
         observe: args.control_stdio.then(stdio_observer),
+        // A voice chosen in the desktop app's settings is heard at once.
+        voices_source: Some(twr_speech::config_voices(root.config_file.clone())),
     };
     // The device id this speaker speaks as, shared by every speaker of this machine (the
     // TUI's own too): a driver aims `speech.control` at it when this one stands by.

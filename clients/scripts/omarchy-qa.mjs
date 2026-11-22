@@ -16,6 +16,7 @@
 // those stock themes. Writes test-results/omarchy-qa.json,
 // test-results/omarchy-themes.json and test-results/omarchy-themes/ (a screenshot of each
 // theme, one taken right after each switch, and every measured pair).
+import { floatTestWindow } from "./hyprland-window.mjs";
 import { _electron as electron, expect } from "@playwright/test";
 import { stopFixture } from "./fixture-cleanup.mjs";
 import { auditScreen, focusRing, shortfalls } from "./omarchy-audit.mjs";
@@ -340,7 +341,8 @@ const captureSurfaces = async (mode) => {
     .getByRole("button", { name: "Close dialog", exact: true })
     .click();
   await page
-    .getByRole("button", { name: "Open command palette", exact: true })
+    .locator(".sidebar-footer")
+    .getByRole("button", { name: "Commands", exact: true })
     .click();
   const palette = page.getByRole("dialog", { name: "Commands", exact: true });
   await palette.waitFor();
@@ -538,6 +540,9 @@ const threadItem = (name) =>
 const selectThread = async (name) => {
   await sidebarShown();
   await threadItem(name).locator(".thread-card").click();
+  await page
+    .getByRole("button", { name: "Show thread details", exact: true })
+    .click();
   await page.locator("#twr-inspector").waitFor();
 };
 const closeInspector = async () => {
@@ -694,8 +699,9 @@ const auditTheme = async (unit) => {
     .getByText("Loading loop settings…")
     .waitFor({ state: "hidden", timeout: 30000 });
   await add("loop-editor");
+  // The first visible field: the controls past the preset may sit behind Customize.
   const editorField = editor
-    .locator("select, input:not([type=checkbox], [type=radio])")
+    .locator("select:visible, input:not([type=checkbox], [type=radio]):visible")
     .first();
   if (await editorField.count()) {
     await keyboardFocus(editorField);
@@ -709,10 +715,12 @@ const auditTheme = async (unit) => {
   await page.locator(".manager .attention-card").first().waitFor();
   await add("needs-you");
   await navTo("Settings");
+  await page.getByRole("tab", { name: "General", exact: true }).click();
   await page
     .getByRole("heading", { name: "Appearance", exact: true })
     .waitFor();
   await add("settings");
+  await page.getByRole("tab", { name: "Loops", exact: true }).click();
   const loopSettings = page
     .locator(".settings-section")
     .filter({ has: page.getByRole("heading", { name: "Loops", exact: true }) });
@@ -1097,6 +1105,7 @@ try {
     colorScheme: null,
     timeout: 60000,
   });
+  await floatTestWindow(application.process().pid);
   for (const stream of [
     application.process().stdout,
     application.process().stderr,
@@ -1156,6 +1165,7 @@ try {
     .locator(".sidebar-footer")
     .getByRole("button", { name: "Settings", exact: true })
     .click();
+  await page.getByRole("tab", { name: "General", exact: true }).click();
   await page.getByRole("button", { name: "System", exact: true }).click();
   const light = await verifySystem(palettes.light);
   await captureSurfaces("light");

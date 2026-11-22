@@ -2108,7 +2108,7 @@
   {
     "id": "cli:loop review",
     "title": "twr loop review",
-    "description": "Start a review loop on a thread's work: an adversarial reviewer (another model, run read-only) reviews it round after round, and the thread verifies and fixes or dismisses each finding, until the reviewer has nothing left. It starts at once on your saved loop settings and prints them. The first time, or with --setup, or when a saved setting no longer holds, the thread's settings card comes first: on a terminal you answer it here (1 start and save, 2 change… in your editor, 3 cancel); without one it stays open, this prints the `twr respond` line that starts it, and exits 2. No flag starts a first loop without that card",
+    "description": "Start a review loop on a thread's work: an adversarial reviewer (another model, run read-only) reviews it round after round, and the thread verifies and fixes or dismisses each finding, until the reviewer has nothing left. It starts at once on your saved loop settings and prints them. The first time, or with --setup, or when a saved setting no longer holds, the thread's settings card comes first: on a terminal you answer it here (1 start and save, 2 change… in your editor, 3 cancel); without one it stays open, this prints the `twr respond` line that starts it, and exits 2. No flag starts a first loop without that card. With --once it is a single pass: one review, the thread's triage of what it found, then the report",
     "group": "CLI · loop",
     "fields": [
       {
@@ -2123,6 +2123,13 @@
         "label": "setup",
         "type": "boolean",
         "description": "Show the settings card first, even when saved settings hold; starting from it saves what it shows",
+        "advanced": false
+      },
+      {
+        "key": "once",
+        "label": "once",
+        "type": "boolean",
+        "description": "A single pass: one review run at the profile's strongest tier, the thread's triage of its findings, then the report. No second round, sweep or verification",
         "advanced": false
       },
       {
@@ -2189,6 +2196,12 @@
       {
         "key": "setup",
         "flag": "--setup",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "once",
+        "flag": "--once",
         "many": false,
         "separator": false
       },
@@ -2771,7 +2784,7 @@
   {
     "id": "cli:model",
     "title": "twr model",
-    "description": "Show or set a thread's runtime, model and reasoning effort. With only the thread, shows them. The model is the runtime's own id or alias (Claude Code: `fable`, `opus`, `sonnet`, or a full id such as `claude-fable-5-2`); `default` returns the model or the effort to the runtime's default (once the thread has a session, only where a resumed session takes it: Claude Code's effort; the hub refuses the rest, except with `--runtime`). A running runtime finishes its turn first, then restarts on the same session with them; an idle one restarts now; a parked or stopped one starts with them next time. With `--runtime`, the thread moves to that runtime: its current runtime stops (after the turn it runs), and its next turn starts a new session of the new one, given a handoff of what the previous session did; a model or effort left out is the new runtime's default. Moving back to a runtime it left a session of resumes that session instead, told what the thread did since, with the settings it had (`default` starts a new one). Not for the orchestrator (switch it with `twr orchestrator use`); a pty thread can only move to another runtime",
+    "description": "Show or set a thread's runtime, model and reasoning effort. With only the thread, shows them. The model is the runtime's own id or alias (Claude Code: `fable`, `opus`, `sonnet`, or a full id such as `claude-fable-5-2`); `default` returns the model or the effort to the runtime's default (once the thread has a session, only where a resumed session takes it: Claude Code's effort; the hub refuses the rest, except with `--runtime`). A running runtime finishes its turn first, then restarts on the same session with them; an idle one restarts now; a parked or stopped one starts with them next time. With `--runtime`, the thread moves to that runtime: its current runtime stops (after the turn it runs), and its next turn starts a new session of the new one, given a handoff of what the previous session did; a model or effort left out is the new runtime's default. Moving back to a runtime it left a session of resumes that session instead, told what the thread did since, with the settings it had (`default` starts a new one). The orchestrator's model and effort change the same way, in place (`twr model orch opus --effort high`); another runtime or account for it is `twr orchestrator use`. A pty thread can only move to another runtime",
     "group": "CLI · model",
     "fields": [
       {
@@ -2860,6 +2873,50 @@
     ]
   },
   {
+    "id": "cli:orchestrator access",
+    "title": "twr orchestrator access",
+    "description": "Show or set the orchestrator's access level: `limited` (twr's tools and a web search only) or `full` (every tool a worker has, its shell included, without asking, in every turn). Applied now, without a hub restart: a running orchestrator restarts with it on its session, after its current turn. Kept in config.toml (`[orchestrator] access`). Without a level: print the current one",
+    "group": "CLI · orchestrator",
+    "fields": [
+      {
+        "key": "level",
+        "label": "level",
+        "type": "select",
+        "required": false,
+        "description": "`limited` or `full` [possible values: limited, full]",
+        "options": [
+          "limited",
+          "full"
+        ]
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the raw `orchestrator.access` JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "orchestrator",
+      "access"
+    ],
+    "cliFields": [
+      {
+        "key": "level",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
     "id": "cli:orchestrator reset",
     "title": "twr orchestrator reset",
     "description": "Clear the conversation: a fresh session on the current runtime/model, no handoff. The old conversation stays in the log; workers and their attention are kept",
@@ -2919,6 +2976,13 @@
         "advanced": false
       },
       {
+        "key": "effort",
+        "label": "effort",
+        "type": "text",
+        "description": "Reasoning effort, one the runtime takes (`twr orchestrator show --json` lists them under `models`), or `default`: the runtime's own (the default)",
+        "advanced": false
+      },
+      {
         "key": "no-summary",
         "label": "no summary",
         "type": "boolean",
@@ -2947,6 +3011,12 @@
       {
         "key": "model",
         "flag": "--model",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "effort",
+        "flag": "--effort",
         "many": false,
         "separator": false
       },
@@ -3674,7 +3744,7 @@
         "key": "rate",
         "label": "rate",
         "type": "text",
-        "description": "Words per minute (80 to 500), over the rate kept by `/read rate` and `[speech] rate`",
+        "description": "Words per minute (80 to 500), over the rate kept by `/read rate` and `[speech] rate` --voice-for <LANG=VOICE>  The voice for messages in one language, over `[speech] voices`: `es=kokoro/ef_dora`, `en=Ava (Premium)` (`twr voices list`). Repeat it for each language",
         "advanced": false
       },
       {
@@ -4535,14 +4605,35 @@
   {
     "id": "cli:voice setup",
     "title": "twr voice setup",
-    "description": "Download whisper.cpp's base.en model (148 MB) to `voice/ggml-base.en.bin` in twr's data directory, the model `[voice] model` left empty means",
+    "description": "Download a pinned whisper.cpp model to the data directory (no config changes)",
     "group": "CLI · voice",
-    "fields": [],
+    "fields": [
+      {
+        "key": "model",
+        "label": "model",
+        "type": "select",
+        "description": "Catalogue model: base.en, base (multilingual), or small.en and small (more accurate, 488 MB, slower). Omit for base.en; explicit selection ignores [voice] model [possible values: base.en, base, small.en, small]",
+        "advanced": false,
+        "options": [
+          "base.en",
+          "base",
+          "small.en",
+          "small"
+        ]
+      }
+    ],
     "cli": [
       "voice",
       "setup"
     ],
-    "cliFields": []
+    "cliFields": [
+      {
+        "key": "model",
+        "flag": "--model",
+        "many": false,
+        "separator": false
+      }
+    ]
   },
   {
     "id": "cli:voice status",
@@ -4566,6 +4657,166 @@
       {
         "key": "json",
         "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:voices install",
+    "title": "twr voices install",
+    "description": "Download and install one of twr's voice models (`twr voices list` names them)",
+    "group": "CLI · voices",
+    "fields": [
+      {
+        "key": "model",
+        "label": "model",
+        "type": "text",
+        "required": true,
+        "description": "The model: kokoro, supertonic, piper-en or piper-es"
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Progress as JSON lines on stdout (`{\"type\":\"progress\",...}`), then the result",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "voices",
+      "install"
+    ],
+    "cliFields": [
+      {
+        "key": "model",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:voices list",
+    "title": "twr voices list",
+    "description": "The voices for reading aloud: this machine's and twr's own (installed or not)",
+    "group": "CLI · voices",
+    "fields": [
+      {
+        "key": "all",
+        "label": "all",
+        "type": "boolean",
+        "description": "Every language of this machine's voices, not only the ones twr tells apart",
+        "advanced": false
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "One JSON object on stdout",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "voices",
+      "list"
+    ],
+    "cliFields": [
+      {
+        "key": "all",
+        "flag": "--all",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:voices remove",
+    "title": "twr voices remove",
+    "description": "Remove one of twr's voice models",
+    "group": "CLI · voices",
+    "fields": [
+      {
+        "key": "model",
+        "label": "model",
+        "type": "text",
+        "required": true,
+        "description": "The model"
+      }
+    ],
+    "cli": [
+      "voices",
+      "remove"
+    ],
+    "cliFields": [
+      {
+        "key": "model",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:voices try",
+    "title": "twr voices try",
+    "description": "Say a sentence with a voice, as a speaker would (`kokoro/af_heart`, `Ava (Premium)`)",
+    "group": "CLI · voices",
+    "fields": [
+      {
+        "key": "voice",
+        "label": "voice",
+        "type": "text",
+        "required": true,
+        "description": "The voice"
+      },
+      {
+        "key": "text",
+        "label": "text",
+        "type": "textarea",
+        "required": false,
+        "description": "What to say; a sentence in the voice's language by default"
+      },
+      {
+        "key": "out",
+        "label": "out",
+        "type": "text",
+        "description": "Write the audio to this WAV file instead of playing it (twr's voices only)",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "voices",
+      "try"
+    ],
+    "cliFields": [
+      {
+        "key": "voice",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "text",
+        "many": false,
+        "separator": false,
+        "literal": true
+      },
+      {
+        "key": "out",
+        "flag": "--out",
         "many": false,
         "separator": false
       }

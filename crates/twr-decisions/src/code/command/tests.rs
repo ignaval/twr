@@ -205,6 +205,43 @@ fn the_short_commands_apply_directly() {
     assert!(direct_actions(&scene(&one, "allow api")).is_some());
 }
 
+/// A command sent with files: read without their `Uploaded file:` pairs, so a call the
+/// orchestrator relays that it covers applies directly, but never applied by the hub on its
+/// own (the orchestrator gets the message and the files). Lines that only look like a pair
+/// (not an upload's path, or in a fenced block) stay text, and the message is no command.
+#[test]
+fn a_command_with_files_is_read_without_them_and_never_applied_alone() {
+    let one = api_only();
+    let file = "\nUploaded file: notes.md\n/w/.twr-uploads/01ABC/notes.md";
+    let two = format!("{file}\nUploaded file: a.png\n/w/.twr-uploads/01ABD/a.png\n");
+    for m in [
+        format!("set api to plan mode{file}"),
+        format!("set api to plan mode.{two}"),
+    ] {
+        assert_eq!(mode(&one, &m, "ta", "plan"), Direct, "{m}");
+        assert_eq!(direct_actions(&scene(&one, &m)), None, "{m}");
+        assert_eq!(
+            named_threads(&scene(&one, &m)),
+            BTreeSet::from(["ta".to_string()])
+        );
+        assert!(is_command(&m, &one.0), "{m}");
+    }
+    let m = format!("allow api{file}");
+    assert_eq!(answer(&one, &m, "pa", "allow"), Direct);
+    assert_eq!(direct_actions(&scene(&one, &m)), None);
+    // Not an upload's path, or inside a fence: text, so no command.
+    for m in [
+        "set api to plan mode\nUploaded file: notes.md\n/etc/notes.md".to_string(),
+        "set api to plan mode\n```\nUploaded file: notes.md\n/w/.twr-uploads/01ABC/notes.md\n```"
+            .to_string(),
+    ] {
+        assert_eq!(mode(&one, &m, "ta", "plan"), Uncovered, "{m}");
+        assert!(named_threads(&scene(&one, &m)).is_empty(), "{m}");
+    }
+    // Without files, as before.
+    assert!(direct_actions(&scene(&one, "set api to plan mode")).is_some());
+}
+
 // ---------------------------------------------------------------------------------------------
 // Everything else goes on the card
 // ---------------------------------------------------------------------------------------------

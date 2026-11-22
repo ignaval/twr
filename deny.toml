@@ -11,7 +11,9 @@ version = 2
 # The RustSec advisory database. A vulnerability fails the check, and so does an unmaintained
 # crate anywhere in the graph or an unsound one a workspace crate depends on directly (the
 # defaults); a yanked version warns. An `ignore` entry needs its reason.
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, with no safe upgrade. It is no vulnerability, and iroh, rmcp and schemars depend on it, so twr moving its own code to jiff or time would not clear it; the event log's timestamps are chrono's RFC 3339 serde form" },
+]
 
 [licenses]
 version = 2
@@ -33,6 +35,13 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.8
+# Build-time only: sherpa-onnx-sys's build script unpacks its prebuilt libraries with `zip`,
+# whose bzip2 and PPMd decoders carry these permissive licences. Nothing of theirs is in a
+# twr binary.
+exceptions = [
+    { crate = "libbz2-rs-sys", allow = ["bzip2-1.0.6"] },
+    { crate = "ppmd-rust", allow = ["MIT-0"] },
+]
 
 [bans]
 multiple-versions = "warn"

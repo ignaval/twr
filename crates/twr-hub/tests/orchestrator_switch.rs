@@ -1,6 +1,8 @@
 //! Switching the orchestrator (`orchestrator.use`, `twr orchestrator use`): a new orchestrator
 //! thread on another runtime / model, the previous one stopped and retired, the choice kept
-//! by the log across restarts, and the handoff the new one starts with (`hub::handoff`).
+//! by the log across restarts, and the handoff the new one starts with (`hub::handoff`). And
+//! what is no switch: the user's model and effort change (`thread.set_model` on the
+//! orchestrator's thread), made in place on its session (`hub::model`).
 //!
 //! Workers run the fake adapter. `claude-code`, `codex` and `grok-build` are played by a test
 //! adapter that hands every session to the test ([`OrchRt`]) with the `SpawnConfig` the hub
@@ -22,7 +24,7 @@ use twr_core::adapter::{
 use twr_core::config::Config;
 use twr_core::event::*;
 use twr_core::proto::codes;
-use twr_hub::hub::ControlSubscription;
+use twr_hub::hub::{ControlSubscription, ModelRequest};
 use twr_hub::{Caller, Hub, HubOptions, NewThread, SwitchOptions};
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -189,6 +191,7 @@ impl Adapter for OrchAdapter {
                 "settings": cfg.settings,
                 "mcp_config": cfg.mcp_config,
                 "mcp_config_file": cfg.mcp_config_file,
+                "keep_own_mcp": cfg.keep_own_mcp,
                 "env": cfg.env,
             })
             .to_string(),
@@ -396,7 +399,12 @@ fn assert_orchestrator_cfg(rt: &OrchRt, env: &Env) {
     if rt.runtime == "claude-code" {
         assert_eq!(
             rt.cfg.builtin_tools,
-            Some(vec!["Read".into(), "Write".into(), "Edit".into()])
+            Some(vec![
+                "Read".into(),
+                "Write".into(),
+                "Edit".into(),
+                "WebSearch".into()
+            ])
         );
         assert_eq!(
             rt.cfg.settings,
@@ -405,11 +413,27 @@ fn assert_orchestrator_cfg(rt: &OrchRt, env: &Env) {
                 None
             ))
         );
+    } else if rt.runtime == "acp" {
+        // ACP cannot restrict its tools: asked for none, as before.
+        assert_eq!(rt.cfg.builtin_tools, Some(Vec::new()));
+        assert_eq!(rt.cfg.settings, None);
     } else {
-        assert_eq!(rt.cfg.builtin_tools, Some(Vec::new()), "{}", rt.runtime);
+        // A web search alone.
+        assert_eq!(
+            rt.cfg.builtin_tools,
+            Some(vec!["WebSearch".into()]),
+            "{}",
+            rt.runtime
+        );
         assert_eq!(rt.cfg.settings, None, "{}", rt.runtime);
     }
-    assert_eq!(rt.cfg.allowed_tools, vec!["mcp__twr".to_string()]);
+    let allowed: &[&str] = if rt.runtime == "acp" {
+        &["mcp__twr"]
+    } else {
+        &["mcp__twr", "WebSearch"]
+    };
+    assert_eq!(rt.cfg.allowed_tools, allowed, "{}", rt.runtime);
+    assert!(!rt.cfg.keep_own_mcp, "{}", rt.runtime);
     assert!(rt
         .cfg
         .system_append
@@ -424,6 +448,45 @@ fn assert_orchestrator_cfg(rt: &OrchRt, env: &Env) {
         0o600
     );
     assert!(!rt.token().is_empty());
+}
+
+/// A switch gives back as many of the user's dropped messages as fit, each whole, in the
+/// order they were queued, well under a response's size limit, and counts the rest: a queue
+/// of big messages never makes the result too big to read.
+#[tokio::test]
+async fn a_switch_gives_back_the_dropped_messages_that_fit() {
+    let mut env = Env::new();
+    let hub = Hub::open(env.opts(|_| {})).await.unwrap();
+    env.worker(&hub, "api").await;
+    env.worker(&hub, "web").await;
+    let r = hub.say("watch the builds", None, &tui()).await.unwrap();
+    assert_eq!(r["action"], "delegate");
+    let mut claude = env.orch().await;
+    claude.next_turn().await;
+    // Busy: these queue behind its open turn, each as long as a message may be, more of
+    // them than a response could hold.
+    let big = |i: usize| format!("{i:03}{}", "x".repeat((256 << 10) - 3));
+    let mut sent = vec!["first".to_string()];
+    sent.extend((0..20).map(big));
+    sent.push("last".into());
+    for m in &sent {
+        hub.say(m, None, &tui()).await.unwrap();
+    }
+    let r = switch(&hub, "codex", None, quick()).await;
+    let p = &r["previous"];
+    assert_eq!(p["dropped_prompts"], 22, "{}", p["dropped_prompts"]);
+    let back: Vec<String> = serde_json::from_value(p["dropped_messages"].clone()).unwrap();
+    let omitted = p["dropped_messages_omitted"].as_u64().unwrap() as usize;
+    assert!(
+        omitted > 0 && back.len() + omitted == sent.len(),
+        "{omitted}"
+    );
+    // Whole, in order: the first big ones that fit, then the small last one.
+    let mut expected = sent[..back.len() - 1].to_vec();
+    expected.push("last".into());
+    assert!(back == expected, "{} back", back.len());
+    assert!(serde_json::to_string(&r).unwrap().len() < twr_core::proto::MAX_FRAME / 2);
+    hub.shutdown().await;
 }
 
 /// claude-code → codex → grok-build: each switch stops and retires the running orchestrator
@@ -466,6 +529,12 @@ async fn switching_runtimes_makes_a_new_orchestrator_each_time() {
     assert_eq!(r["previous"]["runtime"], "claude-code");
     assert_eq!(r["previous"]["model"], "haiku");
     assert_eq!(r["previous"]["dropped_prompts"], 1);
+    // The user's own message the switch dropped comes back whole, to be sent again.
+    assert_eq!(
+        r["previous"]["dropped_messages"],
+        json!(["and the deploys"])
+    );
+    assert_eq!(r["previous"]["dropped_messages_omitted"], 0);
     let second = r["thread"].as_str().unwrap().to_string();
     assert_ne!(second, first);
     claude.wait_stopped().await;
@@ -588,6 +657,66 @@ async fn switching_runtimes_makes_a_new_orchestrator_each_time() {
     hub.shutdown().await;
 }
 
+/// `orchestrator.use` without the summary request, with reasoning effort `effort`.
+fn with_effort(effort: &str) -> SwitchOptions {
+    SwitchOptions {
+        effort: Some(effort.into()),
+        ..quick()
+    }
+}
+
+/// A switch's effort: checked and spelled as the runtime spells it, given to the new session
+/// in place of `[orchestrator] effort` (even for the first orchestrator), reported by the
+/// result and `orchestrator.show`, and kept by the log across a restart. `default` is the
+/// runtime's own, as is leaving it out on a later switch.
+#[tokio::test]
+async fn a_switch_takes_an_effort_that_survives_a_restart() {
+    let mut env = Env::new();
+    let hub = Hub::open(env.opts(|c| c.orchestrator.effort = Some("max".into())))
+        .await
+        .unwrap();
+    env.worker(&hub, "api").await;
+    // The first orchestrator, asked for one: it replaces the configured effort.
+    let r = switch(&hub, "codex", Some("o5"), with_effort("HIGH")).await;
+    assert_eq!(r["effort"], "high");
+    assert_eq!(r["previous"], Value::Null);
+    let first = r["thread"].as_str().unwrap().to_string();
+    assert_eq!(hub.info()["orchestrator"]["effort"], "high");
+    assert_eq!(hub.info()["orchestrator"]["configured"]["effort"], "max");
+    hub.shutdown().await;
+    drop(hub);
+
+    let hub = env.reopen_with(|c| c.orchestrator.autostart = true).await;
+    let mut codex = env.orch().await;
+    assert_eq!(codex.runtime, "codex");
+    assert_eq!(codex.cfg.model.as_deref(), Some("o5"));
+    assert_eq!(codex.cfg.effort.as_deref(), Some("high"));
+    assert_eq!(hub.orchestrator_thread().as_deref(), Some(first.as_str()));
+    assert_eq!(hub.info()["orchestrator"]["effort"], "high");
+
+    // Same runtime, another effort: still a new session, with the handoff.
+    let r = switch(&hub, "codex", Some("o5"), with_effort("low")).await;
+    assert_eq!(r["effort"], "low");
+    assert_eq!(r["previous"]["effort"], "high");
+    codex.wait_stopped().await;
+    let mut codex = env.orch().await;
+    assert_eq!(codex.cfg.effort.as_deref(), Some("low"));
+    let (handoff, t) = codex.next_turn().await;
+    assert!(handoff.starts_with("[twr handoff]"), "{handoff}");
+    codex.end_turn(t);
+
+    // `default`, then left out: the runtime's own either way.
+    let r = switch(&hub, "claude-code", None, with_effort("default")).await;
+    assert_eq!(r["effort"], Value::Null);
+    codex.wait_stopped().await;
+    let claude = env.orch().await;
+    assert_eq!(claude.cfg.effort, None);
+    let r = switch(&hub, "grok-build", None, quick()).await;
+    assert_eq!(r["effort"], Value::Null);
+    assert_eq!(hub.info()["orchestrator"]["effort"], Value::Null);
+    hub.shutdown().await;
+}
+
 /// The switch lives in the log: a restarted hub keeps the new runtime and model (the config
 /// still says claude-code) and autostarts that one.
 #[tokio::test]
@@ -705,8 +834,73 @@ async fn only_users_switch_and_only_to_runtimes_that_attach_mcp() {
             .unwrap_err();
         assert_eq!(e.code, codes::BAD_REQUEST, "{model:?}");
     }
+    // An effort the runtime does not take (Grok Build has no `max`), before anything happens.
+    for (runtime, effort) in [
+        ("codex", "turbo"),
+        ("grok-build", "max"),
+        ("claude-code", "x\n"),
+    ] {
+        let e = hub
+            .use_orchestrator(runtime, None, with_effort(effort), &tui())
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, codes::BAD_REQUEST, "{runtime} {effort:?}");
+        assert!(e.message.contains("reasoning effort"), "{}", e.message);
+    }
     assert!(hub.list_threads().is_empty(), "nothing was created");
     assert!(hub.orchestrator_thread().is_none());
+    hub.shutdown().await;
+}
+
+/// A switch's own reasoning effort (`orchestrator.use` `effort`) starts the new orchestrator
+/// with it, in its runtime's spelling, and the result says it; one the runtime does not take
+/// is refused before anything happens; the next switch without one gets the runtime's
+/// default again.
+#[tokio::test]
+async fn a_switch_sets_the_reasoning_effort() {
+    let mut env = Env::new();
+    let hub = env.hub().await;
+    let effort = |e: &str| SwitchOptions {
+        effort: Some(e.into()),
+        ..quick()
+    };
+    let e = hub
+        .use_orchestrator("codex", Some("o5"), effort("loud"), &tui())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{}", e.message);
+    assert!(
+        e.message.contains("unknown reasoning effort"),
+        "{}",
+        e.message
+    );
+    assert!(hub.orchestrator_thread().is_none(), "nothing was created");
+
+    let r = switch(&hub, "codex", Some("o5"), effort(" Low ")).await;
+    assert_eq!(r["model"], "o5");
+    assert_eq!(r["effort"], "low");
+    let first = r["thread"].as_str().unwrap().to_string();
+    hub.say("anything new?", None, &tui()).await.unwrap();
+    let mut codex = env.orch().await;
+    assert_eq!(codex.cfg.model.as_deref(), Some("o5"));
+    assert_eq!(codex.cfg.effort.as_deref(), Some("low"));
+    assert_eq!(hub.info()["orchestrator"]["effort"], "low");
+    let (_, t) = codex.next_turn().await;
+    codex.end_turn(t);
+
+    // Refused while one runs: it keeps running, unchanged.
+    let e = hub
+        .use_orchestrator("grok-build", None, effort("loud"), &tui())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{}", e.message);
+    assert_eq!(hub.orchestrator_thread().as_deref(), Some(first.as_str()));
+
+    let r = switch(&hub, "grok-build", None, quick()).await;
+    assert_eq!(r["effort"], Value::Null);
+    codex.wait_stopped().await;
+    let grok = env.orch().await;
+    assert_eq!(grok.cfg.effort, None);
     hub.shutdown().await;
 }
 
@@ -899,6 +1093,7 @@ async fn a_busy_orchestrator_is_waited_for_then_skipped() {
     let opts = SwitchOptions {
         summary: true,
         wait: Duration::from_millis(400),
+        effort: None,
     };
     let started = std::time::Instant::now();
     let user = tui();
@@ -918,6 +1113,12 @@ async fn a_busy_orchestrator_is_waited_for_then_skipped() {
         assert!(e.message.contains("in progress"), "{}", e.message);
         let e = hub.reset_orchestrator(&tui()).await.unwrap_err();
         assert_eq!(e.code, codes::CONFLICT, "{e:?}");
+        // Nor is its model changed: the change would land on the one being retired.
+        let e = set_model(&hub, &old, model_effort("opus", "low"))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, codes::CONFLICT, "{e:?}");
+        assert!(e.message.contains("being replaced"), "{}", e.message);
     };
     let (r, ()) = tokio::join!(switching, meanwhile);
     let r = r.unwrap();
@@ -972,6 +1173,7 @@ async fn a_handoff_summary_waits_for_background_work_then_stops_it_on_timeout() 
             SwitchOptions {
                 summary: true,
                 wait: Duration::from_millis(100),
+                effort: None,
             },
             &tui(),
         )
@@ -1343,12 +1545,19 @@ async fn attaching_the_orchestrator_keeps_its_restrictions() {
         assert_eq!(grant.argv[0], "orch-attach", "{runtime}");
         let asked: Value = serde_json::from_str(&grant.argv[2]).unwrap();
         assert_eq!(asked["mode"], "dontAsk", "{runtime}");
-        assert_eq!(asked["builtin_tools"], json!(["Read", "Write", "Edit"]));
+        assert_eq!(
+            asked["builtin_tools"],
+            json!(["Read", "Write", "Edit", "WebSearch"])
+        );
         assert_eq!(
             asked["settings"]["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
             "'/opt/twr/bin/twr' claude-memory-guard || exit 2"
         );
-        assert_eq!(asked["allowed_tools"], json!(["mcp__twr"]), "{runtime}");
+        assert_eq!(
+            asked["allowed_tools"],
+            json!(["mcp__twr", "WebSearch"]),
+            "{runtime}"
+        );
         assert_eq!(
             asked["mcp_config"],
             json!({ "mcpServers": {} }),
@@ -1364,6 +1573,101 @@ async fn attaching_the_orchestrator_keeps_its_restrictions() {
         );
         hub.attach_end(&id, "test", grant.lease, None).unwrap();
     }
+    hub.shutdown().await;
+}
+
+/// `[orchestrator] access = "full"`: every orchestrator runtime but a generic ACP agent runs
+/// like a worker in bypass (recorded on its thread), with every built-in tool and the user's
+/// own MCP servers beside twr's, its own memory still off and twr's tools still allowed; Claude
+/// Code's file tools are guarded off twr's own files, and attaching it carries the same. The
+/// hub reports the access level. ACP is as with limited access.
+#[tokio::test]
+async fn full_access_runs_the_orchestrator_like_a_worker_in_bypass() {
+    use twr_core::config::OrchestratorAccess;
+    let mut env = Env::new();
+    let hub = Hub::open(env.opts(|c| c.orchestrator.access = OrchestratorAccess::Full))
+        .await
+        .unwrap();
+    assert_eq!(hub.info()["orchestrator"]["access"], "full");
+    let r = hub.say("watch the builds", None, &tui()).await.unwrap();
+    let id = r["thread"].as_str().unwrap().to_string();
+    let mut claude = env.orch().await;
+    let cfg = claude.cfg.clone();
+    assert_eq!(cfg.mode, "bypassPermissions");
+    assert_eq!(thread_json(&hub, &id)["mode"], "bypassPermissions");
+    assert_eq!(cfg.builtin_tools, None);
+    assert!(cfg.keep_own_mcp && cfg.native_memory_off);
+    assert_eq!(cfg.allowed_tools, ["mcp__twr", "WebSearch"]);
+    assert!(
+        cfg.mcp_config_file.is_some(),
+        "twr's server, with its token"
+    );
+    assert!(cfg
+        .env
+        .contains(&("CLAUDE_CODE_DISABLE_ATTACHMENTS".into(), "1".into())));
+    let sys = cfg.system_append.as_deref().unwrap();
+    assert!(sys.contains("You have full access") && sys.contains("set_config"));
+    assert!(!sys.contains("You write no code"));
+    let settings = cfg.settings.as_ref().unwrap();
+    let hook = &settings["hooks"]["PreToolUse"][0];
+    assert_eq!(hook["matcher"], "Write|Edit|MultiEdit|NotebookEdit");
+    let command = hook["hooks"][0]["command"].as_str().unwrap();
+    let data = env.path().join("data");
+    assert!(
+        command.starts_with("'/opt/twr/bin/twr' claude-memory-guard --protect ")
+            && command.contains(&format!("--protect '{}'", data.display()))
+            && command.ends_with(" || exit 2"),
+        "{command}"
+    );
+    // Attached, the same.
+    hub.send_by(&id, "hello", &tui()).unwrap();
+    let (_, t) = claude.next_turn().await;
+    claude.end_turn(t);
+    let grant = timeout(WAIT, async {
+        loop {
+            match hub.attach_begin(&id, true, "test").await {
+                Err(e) if e.message.contains("no runtime session") => {
+                    tokio::time::sleep(Duration::from_millis(20)).await
+                }
+                other => return other,
+            }
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let asked: Value = serde_json::from_str(&grant.argv[2]).unwrap();
+    assert_eq!(asked["mode"], "bypassPermissions");
+    assert_eq!(asked["builtin_tools"], Value::Null);
+    assert_eq!(asked["keep_own_mcp"], true);
+    assert_eq!(asked["settings"], *settings);
+    assert_eq!(asked["mcp_config"], json!({ "mcpServers": {} }));
+    hub.attach_end(&id, "test", grant.lease, None).unwrap();
+    // The attached one is not running: each new one starts on a message.
+    for runtime in ["codex", "grok-build"] {
+        let r = switch(&hub, runtime, None, quick()).await;
+        let id = r["thread"].as_str().unwrap();
+        hub.send_by(id, "hello", &tui()).unwrap();
+        let mut rt = env.orch().await;
+        let (_, t) = rt.next_turn().await;
+        rt.end_turn(t);
+        assert_eq!(rt.cfg.mode, "bypassPermissions", "{runtime}");
+        assert_eq!(
+            thread_json(&hub, id)["mode"],
+            "bypassPermissions",
+            "{runtime}"
+        );
+        assert_eq!(rt.cfg.builtin_tools, None, "{runtime}");
+        assert_eq!(rt.cfg.settings, None, "{runtime}");
+        assert!(rt.cfg.keep_own_mcp && rt.cfg.native_memory_off, "{runtime}");
+        assert_eq!(rt.cfg.allowed_tools, ["mcp__twr", "WebSearch"], "{runtime}");
+    }
+    let r = switch(&hub, "acp:agent --stdio", None, quick()).await;
+    let acp = env.orch().await;
+    assert_eq!(r["runtime"], "acp");
+    assert_eq!(acp.cfg.mode, "manual");
+    assert_eq!(acp.cfg.builtin_tools, Some(Vec::new()));
+    assert!(!acp.cfg.keep_own_mcp);
     hub.shutdown().await;
 }
 
@@ -1719,7 +2023,7 @@ async fn show_says_whether_the_runtime_was_configured_and_what_is_installed() {
     );
     assert_eq!(
         models["codex"]["models"][0]["id"],
-        json!("gpt-6.1-sol"),
+        json!("gpt-6.2-sol"),
         "{o}"
     );
     assert_eq!(
@@ -2074,5 +2378,388 @@ async fn reset_is_user_only_and_preserves_a_recorded_acp_agent() {
     let mut rt = env.orch().await;
     assert!(rt.cfg.resume_session.is_none());
     assert!(rt.next_turn().await.0.contains("fresh ACP prompt"));
+    hub.shutdown().await;
+}
+
+/// A switch to a bare `acp` (the runtime a thread shows for every agent) while the
+/// orchestrator runs an ACP agent keeps that agent, as a reset does: its command, attach
+/// template and preset as recorded, with the model and effort asked. Without an ACP agent
+/// running, a bare `acp` is refused: it names no agent. A bare `acp` is also how
+/// `thread.set_model` names its runtime for a model change in place.
+#[tokio::test]
+async fn a_bare_acp_switch_keeps_the_orchestrators_agent() {
+    let env = Env::new();
+    let opts = env.opts(|c| {
+        c.runtimes.insert(
+            "agent".into(),
+            twr_core::config::RuntimePreset {
+                acp: "opencode acp".into(),
+                attach: Some("opencode --resume {session}".into()),
+                ..Default::default()
+            },
+        );
+    });
+    let hub = Hub::open(opts).await.unwrap();
+    let e = hub
+        .use_orchestrator("acp", Some("m"), quick(), &tui())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{e:?}");
+    switch(&hub, "codex", None, quick()).await;
+    let e = hub
+        .use_orchestrator("acp", Some("m"), quick(), &tui())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{e:?}");
+
+    let created = |id: &str| {
+        events_of(&hub, id)
+            .into_iter()
+            .find_map(|e| match e.body {
+                EventBody::ThreadCreated(p) => p.ext.and_then(|x| x.get("twr").cloned()),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let first = switch(&hub, "agent", Some("a-model"), quick()).await;
+    let old = first["thread"].as_str().unwrap().to_string();
+    let command = hub.thread_view(&old).unwrap().acp_command;
+    let mut opts = quick();
+    opts.effort = Some("high".into());
+    let r = switch(&hub, "acp", Some("b-model"), opts).await;
+    let id = r["thread"].as_str().unwrap();
+    assert_ne!(id, old);
+    assert_eq!(r["runtime"], "acp");
+    assert_eq!(r["model"], "b-model");
+    assert_eq!(r["effort"], "high");
+    assert_eq!(hub.thread_view(id).unwrap().acp_command, command);
+    let twr = created(id);
+    assert_eq!(twr["acp_preset"], "agent", "{twr}");
+    assert_eq!(twr["acp_attach"], created(&old)["acp_attach"], "{twr}");
+    assert!(
+        twr.get("conversation_reset").is_none(),
+        "a switch, not a reset: {twr}"
+    );
+    // And again, on the agent recorded by the switch.
+    let again = hub
+        .use_orchestrator("acp", None, quick(), &tui())
+        .await
+        .unwrap();
+    let again = again["thread"].as_str().unwrap().to_string();
+    assert_eq!(hub.thread_view(&again).unwrap().acp_command, command);
+    // Its model changes in place, its runtime named as `acp`; another agent is a switch.
+    let r = set_model(
+        &hub,
+        &again,
+        ModelRequest {
+            runtime: Some("acp"),
+            model: Some("c-model"),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (&r["changed"], &r["applies"]),
+        (&json!(true), &json!("next_start")),
+        "{r}"
+    );
+    assert_eq!(hub.orchestrator_thread().as_deref(), Some(again.as_str()));
+    let view = hub.thread_view(&again).unwrap();
+    assert_eq!(
+        (view.model.as_deref(), &view.acp_command),
+        (Some("c-model"), &command)
+    );
+    for runtime in ["acp:other-agent", "codex"] {
+        let req = ModelRequest {
+            runtime: Some(runtime),
+            model: Some("d-model"),
+            ..Default::default()
+        };
+        let e = set_model(&hub, &again, req).await.unwrap_err();
+        assert_eq!(e.code, codes::BAD_REQUEST, "{runtime}: {e:?}");
+        assert!(
+            e.message.contains("twr orchestrator use"),
+            "{runtime}: {}",
+            e.message
+        );
+    }
+    hub.shutdown().await;
+}
+
+/// `thread.set_model` on `thread` by the TUI.
+async fn set_model(
+    hub: &Hub,
+    thread: &str,
+    req: ModelRequest<'_>,
+) -> Result<Value, twr_core::proto::RpcError> {
+    hub.set_thread_model(thread, req, &tui()).await
+}
+
+/// A model and effort change.
+fn model_effort<'a>(model: &'a str, effort: &'a str) -> ModelRequest<'a> {
+    ModelRequest {
+        model: Some(model),
+        effort: Some(effort),
+        ..Default::default()
+    }
+}
+
+/// Waits until the orchestrator is idle.
+async fn wait_idle(hub: &Hub) {
+    timeout(WAIT, async {
+        loop {
+            if hub.orchestrator_info()["status"] == "idle" {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the orchestrator did not go idle");
+}
+
+/// The `ext.twr.reason` of each `thread.stopped` of `thread`.
+fn stop_reasons(hub: &Hub, thread: &str) -> Vec<Value> {
+    events_of(hub, thread)
+        .into_iter()
+        .filter_map(|e| match e.body {
+            EventBody::ThreadStopped(p) => Some(p.ext.unwrap_or_default()["twr"]["reason"].clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The user's model and effort change of an idle orchestrator is made in place, like a
+/// worker's: recorded on its thread, its runtime restarted at once on its session with them
+/// (`model_change`), no new orchestrator and no handoff. `orchestrator.show` reports them, a
+/// reset keeps them, and so does a hub restart. Its effort is checked as the runtime takes it,
+/// a clear the session would not take is refused, and it is no move: another runtime or
+/// account, and the orchestrator's own call, are refused.
+#[tokio::test]
+async fn the_orchestrators_model_changes_in_place_on_its_session() {
+    let mut env = Env::new();
+    let hub = env.hub().await;
+    let api = env.worker(&hub, "api").await;
+    hub.say_to_orchestrator("hello", None, &tui()).unwrap();
+    let mut rt = env.orch().await;
+    let orch = hub.orchestrator_thread().unwrap();
+    assert_eq!(rt.cfg.model.as_deref(), Some("haiku"));
+    let (_, t) = rt.next_turn().await;
+    rt.end_turn(t);
+    wait_idle(&hub).await;
+
+    let r = set_model(&hub, &orch, model_effort("sonnet", "HIGH"))
+        .await
+        .unwrap();
+    assert_eq!(r["thread"], orch.as_str(), "{r}");
+    assert_eq!(
+        (&r["changed"], &r["applies"]),
+        (&json!(true), &json!("now")),
+        "{r}"
+    );
+    assert_eq!(
+        (&r["model"], &r["effort"]),
+        (&json!("sonnet"), &json!("high"))
+    );
+    assert_eq!(r["previous_model"], "haiku");
+    assert_eq!(r["runtime_changed"], false);
+    rt.wait_stopped().await;
+    let mut new = env.orch().await;
+    assert_eq!(new.runtime, "claude-code");
+    assert_eq!(new.cfg.resume_session.as_deref(), Some("s-claude-code"));
+    assert_eq!(
+        (new.cfg.model.as_deref(), new.cfg.effort.as_deref()),
+        (Some("sonnet"), Some("high"))
+    );
+    assert_orchestrator_cfg(&new, &env);
+    assert_eq!(stop_reasons(&hub, &orch), [json!(MODEL_RESTART_REASON)]);
+    assert_eq!(hub.orchestrator_thread().as_deref(), Some(orch.as_str()));
+    let info = hub.orchestrator_info();
+    assert_eq!(
+        (&info["model"], &info["effort"]),
+        (&json!("sonnet"), &json!("high"))
+    );
+    assert_eq!(info["retired"], 0, "no new orchestrator");
+    wait_idle(&hub).await;
+    assert!(!new.had_turn(), "no handoff");
+    // The conversation goes on there: a notice reaches it.
+    hub.send_by(&api, "!error worker needs help", &tui())
+        .unwrap();
+    let (notice, t) = new.next_turn().await;
+    assert!(notice.starts_with("[twr notice]"), "{notice}");
+    new.end_turn(t);
+    wait_idle(&hub).await;
+
+    // The same again: nothing changes, nothing restarts.
+    let r = set_model(&hub, &orch, model_effort("sonnet", "high"))
+        .await
+        .unwrap();
+    assert_eq!(r["changed"], false, "{r}");
+    // Its own runtime named alone is no move.
+    let req = ModelRequest {
+        runtime: Some("claude-code"),
+        effort: Some("high"),
+        ..Default::default()
+    };
+    assert_eq!(set_model(&hub, &orch, req).await.unwrap()["changed"], false);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(env.no_spawn());
+
+    // Refused: an effort the runtime does not take, a clear the resumed session would not
+    // take, another runtime, the orchestrator's own call. Nothing is recorded.
+    let e = set_model(&hub, &orch, model_effort("sonnet", "turbo"))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{e:?}");
+    assert!(e.message.contains("reasoning effort"), "{}", e.message);
+    let req = ModelRequest {
+        model: Some("default"),
+        ..Default::default()
+    };
+    let e = set_model(&hub, &orch, req).await.unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{e:?}");
+    assert!(
+        e.message.contains("keeps a session's model on resume"),
+        "{}",
+        e.message
+    );
+    assert!(
+        e.message.contains("`twr orchestrator use claude-code`"),
+        "{}",
+        e.message
+    );
+    for runtime in ["codex", "acp", "pty:bash"] {
+        let req = ModelRequest {
+            runtime: Some(runtime),
+            model: Some("o5"),
+            ..Default::default()
+        };
+        let e = set_model(&hub, &orch, req).await.unwrap_err();
+        assert_eq!(e.code, codes::BAD_REQUEST, "{runtime}: {e:?}");
+        assert!(
+            e.message.contains("is the orchestrator"),
+            "{runtime}: {}",
+            e.message
+        );
+        assert!(
+            e.message.contains("twr orchestrator use"),
+            "{runtime}: {}",
+            e.message
+        );
+    }
+    let e = hub
+        .set_thread_model(&orch, model_effort("opus", "low"), &Caller::Orchestrator)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::UNAUTHORIZED, "{e:?}");
+    assert!(
+        e.message.contains("cannot change its own model"),
+        "{}",
+        e.message
+    );
+    let view = hub.thread_view(&orch).unwrap();
+    assert_eq!(
+        (view.model.as_deref(), view.effort.as_deref()),
+        (Some("sonnet"), Some("high"))
+    );
+    assert!(env.no_spawn());
+
+    // A reset keeps them: a new conversation with the model and effort set.
+    let r = hub.reset_orchestrator(&tui()).await.unwrap();
+    assert_eq!(
+        (&r["model"], &r["effort"]),
+        (&json!("sonnet"), &json!("high")),
+        "{r}"
+    );
+    let reset = r["thread"].as_str().unwrap().to_string();
+    assert_ne!(reset, orch);
+    new.wait_stopped().await;
+    hub.say_to_orchestrator("after the reset", None, &tui())
+        .unwrap();
+    let mut rt = env.orch().await;
+    assert_eq!(rt.cfg.resume_session, None);
+    assert_eq!(
+        (rt.cfg.model.as_deref(), rt.cfg.effort.as_deref()),
+        (Some("sonnet"), Some("high"))
+    );
+    let (_, t) = rt.next_turn().await;
+    rt.end_turn(t);
+    wait_idle(&hub).await;
+    // Changed on the new conversation, then kept across a hub restart (the log).
+    let r = set_model(&hub, &reset, model_effort("opus", "low"))
+        .await
+        .unwrap();
+    assert_eq!(r["applies"], "now", "{r}");
+    rt.wait_stopped().await;
+    let rt = env.orch().await;
+    assert_eq!(rt.cfg.model.as_deref(), Some("opus"));
+    hub.shutdown().await;
+    drop((rt, hub));
+    let hub = env.reopen_with(|c| c.orchestrator.autostart = true).await;
+    let rt = env.orch().await;
+    assert_eq!(hub.orchestrator_thread().as_deref(), Some(reset.as_str()));
+    assert_eq!(
+        (rt.cfg.model.as_deref(), rt.cfg.effort.as_deref()),
+        (Some("opus"), Some("low"))
+    );
+    let info = hub.orchestrator_info();
+    assert_eq!(
+        (&info["model"], &info["effort"]),
+        (&json!("opus"), &json!("low"))
+    );
+    hub.shutdown().await;
+}
+
+/// A busy orchestrator's model change waits for its running turn (`after_turn`): the turn
+/// finishes on the old runtime, which is then restarted on its session with the new model,
+/// and a notice queued meanwhile goes to the restarted one. Together with an access change
+/// made meanwhile, one restart applies both.
+#[tokio::test]
+async fn a_busy_orchestrator_takes_its_new_model_after_its_turn() {
+    let mut env = Env::new();
+    let hub = env.hub().await;
+    let api = env.worker(&hub, "api").await;
+    hub.say_to_orchestrator("think hard", None, &tui()).unwrap();
+    let mut rt = env.orch().await;
+    let orch = hub.orchestrator_thread().unwrap();
+    let (_, t) = rt.next_turn().await;
+    let r = set_model(&hub, &orch, model_effort("opus", "max"))
+        .await
+        .unwrap();
+    assert_eq!(r["applies"], "after_turn", "{r}");
+    // The level too: still one restart.
+    let a = hub.orchestrator_access(Some("full"), &tui()).await.unwrap();
+    assert_eq!(a["restart"], "after_turn", "{a}");
+    hub.send_by(&api, "!error worker needs help", &tui())
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(rt.stopped.try_recv().is_err(), "the turn is never cut");
+    assert!(!rt.had_turn() && env.no_spawn());
+    rt.end_turn(t);
+    rt.wait_stopped().await;
+    let mut new = env.orch().await;
+    assert_eq!(new.cfg.resume_session.as_deref(), Some("s-claude-code"));
+    assert_eq!(
+        (new.cfg.model.as_deref(), new.cfg.effort.as_deref()),
+        (Some("opus"), Some("max"))
+    );
+    assert_eq!(
+        new.cfg.mode, "bypassPermissions",
+        "the access level applied too"
+    );
+    assert_eq!(stop_reasons(&hub, &orch), [json!(MODE_RESTART_REASON)]);
+    // The notice queued meanwhile reaches the restarted runtime.
+    let (notice, t) = new.next_turn().await;
+    assert!(notice.starts_with("[twr notice]"), "{notice}");
+    assert!(notice.contains("thread=api reason=error"), "{notice}");
+    new.end_turn(t);
+    wait_idle(&hub).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        new.stopped.try_recv().is_err() && env.no_spawn(),
+        "restarted once"
+    );
+    assert_eq!(hub.orchestrator_thread().as_deref(), Some(orch.as_str()));
     hub.shutdown().await;
 }

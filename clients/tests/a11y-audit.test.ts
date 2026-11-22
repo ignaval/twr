@@ -139,45 +139,75 @@ describe("accessibility audit of the shared UI", () => {
     expect(sources.flatMap(audit)).toEqual([]);
   });
 
-  // A label that holds a hint as well as its field's name would name the field with both
-  // ("Sweep The thread audits each rule itself…"): the field is named by its own word, and
-  // the hint describes it.
-  it("names a loop field by its label's word, not by the hint the label holds", () => {
-    const path = "shared/LoopViews.tsx";
-    const text = readFileSync(join(root, path), "utf8");
-    const file = ts.createSourceFile(
-      path,
-      text,
-      ts.ScriptTarget.Latest,
-      true,
-      ts.ScriptKind.TSX,
-    );
-    const problems: string[] = [];
-    const visit = (node: ts.Node) => {
-      if (ts.isJsxElement(node) && tagOf(node.openingElement) === "label") {
-        const inside: ts.JsxOpeningLikeElement[] = [];
-        const collect = (n: ts.Node) => {
-          if (ts.isJsxElement(n)) inside.push(n.openingElement);
-          else if (ts.isJsxSelfClosingElement(n)) inside.push(n);
-          ts.forEachChild(n, collect);
-        };
-        node.children.forEach(collect);
-        const hint = inside.some((e) => tagOf(e) === "small");
-        for (const field of inside.filter((e) =>
-          ["input", "textarea", "select"].includes(tagOf(e)),
-        ))
-          if (
-            hint &&
-            !namingAttributes.some((name) => attributes(field).has(name))
-          )
-            problems.push(
-              `${path}:${file.getLineAndCharacterOfPosition(field.getStart()).line + 1} <${tagOf(field)}> is named by its label's hint too`,
-            );
-      }
-      ts.forEachChild(node, visit);
+  // A label that holds a hint (or a button) as well as its field's name would name the
+  // field with both ("Sweep The thread audits each rule itself…", "Project or repository
+  // Choose folder"): the field is named by its own word, and the hint describes it.
+  it("names a field by its label's word, not by the hint or button the label holds", () => {
+    const labelled = (path: string) => {
+      const text = readFileSync(join(root, path), "utf8");
+      const file = ts.createSourceFile(
+        path,
+        text,
+        ts.ScriptTarget.Latest,
+        true,
+        ts.ScriptKind.TSX,
+      );
+      const problems: string[] = [];
+      const visit = (node: ts.Node) => {
+        if (ts.isJsxElement(node) && tagOf(node.openingElement) === "label") {
+          const inside: ts.JsxOpeningLikeElement[] = [];
+          const collect = (n: ts.Node) => {
+            if (ts.isJsxElement(n)) inside.push(n.openingElement);
+            else if (ts.isJsxSelfClosingElement(n)) inside.push(n);
+            ts.forEachChild(n, collect);
+          };
+          node.children.forEach(collect);
+          const extra = inside.some((e) =>
+            ["small", "button"].includes(tagOf(e)),
+          );
+          for (const field of inside.filter((e) =>
+            ["input", "textarea", "select"].includes(tagOf(e)),
+          ))
+            if (
+              extra &&
+              !namingAttributes.some((name) => attributes(field).has(name))
+            )
+              problems.push(
+                `${path}:${file.getLineAndCharacterOfPosition(field.getStart()).line + 1} <${tagOf(field)}> is named by its label's hint or button too`,
+              );
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(file);
+      return problems;
     };
-    visit(file);
-    expect(problems).toEqual([]);
+    expect(sources.flatMap(labelled)).toEqual([]);
+  });
+
+  it("names a form's field by its label alone, described by its description", () => {
+    const html = renderToStaticMarkup(
+      createElement(FieldInput, {
+        field: {
+          key: "project",
+          label: "Project or repository",
+          type: "directory",
+          description: "A folder, or a repository to clone.",
+        },
+        value: "",
+        onChange() {},
+      }),
+    );
+    // The label holds the name alone: the folder button and the description are outside.
+    const label = html.match(/<label[^>]*>(.*?)<\/label>/)?.[1] ?? "";
+    expect(label).toBe("Project or repository");
+    expect(html).toContain('for="field-project"');
+    expect(html).toMatch(
+      /<input[^>]*id="field-project"[^>]*aria-describedby="field-project-description"/,
+    );
+    expect(html).toContain(
+      '<small id="field-project-description">A folder, or a repository to clone.</small>',
+    );
+    expect(html).toContain('aria-label="Choose folder"');
   });
 
   it("keeps a primary answer's accent background over the answers' raised one", () => {
@@ -204,6 +234,18 @@ describe("accessibility audit of the shared UI", () => {
         selector,
       ).toBe(true);
     }
+  });
+
+  it("gives a keyboard jump's message target an outline above tabindex=-1 suppression", () => {
+    const css = readFileSync(join(root, "shared/style.css"), "utf8");
+    // The general suppression has specificity (0, 2, 1). The message rule's
+    // class, attribute and pseudo-class give it (0, 3, 0), so it wins the cascade.
+    const rule =
+      /\.transcript-block\[tabindex="-1"\]:focus-visible\s*\{([^}]*)\}/.exec(
+        css,
+      );
+    expect(rule?.[1]).toMatch(/outline:\s*2px solid var\(--focus\)/);
+    expect(rule?.[1]).toMatch(/outline-offset:\s*-2px/);
   });
 });
 
@@ -397,6 +439,25 @@ describe("styles that keep controls usable", () => {
     expect(primary).toContain("background: var(--accent)");
     expect(primary).toContain("color: var(--accent-fg)");
   });
+  it("draws a switch as a track and thumb, 44 points to touch on the phone", () => {
+    const sw = 'input[type="checkbox"][role="switch"]';
+    expect(rule(css, sw)).toContain("border-radius: 999px");
+    expect(rule(css, `${sw}:checked`)).toContain("background: var(--accent)");
+    expect(rule(css, `${sw}:checked::before`)).toContain(
+      "transform: translateX",
+    );
+    // The input itself is the 44-point target (what is measured and tapped); its ::after
+    // draws the 26-high track inside it, and turns the accent when on.
+    const target = rule(mobile, `[data-mobile="true"] ${sw}:checked`);
+    expect(target).toContain("min-width: 44px");
+    expect(target).toContain("min-height: 44px");
+    const track = rule(mobile, `[data-mobile="true"] ${sw}::after`);
+    expect(track).toContain("height: 26px");
+    expect(track).toContain("border-radius: 999px");
+    expect(rule(mobile, `[data-mobile="true"] ${sw}:checked::after`)).toContain(
+      "background: var(--accent)",
+    );
+  });
   it("gives the phone's disclosure rows and the model picker's list switch 44 points", () => {
     expect(rule(mobile, '[data-mobile="true"] details > summary')).toContain(
       "min-height: 44px",
@@ -404,8 +465,8 @@ describe("styles that keep controls usable", () => {
     expect(
       rule(mobile, '[data-mobile="true"] .input-with-button > button'),
     ).toContain("min-width: 44px");
-    // Send as implementation loop's ↻ button and its choice, the inspector's two loop
-    // starts and the phone's in-flow notice's Dismiss.
+    // Run as loop's ↻ switch, the inspector's two loop starts and the phone's in-flow
+    // notice's Dismiss.
     expect(rule(mobile, '[data-mobile="true"] .send-loop-button')).toContain(
       "min-width: 44px",
     );
@@ -414,12 +475,12 @@ describe("styles that keep controls usable", () => {
     );
     const loopTargets = rule(
       mobile,
-      '[data-mobile="true"] .send-loop-panel > button,\n[data-mobile="true"] .inspector-notice > button,\n[data-mobile="true"] .loop-starts > button',
+      '[data-mobile="true"] .inspector-notice > button,\n[data-mobile="true"] .loop-starts > button',
     );
     expect(loopTargets).toContain("min-height: 44px");
     expect(loopTargets).toContain("min-width: 44px");
     // Every control in the composer's row: Upload, the microphone, hands-free, Send (and
-    // Send as implementation loop, above). The microphone and hands-free were 32 wide.
+    // Run as loop, above). The microphone and hands-free were 32 wide.
     const composerTargets = rule(
       mobile,
       '[data-mobile="true"] .send-button,\n[data-mobile="true"] .voice-button',
@@ -458,8 +519,32 @@ describe("styles that keep controls usable", () => {
       rule(mobile, '[data-mobile="true"] select:not([multiple]):not([size])'),
     ).toContain("height: max(44px");
   });
+  it("gives the phone's attached files 44-point targets inside the message box", () => {
+    const remove = rule(mobile, '[data-mobile="true"] .attachment-remove');
+    for (const size of [
+      "min-width: 44px",
+      "min-height: 44px",
+      "width: 44px",
+      "height: 44px",
+    ])
+      expect(remove).toContain(size);
+    expect(
+      rule(mobile, '[data-mobile="true"] .attachment-chip > .attachment-open'),
+    ).toContain("min-height: 44px");
+    // The files take the box's width, above the text, and wrap rather than overflow.
+    expect(
+      rule(mobile, '[data-mobile="true"] .composer-attachments'),
+    ).toContain("grid-column: 1 / -1");
+    const attachments = readFileSync(
+      join(root, "shared/attachments.css"),
+      "utf8",
+    );
+    expect(attachments).toMatch(
+      /\.composer-attachments > ul \{[^}]*flex-wrap: wrap;/,
+    );
+    expect(attachments).toMatch(/\.attachment-tile \{[^}]*width: 64px;/);
+  });
 });
-
 describe("loop surfaces", () => {
   const css = readFileSync(join(root, "shared/style.css"), "utf8");
   it("lets a long held task scroll inside the setup card, and be scrolled by keyboard", () => {

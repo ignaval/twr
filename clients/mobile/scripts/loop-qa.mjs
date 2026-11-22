@@ -766,6 +766,9 @@ export async function loopQA(driver, fixture, options) {
   await run.until("async (a, lq) => !!lq.find('[role=dialog] .loop-presets')");
   const editor = await run.ev(`async (a, lq) => {
     const d = [...document.querySelectorAll('[role=dialog]')].at(-1);
+    // The controls past the preset sit behind Customize.
+    for (const b of d.querySelectorAll('.loop-customize-toggle[aria-expanded=false]')) b.click();
+    await lq.settle();
     const presets = lq.all('.loop-presets button', d).map((b) => ({ name: lq.nameOf(b), pressed: b.getAttribute('aria-pressed') }));
     const group = d.querySelector('.loop-presets')?.getAttribute('role');
     const fields = lq.all('label.field > span:first-child, .field > span:first-child, .loop-editor-heading', d).map(lq.text);
@@ -866,7 +869,7 @@ export async function loopQA(driver, fixture, options) {
   const controls = await run.ev(
     "async (a, lq) => ({ buttons: lq.all('.inspector-loops button').map(lq.nameOf), phases: lq.all('.loop-phases li').map(lq.text), current: lq.text(document.querySelector('.loop-phases [aria-current=step]')), status: lq.text(document.querySelector('.loop-status')) })",
   );
-  for (const name of ["Pause", "Skip to verify", "Stop…"])
+  for (const name of ["Pause", "Finish early", "Stop…"])
     assert(controls.buttons.includes(name), `${name} in ${controls.buttons}`);
   await run.shots("inspector-running", { root: ".inspector" });
   run.pass(
@@ -1137,19 +1140,23 @@ async function openConversation(run, name) {
     { what: `${name}'s composer` },
   );
 }
-/** The ↻ button beside Send, then its choice: what the choice says. */
+/** What Run as loop (the ↻ switch beside Send) says, and the Send button's name. */
+const RUN_AS_LOOP = `async (a, lq) => {
+  const s = lq.find('.send-loop-button', 'Run as loop');
+  if (!s) return false;
+  if (a.on && s.getAttribute('aria-checked') !== 'true') return false;
+  return { checked: s.getAttribute('aria-checked'), disabled: s.disabled, what: lq.text(document.getElementById(s.getAttribute('aria-describedby'))), send: lq.nameOf(document.querySelector('.send-button')) };
+}`;
+/** Turns Run as loop on when it can be: what it says then. */
 async function openSendAsLoop(run, name) {
-  await run.tap(".send-loop-button", `Send as implementation loop to ${name}…`);
-  return run.until(
-    `async (a, lq) => {
-      const opener = lq.find('.send-loop-button', 'Send as implementation loop to ' + a.name + '…');
-      const choice = lq.find('.send-loop-panel button', 'Send as implementation loop');
-      if (!choice) return false;
-      return { expanded: opener?.getAttribute('aria-expanded'), disabled: choice.disabled, what: lq.text(document.getElementById(choice.getAttribute('aria-describedby'))) };
-    }`,
+  const before = await run.until(
+    RUN_AS_LOOP,
     { name },
-    { what: "Send as implementation loop" },
+    { what: "Run as loop" },
   );
+  if (before.disabled || before.checked === "true") return before;
+  await run.tap(".send-loop-button", "Run as loop");
+  return run.until(RUN_AS_LOOP, { name, on: true }, { what: "Run as loop on" });
 }
 /** Whether the open sheet's last answer can be scrolled to and tapped (not under the
  * home indicator, the keyboard or the edge). */
@@ -1217,21 +1224,19 @@ async function implementQA(run, d, f) {
   });
   await openConversation(run, BUILDER);
 
-  // 1. The ↻ button beside Send opens Send as implementation loop.
+  // 1. The ↻ switch beside Send turns on Run as loop: Send then starts the loop.
   await typeTask(run, BUILDER, TASK);
   const choice = await openSendAsLoop(run, BUILDER);
-  assert.equal(choice.expanded, "true");
+  assert.equal(choice.checked, "true");
   assert.equal(choice.disabled, false);
   assert.match(choice.what, /plans your message as a task/);
-  await run.shots("implement-choice", { root: ".send-as-loop" });
-  run.pass(
-    "the ↻ button beside Send opens Send as implementation loop",
-    choice,
-  );
+  assert.equal(choice.send, "Start implementation loop");
+  await run.shots("implement-choice", { root: ".composer" });
+  run.pass("the ↻ switch beside Send turns on Run as loop", choice);
 
   // 2. No saved settings: the card holds the task, a row that opens as a sheet with four
   //    answers in order, under the 600 ms rule.
-  await run.tap(".send-loop-panel button", "Send as implementation loop");
+  await run.tap(".send-button", "Start implementation loop");
   await run.until(
     "async (a, lq) => !!lq.find('.loop-setup-row button', 'Review setup')",
     {},
@@ -1363,7 +1368,7 @@ async function implementQA(run, d, f) {
   f.template("implement", "!sleep 30000\n" + IMPLEMENT);
   await typeTask(run, BUILDER, TASK);
   await openSendAsLoop(run, BUILDER);
-  await run.tap(".send-loop-panel button", "Send as implementation loop");
+  await run.tap(".send-button", "Start implementation loop");
   await run.until(
     "async (a, lq) => !!lq.find('.loop-setup-row button', 'Review setup')",
     {},
@@ -1625,7 +1630,7 @@ async function implementQA(run, d, f) {
   }
   run.pass("the New thread form's switch starts an implementation loop", form);
 
-  // 8. Offline: neither Send as implementation loop nor the card's answers start
+  // 8. Offline: neither Run as loop nor the card's answers start
   //    anything, and nothing goes to the outbox.
   await owner("loop.request", {
     thread: BUILDER,
@@ -1642,17 +1647,12 @@ async function implementQA(run, d, f) {
   await typeTask(run, BUILDER, "add a PDF export");
   await d.offline(true);
   const offlineChoice = await poll(async () => {
-    const c = await openSendAsLoop(run, BUILDER);
-    if (c.disabled) return c;
-    await run.ev(
-      "async (a, lq) => { lq.find('.send-loop-button', { re: '^Send as implementation loop to' })?.click(); return true; }",
-    );
-    return false;
-  }, "Send as implementation loop is off while offline");
+    const c = await run.until(RUN_AS_LOOP, {}, { what: "Run as loop" });
+    return c.disabled && c.checked === "false" ? c : false;
+  }, "Run as loop is off while offline");
   const offline = await run.ev(`async (a, lq) => {
-    lq.find('.send-loop-panel button', 'Send as implementation loop')?.click();
+    lq.find('.send-loop-button', 'Run as loop')?.click();
     await lq.sleep(500);
-    lq.find('.send-loop-button', { re: '^Send as implementation loop to' })?.click();
     lq.find('.loop-setup-row button', 'Review setup')?.click();
     await lq.sleep(800);
     const start = lq.find('[role=dialog] .attention-options button', 'Start and save');
@@ -1685,7 +1685,7 @@ async function implementQA(run, d, f) {
   );
   assert.equal(await runningLoop(d, BUILDER), undefined, "Nothing started");
   run.pass(
-    "offline: Send as implementation loop and the card's answers are off; nothing queued or sent",
+    "offline: Run as loop and the card's answers are off; nothing queued or sent",
     { offlineChoice, offline },
   );
   // Leave no card or draft behind.
@@ -1981,6 +1981,7 @@ export async function revokeInApp(driver) {
 async function openSettingsLoops(run) {
   await run.tab("More");
   await run.tap("#twr-sidebar button, .sidebar button", { re: "^Settings" });
+  await run.tap("[role=tab]", "Loops");
   await run.until(
     "async (a, lq) => !!lq.all('.settings-section h2').find((h) => lq.text(h) === 'Loops')",
     {},
@@ -2092,8 +2093,7 @@ export async function loopReadOnlyQA(driver, fixture, options) {
 
 /**
  * An implementation loop on a `read` device: its card's four answers are off; the chip, the
- * progress and the report's text show; Send as implementation loop and the controls are
- * off.
+ * progress and the report's text show; Run as loop and the controls are off.
  */
 async function implementReadOnlyQA(run, d, f) {
   const owner = (method, params) => d.owner(method, params);
@@ -2167,10 +2167,10 @@ async function implementReadOnlyQA(run, d, f) {
     JSON.stringify(progress),
   );
   await run.shots("read-implement-progress", { root: ".inspector" });
-  // Send as implementation loop is off.
+  // Run as loop is off.
   await openConversation(run, BUILDER);
   const send = await run.ev(
-    "async (a, lq) => { const o = lq.find('.send-loop-button', { re: '^Send as implementation loop to' }); if (!o) return { shown: false }; o.click(); await lq.sleep(300); const c = lq.find('.send-loop-panel button', 'Send as implementation loop'); const out = { shown: true, disabled: c ? c.disabled : null, why: c ? lq.text(document.getElementById(c.getAttribute('aria-describedby'))) : '' }; o.click(); return out; }",
+    "async (a, lq) => { const o = lq.find('.send-loop-button', 'Run as loop'); if (!o) return { shown: false }; return { shown: true, disabled: o.disabled, why: lq.text(document.getElementById(o.getAttribute('aria-describedby'))) }; }",
   );
   assert(
     !send.shown || send.disabled !== false,
@@ -2356,6 +2356,9 @@ const LOOPS = `async (a, lq) => {
  * (the top dialog, or Settings › Loops). */
 const PICKERS = `async (a, lq) => {
   const root = a.root === 'dialog' ? [...document.querySelectorAll('[role=dialog]')].at(-1) : lq.all('.settings-section').find((s) => lq.text(s.querySelector('h2')) === 'Loops');
+  if (!root) return false;
+  for (const b of root.querySelectorAll('.loop-customize-toggle[aria-expanded=false]')) b.click();
+  await lq.settle();
   const group = [...root.querySelectorAll('.loop-editor-group')].find((g) => lq.text(g.querySelector('.loop-editor-heading')) === 'Reviewer');
   if (!group) return false;
   const [runtime, model] = group.querySelectorAll('select');
@@ -2854,7 +2857,7 @@ exit 1
     await typeTask(run, "boxer", TASK);
     const choice = await openSendAsLoop(run, "boxer");
     assert.equal(choice.disabled, false, JSON.stringify(choice));
-    await run.tap(".send-loop-panel button", "Send as implementation loop");
+    await run.tap(".send-button", "Start implementation loop");
     await poll(
       async () => (await runningLoop(d, "boxer"))?.kind === "implement",
       "the box's implementation loop starts",
@@ -2919,22 +2922,11 @@ exit 1
       away2.what,
       "Box lab is away: a loop can start once it is back.",
     );
-    const escape = await run.ev(`async (a, lq) => {
-      const panel = document.querySelector('.send-loop-panel');
-      const focused = document.activeElement === panel;
-      document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
-      await lq.sleep(300);
-      return { focused, closed: !document.querySelector('.send-loop-panel'), back: lq.nameOf(document.activeElement) };
-    }`);
-    assert.deepEqual(escape, {
-      focused: true,
-      closed: true,
-      back: "Send as implementation loop to boxer…",
-    });
+    assert.equal(away2.checked, "false");
     await typeTask(run, "boxer", "");
     run.pass(
-      "with the box away, Review loop, Implementation loop… and ↻ say why they wait; the panel takes the focus and Escape closes it",
-      { why: gated.why, escape },
+      "with the box away, Review loop, Implementation loop… and ↻ say why they wait",
+      { why: gated.why, away: away2 },
     );
     // The box back for the rest.
     await startRunner(true);

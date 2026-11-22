@@ -338,6 +338,54 @@ async function dismissKeyboard() {
     )
     .toBe(true);
 }
+/** Settings › Orchestrator's access level, from an admin device: Full asks first and
+ * Cancel changes nothing; confirming applies it on the hub and in config.toml; Limited
+ * applies without asking. Ends back on Chat at Limited. */
+async function orchestratorAccessQA() {
+  const config = () => readFileSync(join(fixture, "config.toml"), "utf8");
+  const hubAccess = async () => (await ownerCall("orchestrator.show")).access;
+  await page
+    .locator(".mobile-tabs")
+    .getByRole("button", { name: "More", exact: true })
+    .click();
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("tab", { name: "Agents", exact: true }).click();
+  const group = page.getByRole("group", { name: "Orchestrator access" });
+  await group.scrollIntoViewIfNeeded();
+  const limited = group.getByRole("button", { name: "Limited", exact: true });
+  const full = group.getByRole("button", { name: "Full", exact: true });
+  await expect(limited).toHaveAttribute("aria-pressed", "true");
+  await full.click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("Give the orchestrator full access?");
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect(limited).toHaveAttribute("aria-pressed", "true");
+  assert.equal(await hubAccess(), "limited");
+  await full.click();
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Give full access", exact: true })
+    .click();
+  await expect(full).toHaveAttribute("aria-pressed", "true");
+  await expect(
+    page.locator(".orchestrator-access [role=status]"),
+  ).toContainText("full access");
+  assert.equal(await hubAccess(), "full");
+  assert.match(config(), /^access = "full"$/m);
+  await limited.click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(limited).toHaveAttribute("aria-pressed", "true");
+  assert.equal(await hubAccess(), "limited");
+  assert.match(config(), /^access = "limited"$/m);
+  await page
+    .locator(".mobile-tabs")
+    .getByRole("button", { name: "Chat", exact: true })
+    .click();
+  console.log(
+    "PASS: Settings › Orchestrator changes the access level live on the hub and in config.toml, and Full asks first",
+  );
+}
 
 try {
   fixtureHub = spawn(join(bin, "twr"), ["hub"], { env, stdio: "ignore" });
@@ -1483,6 +1531,7 @@ try {
   console.log(
     "PASS: duplicate mutation ID replays the durable result without creating another thread",
   );
+  await orchestratorAccessQA();
   if (serial === "emulator-5554") {
     adbRun([
       "shell",
@@ -1861,10 +1910,7 @@ try {
       .getByRole("button", { name: "More", exact: true })
       .click();
     await expect(
-      page.getByRole("button", { name: "Accounts", exact: true }),
-    ).toHaveCount(0);
-    await expect(
-      page.getByRole("button", { name: "Boxes", exact: true }),
+      page.getByRole("button", { name: "Machines & accounts", exact: true }),
     ).toHaveCount(0);
     console.log(
       "PASS: default device scopes disable terminals and hide admin sections",

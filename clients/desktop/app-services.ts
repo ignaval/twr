@@ -53,6 +53,9 @@ export interface AppServiceHost {
   prepareQuit(): void;
   /** Undoes prepareQuit when the quit does not happen. */
   cancelQuit(): void;
+  /** Has the page save its drafts now; the window's next close then goes ahead without
+   * asking it again (`save-before-close.ts`). */
+  saveBeforeClosing(): Promise<void>;
   activeTerminals(): number;
   facts(): Record<string, unknown>;
 }
@@ -258,7 +261,7 @@ export class AppServices {
         "tray",
         "No StatusNotifier host yet; checking again while the session starts.",
       );
-      // At login, uwsm can start twr before Waybar registers its tray.
+      // At login, uwsm can start twr before the bar (the Omarchy shell, Waybar) registers its tray.
       void this.waitForTray();
     }
     this.applyTray();
@@ -424,6 +427,8 @@ export class AppServices {
         : await dialog.showMessageBox(options);
       if (response !== 1) return;
     }
+    // The restart closes the window itself: the drafts are saved first.
+    await this.host.saveBeforeClosing();
     this.host.prepareQuit();
     try {
       this.updater.install();

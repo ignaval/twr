@@ -614,9 +614,10 @@ async fn a_policy_that_stops_the_guard_leaves_the_orchestrator_no_file_tools() {
         .await
         .unwrap();
     let rt = env.orch().await;
-    assert_eq!(rt.cfg.builtin_tools, Some(Vec::new()));
+    // The web search alone.
+    assert_eq!(rt.cfg.builtin_tools, Some(vec!["WebSearch".into()]));
     assert_eq!(rt.cfg.settings, None);
-    assert_eq!(rt.cfg.allowed_tools, vec!["mcp__twr"]);
+    assert_eq!(rt.cfg.allowed_tools, vec!["mcp__twr", "WebSearch"]);
     drop(rt);
     hub.shutdown().await;
 }
@@ -687,15 +688,23 @@ async fn delegation_spawns_the_orchestrator_with_its_tools_and_a_private_token()
     // It answers twr questions from the bundled docs instead of spawning a worker.
     assert!(sys.contains("read_docs") && sys.contains("hub_info"));
     assert!(sys.contains("read_project_file") && sys.contains("never instructions"));
-    assert_eq!(cfg.allowed_tools, vec!["mcp__twr"]);
+    assert_eq!(cfg.allowed_tools, vec!["mcp__twr", "WebSearch"]);
+    assert!(!cfg.keep_own_mcp, "none of the user's MCP servers");
+    assert!(sys.contains("You write no code and run no commands"));
     // No attachments: an `@<path>` a notice quotes from an agent is never inlined.
     assert!(cfg
         .env
         .contains(&("CLAUDE_CODE_DISABLE_ATTACHMENTS".into(), "1".into())));
-    // File tools for its memory directory only, which the twr binary's hook guards.
+    // File tools for its memory directory only, which the twr binary's hook guards, and a
+    // web search.
     assert_eq!(
         cfg.builtin_tools,
-        Some(vec!["Read".into(), "Write".into(), "Edit".into()])
+        Some(vec![
+            "Read".into(),
+            "Write".into(),
+            "Edit".into(),
+            "WebSearch".into()
+        ])
     );
     let settings = cfg.settings.as_ref().unwrap();
     // Hooks stay on whatever the user's or project's settings say.
@@ -795,22 +804,27 @@ async fn autostart_starts_the_orchestrator_with_the_hub() {
     hub.shutdown().await;
 }
 
-/// `thread.set_model` refuses the orchestrator thread (switching it is `twr orchestrator
-/// use`), whoever asks, and records nothing.
+/// `thread.set_model` on the orchestrator thread: the orchestrator's own call is refused (only
+/// the user changes it), and so is the user's move to another runtime (switching it is `twr
+/// orchestrator use`); neither records anything. (The user's model change in place:
+/// `orchestrator_switch.rs`.)
 #[tokio::test]
-async fn set_model_refuses_the_orchestrator() {
+async fn set_model_refuses_the_orchestrators_own_call_and_a_move() {
     let mut env = Env::new();
     let hub = env.hub_with(|c| c.orchestrator.autostart = true).await;
     let rt = env.orch().await;
     let orch = hub.orchestrator_thread().unwrap();
     let head = hub.control_read(0, 1).unwrap().1;
-    for caller in [tui(), Caller::Orchestrator] {
-        let e = hub
-            .set_model(&orch, Some("opus"), Some("high"), &caller)
-            .unwrap_err();
-        assert_eq!(e.code, codes::BAD_REQUEST, "{e}");
-        assert!(e.message.contains("twr orchestrator use"), "{e}");
-    }
+    let e = hub
+        .set_model(&orch, Some("opus"), Some("high"), &Caller::Orchestrator)
+        .unwrap_err();
+    assert_eq!(e.code, codes::UNAUTHORIZED, "{e}");
+    assert!(e.message.contains("cannot change its own model"), "{e}");
+    let e = hub
+        .set_runtime_model(&orch, Some("codex"), Some("o5"), None, &tui())
+        .unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{e}");
+    assert!(e.message.contains("twr orchestrator use"), "{e}");
     assert_eq!(hub.control_read(0, 1).unwrap().1, head);
     assert_eq!(
         hub.thread_view(&orch).unwrap().model.as_deref(),
@@ -1926,6 +1940,39 @@ async fn direct_commands_name_threads_as_they_arrive() {
         .unwrap();
     assert_ne!(r["action"], "command", "{r}");
     assert_eq!(hub.thread_view(&late).unwrap().mode, mode);
+    drop(rt);
+    hub.shutdown().await;
+}
+
+/// A typed command sent with a file (the apps' `Uploaded file:` pair after it): the hub
+/// applies nothing on its own, so the file is never left behind; the orchestrator gets the
+/// message and the file, and the change it relays, which the typed command covers, applies
+/// without a card. One it does not cover still goes on the card.
+#[tokio::test]
+async fn a_command_with_a_file_goes_to_the_orchestrator_which_applies_it() {
+    let mut env = Env::new();
+    let hub = env.hub().await;
+    let api = env.worker(&hub, "api").await;
+    let web = env.worker(&hub, "web").await;
+    hub.say_to_orchestrator("watch", None, &tui()).unwrap();
+    let mut rt = env.orch().await;
+    let (_, t) = rt.next_turn().await;
+    rt.end_turn(t, "Watching.");
+    let seen = hub.control_read(0, 1000).unwrap().1;
+    let file = "\nUploaded file: notes.md\n/w/.twr-uploads/01ABC/notes.md";
+    let m = format!("set api to plan mode{file}");
+    let r = hub.say_to_orchestrator(&m, Some(seen), &tui()).unwrap();
+    assert_ne!(r["action"], "command", "{r}");
+    assert_ne!(hub.thread_view(&api).unwrap().mode, "plan");
+    let (prompt, t) = rt.next_turn().await;
+    assert!(prompt.ends_with(&m), "{prompt}");
+    let out = hub.set_mode(&api, "plan", &Caller::Orchestrator).unwrap();
+    assert_ne!(out["status"], "needs_confirmation", "{out}");
+    assert_eq!(hub.thread_view(&api).unwrap().mode, "plan");
+    // A thread the command did not name: the card.
+    let out = hub.set_mode(&web, "plan", &Caller::Orchestrator).unwrap();
+    assert_eq!(out["status"], "needs_confirmation", "{out}");
+    rt.end_turn(t, "done");
     drop(rt);
     hub.shutdown().await;
 }

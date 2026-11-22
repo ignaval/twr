@@ -16,6 +16,12 @@
 //! - Any other `.`, `!`, `?`, `¿`, `¡`, `;`, `:`, `…` (full-width forms too), a line break or a
 //!   control character anywhere makes it no command: a command is exactly one sentence.
 //! - At most [`MAX_MESSAGE_BYTES`] bytes and [`MAX_TOKENS`] tokens.
+//! - The files the apps attach to it are not part of it: the `Uploaded file: <name>` line
+//!   and upload path of each ([`twr_core::upload::split_attachments`]: an uploaded copy's
+//!   path, outside fenced code blocks) are left out before it is read. A command sent with
+//!   files is never applied by the hub on its own ([`direct_actions`] gives nothing): the
+//!   message goes to the orchestrator whole, files and all, and a call it relays that the
+//!   typed command covers is applied as it would be without them.
 //! - It is lowercased with curly quotes and apostrophes straightened ([`normalize`]) and split
 //!   at whitespace; each `,` is a token of its own. Nothing else is trimmed: "'api'", "(api)"
 //!   or "*api*" is no vocabulary. Every token must be consumed by the grammar.
@@ -321,6 +327,25 @@ const SENTENCE_MARKS: &[char] = &[
     '\u{FF1B}', '\u{FF1F}', '\u{2028}', '\u{2029}',
 ];
 
+/// Most bytes of a message whose files are looked for ([`typed`]): a command at its longest
+/// with a few dozen files' lines, and still no copy of a long message, which is no command.
+const MAX_WITH_FILES: usize = 4 * MAX_MESSAGE_BYTES;
+
+/// What the user typed of `message`, without the files the apps attach to it (module docs,
+/// "The message"), and whether it had any. A message with no file's line, or too long to
+/// be a command with its files, is read as it is, with nothing copied.
+fn typed(message: &str) -> (std::borrow::Cow<'_, str>, bool) {
+    if message.len() > MAX_WITH_FILES || !message.contains("Uploaded file: ") {
+        return (message.into(), false);
+    }
+    let (text, files) = twr_core::upload::split_attachments(message);
+    if files.is_empty() {
+        (message.into(), false)
+    } else {
+        (text.into(), true)
+    }
+}
+
 /// The tokens of `message` when it can be a command at all (module docs, "The message"):
 /// one sentence, at most [`MAX_MESSAGE_BYTES`] bytes and [`MAX_TOKENS`] tokens.
 fn tokens(message: &str) -> Option<Vec<String>> {
@@ -574,7 +599,8 @@ impl Names {
 /// a thread made or renamed meanwhile (by the orchestrator, say) could capture a word of it.
 /// Empty when the message can be no command.
 pub fn named_threads(scene: &Scene) -> BTreeSet<String> {
-    let Some(toks) = tokens(scene.message) else {
+    // The words [`read`] reads: without the message's files.
+    let Some(toks) = tokens(&typed(scene.message).0) else {
         return BTreeSet::new();
     };
     let names = Names::new(scene.threads);
@@ -1004,7 +1030,7 @@ fn resolve_clause(scene: &Scene, c: &Clause) -> Option<BTreeSet<String>> {
 /// Reads `scene.message`: the actions of the command it is, or `None` when it is no command
 /// (outside the grammar, read two ways, past a limit, or a group picking out nothing).
 pub fn read(scene: &Scene) -> Option<Vec<Action>> {
-    let toks = tokens(scene.message)?;
+    let toks = tokens(&typed(scene.message).0)?;
     let mut p = Parser::new(&toks, scene.threads);
     let (count, parse) = p.parses(0, MAX_CLAUSES);
     if count != 1 {
@@ -1026,7 +1052,7 @@ pub fn read(scene: &Scene) -> Option<Vec<Action>> {
 /// its targets would resolve: an answer or a mode change for threads by name, quantity or
 /// mode. For text that must never be taken for one (a next message a model suggested).
 pub fn is_command(message: &str, threads: &[ThreadInfo]) -> bool {
-    let Some(toks) = tokens(message) else {
+    let Some(toks) = tokens(&typed(message).0) else {
         return false;
     };
     let mut p = Parser::new(&toks, threads);
@@ -1080,9 +1106,13 @@ pub enum DirectAction {
     Mode { thread: String, mode: String },
 }
 
-/// Resolve the whole command before applying anything. Conflicts, questions and a lone answer
-/// ([`Coverage::Lone`]) fall back.
+/// Resolve the whole command before applying anything. Conflicts, questions, a lone answer
+/// ([`Coverage::Lone`]) and a command sent with files (module docs, "The message": the
+/// orchestrator gets those, and the files) fall back.
 pub fn direct_actions(scene: &Scene) -> Option<Vec<DirectAction>> {
+    if typed(scene.message).1 {
+        return None;
+    }
     let mut out = BTreeMap::new();
     for action in read(scene)? {
         if action.lone {

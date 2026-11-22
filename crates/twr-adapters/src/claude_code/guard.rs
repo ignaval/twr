@@ -34,6 +34,14 @@
 //! orchestrator no file tools at all. The environment variables that would drop or wrap the
 //! hook ([`HOOK_ENV`]) are removed from the runtime and its attach command.
 //!
+//! An orchestrator with full access (`[orchestrator] access = "full"`) has every tool, and the
+//! guard runs in its other mode (`--protect <dir>`, [`protect_settings`], [`check_protected`]):
+//! its file-writing tools ([`WRITE_TOOLS`]) may write anywhere but in twr's own directories and
+//! files (its config directory, `config.toml` and `boxes.toml`, its data directory,
+//! `TWR_HOME`), each checked as the file system resolves it, the same way; Read is not hooked.
+//! It is defense in depth for the file tools only: the shell it also has reaches those files
+//! anyway.
+//!
 //! Not seen here, and accepted: a settings `env` block that sets one of those variables again
 //! once Claude Code has started, server-managed settings Claude Code has not stored yet (it may
 //! fetch them during the session), and managed settings from an MDM profile or the Windows
@@ -73,6 +81,27 @@ const MAX_LINKS: usize = 40;
 /// The `twr claude-memory-guard` option that names the one memory directory the guard allows
 /// ([`check_with`]).
 pub const MEMORY_DIR_FLAG: &str = "--memory-dir";
+
+/// The `twr claude-memory-guard` option (repeated) that names a directory or file of twr's own
+/// that the file-writing tools may not touch ([`check_protected`]); with it, the guard checks
+/// [`WRITE_TOOLS`] instead of confining [`TOOLS`] to the memory directory.
+pub const PROTECT_FLAG: &str = "--protect";
+
+/// Claude Code's built-in tools that write files (Claude Code 2.1.326: `MultiEdit` is no longer
+/// offered, but a version that still has it is covered), hooked for an orchestrator with full
+/// access ([`protect_settings`]). Each names its file with `file_path`, `NotebookEdit` with
+/// `notebook_path`.
+pub const WRITE_TOOLS: [&str; 4] = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
+
+/// What the guard checks a call against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Policy {
+    /// [`check_with`]: Read, Write and Edit only inside the memory directory (`Some`: exactly
+    /// that one, `--memory-dir`).
+    Memory(Option<PathBuf>),
+    /// [`check_protected`]: the file-writing tools anywhere but in these (`--protect`).
+    Protect(Vec<PathBuf>),
+}
 
 /// `--settings` for a Claude Code orchestrator: the guard (`<exe> claude-memory-guard`) as a
 /// `PreToolUse` hook on [`TOOLS`], with hooks kept on (a user's or project's
@@ -135,6 +164,38 @@ pub fn project_memory_dir(config_dir: &Path, cwd: &Path) -> Result<PathBuf, Stri
     }
     let dir = config_dir.join("projects").join(key).join("memory");
     resolve(&dir).map_err(|e| format!("{} cannot be resolved: {e}", dir.display()))
+}
+
+/// `--settings` for a Claude Code orchestrator with full access: the guard (`<exe>
+/// claude-memory-guard --protect '<path>'...`, one `--protect` per path of `protect`) as a
+/// `PreToolUse` hook on [`WRITE_TOOLS`], with hooks kept on and the same `|| exit 2` and timeout
+/// as [`settings`]. With `memory_dir`, `autoMemoryDirectory` moves its memory there as
+/// [`settings`] does (the hook need not know it: it writes anywhere outside `protect`).
+pub fn protect_settings(exe: &Path, protect: &[PathBuf], memory_dir: Option<&Path>) -> Value {
+    let mut command = format!("{} {COMMAND}", shell_quote(&exe.to_string_lossy()));
+    for p in protect {
+        command.push_str(&format!(
+            " {PROTECT_FLAG} {}",
+            shell_quote(&p.to_string_lossy())
+        ));
+    }
+    let mut out = json!({
+        "disableAllHooks": false,
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": WRITE_TOOLS.join("|"),
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{command} || exit 2"),
+                    "timeout": HOOK_TIMEOUT_SECS,
+                }],
+            }],
+        },
+    });
+    if let Some(dir) = memory_dir {
+        out["autoMemoryDirectory"] = json!(dir.to_string_lossy());
+    }
+    out
 }
 
 /// `s` as one word for `sh`.
@@ -325,24 +386,43 @@ pub fn run_with(
     deadline: Duration,
     memory_dir: Option<PathBuf>,
 ) -> Option<Value> {
+    run_policy(read, deadline, Policy::Memory(memory_dir))
+}
+
+/// [`run`] checking each call against `policy`: denied, with that policy's message, whenever
+/// it is not decided within `deadline`, the input cannot be read, or the guard panics.
+pub fn run_policy(
+    read: impl FnOnce() -> std::io::Result<String> + Send + 'static,
+    deadline: Duration,
+    policy: Policy,
+) -> Option<Value> {
     let (tx, rx) = std::sync::mpsc::channel();
+    let mine = policy.clone();
     let spawned = std::thread::Builder::new().spawn(move || {
         let out = match read() {
-            Ok(input) => answer_with(&input, memory_dir.as_deref()),
-            Err(e) => Some(deny(&format!("its input could not be read: {e}"))),
+            Ok(input) => answer_policy(&input, &mine),
+            Err(e) => Some(deny_for(
+                &mine,
+                &format!("its input could not be read: {e}"),
+            )),
         };
         let _ = tx.send(out);
     });
     if spawned.is_err() {
-        return Some(deny("the guard could not start"));
+        return Some(deny_for(&policy, "the guard could not start"));
     }
     match rx.recv_timeout(deadline) {
         Ok(out) => out,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Some(deny(&format!(
-            "the guard did not decide within {} ms",
-            deadline.as_millis()
-        ))),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Some(deny("the guard failed")),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Some(deny_for(
+            &policy,
+            &format!(
+                "the guard did not decide within {} ms",
+                deadline.as_millis()
+            ),
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Some(deny_for(&policy, "the guard failed"))
+        }
     }
 }
 
@@ -354,23 +434,39 @@ pub fn answer(input: &str) -> Option<Value> {
 
 /// [`answer`] allowing only `memory_dir` when given ([`check_with`]).
 pub fn answer_with(input: &str, memory_dir: Option<&Path>) -> Option<Value> {
-    let reason = match serde_json::from_str::<Value>(input) {
-        Ok(v) => check_with(&v, memory_dir).err()?,
-        Err(e) => format!("unreadable hook input: {e}"),
-    };
-    Some(deny(&reason))
+    answer_policy(input, &Policy::Memory(memory_dir.map(Path::to_path_buf)))
 }
 
-/// The `deny` decision for `reason`.
-fn deny(reason: &str) -> Value {
+/// [`answer`] checking the call against `policy`.
+pub fn answer_policy(input: &str, policy: &Policy) -> Option<Value> {
+    let reason = match serde_json::from_str::<Value>(input) {
+        Ok(v) => match policy {
+            Policy::Memory(dir) => check_with(&v, dir.as_deref()).err()?,
+            Policy::Protect(protect) => check_protected(&v, protect).err()?,
+        },
+        Err(e) => format!("unreadable hook input: {e}"),
+    };
+    Some(deny_for(policy, &reason))
+}
+
+/// The `deny` decision for `reason`, saying what `policy` allows.
+fn deny_for(policy: &Policy, reason: &str) -> Value {
+    let why = match policy {
+        Policy::Memory(_) => format!(
+            "twr: the orchestrator's file tools work only in its memory directory ({reason}); \
+             leave project files to worker threads"
+        ),
+        Policy::Protect(_) => format!(
+            "twr: the orchestrator's file tools may not change twr's own files ({reason}); \
+             change twr's configuration with the set_config tool, and leave its data \
+             directory to the hub"
+        ),
+    };
     json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
-            "permissionDecisionReason": format!(
-                "twr: the orchestrator's file tools work only in its memory directory ({reason}); \
-                 leave project files to worker threads"
-            ),
+            "permissionDecisionReason": why,
         },
     })
 }
@@ -434,6 +530,89 @@ pub fn check_with(input: &Value, memory_dir: Option<&Path>) -> Result<(), String
     } else {
         Err(format!("{} is outside it", path.display()))
     }
+}
+
+/// Whether the `PreToolUse` call `input` of an orchestrator with full access stays out of
+/// `protect` (twr's own directories and files, `--protect`): `Err` says why not. Only the
+/// file-writing tools ([`WRITE_TOOLS`]) are the guard's to let through; their path
+/// (`file_path`, `notebook_path` for `NotebookEdit`) is resolved as [`check_with`] resolves it
+/// ([`resolve`]), relative to the call's `cwd`, never from `~`. It is refused when it is one of
+/// `protect` or inside one, as each resolves (so through a symbolic link or a `..` too), when
+/// it matches one but for letter case (a case-insensitive file system), or when it or a
+/// directory above it is the same file as one of them (another name for it: a bind mount, a
+/// case variant). A path or a protected entry that cannot be resolved, and an empty `protect`,
+/// refuse everything.
+pub fn check_protected(input: &Value, protect: &[PathBuf]) -> Result<(), String> {
+    let tool = input["tool_name"].as_str().unwrap_or_default();
+    if !WRITE_TOOLS.contains(&tool) {
+        return Err(format!(
+            "{tool:?} is not a file-writing tool the guard knows"
+        ));
+    }
+    let key = if tool == "NotebookEdit" {
+        "notebook_path"
+    } else {
+        "file_path"
+    };
+    let path = input["tool_input"][key]
+        .as_str()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| format!("no {key}"))?;
+    if path.starts_with('~') {
+        return Err(format!("{path} starts with ~"));
+    }
+    if protect.is_empty() {
+        return Err("no directory of twr's is named, so none can be told apart".into());
+    }
+    let cwd = input["cwd"]
+        .as_str()
+        .filter(|c| !c.is_empty())
+        .map(Path::new);
+    let path = Path::new(path);
+    let path = match (path.is_absolute(), cwd) {
+        (true, _) => path.to_path_buf(),
+        (false, Some(cwd)) if cwd.is_absolute() => cwd.join(path),
+        (false, _) => return Err(format!("relative path {} and no cwd", path.display())),
+    };
+    let resolved =
+        resolve(&path).map_err(|e| format!("{} cannot be resolved: {e}", path.display()))?;
+    for p in protect {
+        let d = resolve(p).map_err(|e| format!("{} cannot be resolved: {e}", p.display()))?;
+        if is_within(&resolved, &d) {
+            return Err(format!("{} is in {}", path.display(), p.display()));
+        }
+    }
+    Ok(())
+}
+
+/// Whether the resolved path `path` is `dir` (resolved) or inside it: by name, by name but for
+/// letter case, or by identity of `path` or a directory above it with `dir`.
+fn is_within(path: &Path, dir: &Path) -> bool {
+    if path.starts_with(dir) {
+        return true;
+    }
+    let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+    if lower(path).starts_with(lower(dir)) {
+        return true;
+    }
+    same_file_above(path, dir)
+}
+
+/// Whether `path` or a directory above it is the same file as `dir` (device and inode).
+#[cfg(unix)]
+fn same_file_above(path: &Path, dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(d) = std::fs::metadata(dir) else {
+        return false;
+    };
+    path.ancestors().any(|a| {
+        std::fs::symlink_metadata(a).is_ok_and(|m| m.dev() == d.dev() && m.ino() == d.ino())
+    })
+}
+
+#[cfg(not(unix))]
+fn same_file_above(_path: &Path, _dir: &Path) -> bool {
+    false
 }
 
 /// The session's memory directories (see the module docs): the one of its transcript's
@@ -1305,5 +1484,217 @@ mod tests {
         assert_eq!(run(move || Ok(input), DEADLINE), None);
         // The environment shortens the deadline, never lengthens it.
         assert!(deadline() <= DEADLINE);
+    }
+
+    /// The full-access settings hook the file-writing tools only, name every protected path to
+    /// the guard quoted like the binary, keep hooks on, and move the memory like [`settings`].
+    #[test]
+    fn protect_settings_hook_the_writing_tools() {
+        let protect = [
+            PathBuf::from("/h/.config/twr"),
+            PathBuf::from("/h/it's data"),
+        ];
+        let s = protect_settings(Path::new("/opt/twr"), &protect, None);
+        assert_eq!(s["disableAllHooks"], false);
+        let hook = &s["hooks"]["PreToolUse"][0];
+        assert_eq!(hook["matcher"], "Write|Edit|MultiEdit|NotebookEdit");
+        assert_eq!(
+            hook["hooks"][0]["command"],
+            r"'/opt/twr' claude-memory-guard --protect '/h/.config/twr' --protect '/h/it'\''s data' || exit 2"
+        );
+        assert_eq!(hook["hooks"][0]["timeout"], HOOK_TIMEOUT_SECS);
+        assert!(s.get("autoMemoryDirectory").is_none(), "{s}");
+        let s = protect_settings(
+            Path::new("/opt/twr"),
+            &protect,
+            Some(Path::new("/h/.claude/projects/-h/memory")),
+        );
+        assert_eq!(s["autoMemoryDirectory"], "/h/.claude/projects/-h/memory");
+        assert!(!s["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains(MEMORY_DIR_FLAG));
+    }
+
+    /// twr's own directories and files, laid out as a hub has them, and somewhere else.
+    struct Twr {
+        dir: tempfile::TempDir,
+    }
+
+    impl Twr {
+        fn new() -> Twr {
+            let t = Twr {
+                dir: tempfile::tempdir().unwrap(),
+            };
+            for d in [
+                "config/twr",
+                "data/twr/worktrees",
+                "home",
+                "work",
+                "dotfiles",
+            ] {
+                std::fs::create_dir_all(t.root().join(d)).unwrap();
+            }
+            std::fs::write(t.root().join("config/twr/boxes.toml"), "").unwrap();
+            std::fs::write(t.root().join("dotfiles/config.toml"), "").unwrap();
+            // The config file is a link into a dotfiles repository.
+            std::os::unix::fs::symlink(
+                t.root().join("dotfiles/config.toml"),
+                t.root().join("config/twr/config.toml"),
+            )
+            .unwrap();
+            std::fs::write(t.root().join("work/notes.md"), "").unwrap();
+            t
+        }
+
+        fn root(&self) -> PathBuf {
+            self.dir.path().canonicalize().unwrap()
+        }
+
+        fn protect(&self) -> Vec<PathBuf> {
+            let r = self.root();
+            vec![
+                r.join("config/twr"),
+                r.join("config/twr/config.toml"),
+                r.join("config/twr/boxes.toml"),
+                r.join("data/twr"),
+                r.join("home"),
+            ]
+        }
+
+        fn call(&self, tool: &str, path: &Path) -> Result<(), String> {
+            let key = if tool == "NotebookEdit" {
+                "notebook_path"
+            } else {
+                "file_path"
+            };
+            check_protected(
+                &json!({
+                    "tool_name": tool,
+                    "tool_input": {key: path},
+                    "cwd": self.root().join("work"),
+                }),
+                &self.protect(),
+            )
+        }
+    }
+
+    /// With full access the writing tools work anywhere but in twr's own directories and
+    /// files: the config directory and its files (also where a linked config file really
+    /// is), the data directory with the worktrees in it, and `TWR_HOME`; as the paths resolve
+    /// (links, `..`, letter case), relative ones from the call's directory.
+    #[test]
+    fn full_access_writes_anywhere_but_twrs_own_files() {
+        let t = Twr::new();
+        let r = t.root();
+        std::os::unix::fs::symlink(r.join("config/twr"), r.join("work/cfg")).unwrap();
+        for tool in WRITE_TOOLS {
+            for ok in [
+                r.join("work/notes.md"),
+                r.join("work/new/deeper.md"),
+                r.join("dotfiles/other.toml"),
+                r.join("config/other-app.toml"),
+                r.join("data/twr-other/x"),
+                PathBuf::from("notes.md"),
+            ] {
+                assert_eq!(t.call(tool, &ok), Ok(()), "{tool} {}", ok.display());
+            }
+            for bad in [
+                r.join("config/twr/config.toml"),
+                r.join("config/twr/boxes.toml"),
+                r.join("config/twr/new.toml"),
+                r.join("config/twr"),
+                r.join("dotfiles/config.toml"),
+                r.join("data/twr/twr.db"),
+                r.join("data/twr/worktrees/api-1/src/main.rs"),
+                r.join("home/config.toml"),
+                r.join("work/cfg/config.toml"),
+                r.join("work/../config/twr/config.toml"),
+                r.join("work/./../data/twr/memory/x.md"),
+                PathBuf::from("../config/twr/boxes.toml"),
+                PathBuf::from("cfg/config.toml"),
+                PathBuf::from(
+                    r.join("CONFIG/TWR/config.toml")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                r.join("Data/Twr/twr.db"),
+            ] {
+                let err = t.call(tool, &bad);
+                assert!(err.is_err(), "{tool} {}", bad.display());
+            }
+        }
+        // A link made later that leads in, dangling or not, is followed.
+        std::os::unix::fs::symlink(r.join("data/twr/later"), r.join("work/later")).unwrap();
+        assert!(t.call("Write", &r.join("work/later/x")).is_err());
+    }
+
+    /// Whatever the full-access guard cannot place or does not know is refused, with a deny
+    /// decision that points to `set_config`.
+    #[test]
+    fn the_full_access_guard_fails_closed() {
+        let t = Twr::new();
+        let r = t.root();
+        let policy = Policy::Protect(t.protect());
+        let reason = |input: Value| {
+            let v = answer_policy(&input.to_string(), &policy).expect("denied");
+            assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+            let why = v["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(why.contains("set_config"), "{why}");
+            why
+        };
+        let ok = json!({
+            "tool_name": "Write",
+            "tool_input": {"file_path": r.join("work/x.md")},
+            "cwd": r.join("work"),
+        });
+        assert_eq!(answer_policy(&ok.to_string(), &policy), None);
+        // Another tool, a missing path, `~`, a relative path without a directory.
+        let mut bash = ok.clone();
+        bash["tool_name"] = json!("Bash");
+        assert!(reason(bash).contains("Bash"));
+        let mut read = ok.clone();
+        read["tool_name"] = json!("Read");
+        assert!(reason(read).contains("Read"));
+        assert!(reason(json!({"tool_name": "Edit", "tool_input": {}})).contains("file_path"));
+        assert!(reason(json!({"tool_name": "NotebookEdit",
+            "tool_input": {"file_path": r.join("work/x.ipynb")}}))
+        .contains("notebook_path"));
+        assert!(reason(json!({"tool_name": "Write",
+            "tool_input": {"file_path": "~/.config/twr/config.toml"}}))
+        .contains("~"));
+        assert!(reason(json!({"tool_name": "Write",
+            "tool_input": {"file_path": "x.md"}}))
+        .contains("no cwd"));
+        assert!(answer_policy("not json", &policy).is_some());
+        // A `..` under a part that does not exist yet.
+        let mut unborn = ok.clone();
+        unborn["tool_input"]["file_path"] = json!(r.join("work/nope/../../config/twr/x"));
+        assert!(reason(unborn).contains("cannot be resolved"));
+        // Nothing protected, or a protected path that cannot be resolved: nothing goes.
+        assert!(check_protected(&ok, &[]).is_err());
+        std::os::unix::fs::symlink(r.join("loop"), r.join("loop")).unwrap();
+        let looped = vec![r.join("loop/twr")];
+        assert!(check_protected(&ok, &looped)
+            .unwrap_err()
+            .contains("cannot be resolved"));
+        // Slow or broken: denied with the same message.
+        let slow = || {
+            std::thread::sleep(Duration::from_secs(30));
+            Ok(String::new())
+        };
+        let v = run_policy(slow, Duration::from_millis(100), policy.clone()).expect("denied");
+        let why = v["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap();
+        assert!(
+            why.contains("within 100 ms") && why.contains("set_config"),
+            "{why}"
+        );
+        let input = ok.to_string();
+        assert_eq!(run_policy(move || Ok(input), DEADLINE, policy), None);
     }
 }

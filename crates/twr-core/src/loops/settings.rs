@@ -563,6 +563,18 @@ fn implementer_runtime<'a>(s: &'a LoopSettings, avail: &'a Availability) -> Opti
 /// the implementer's runtime doesn't take (checked only where it runs subagents). An empty list
 /// means the settings hold and a loop may start on them without the card.
 pub fn validate(s: &LoopSettings, avail: &Availability, config: &LoopsConfig) -> Vec<Problem> {
+    validate_run(s, avail, config, false)
+}
+
+/// [`validate`] for a run: `once`, a single review pass ([`crate::event::LoopStarted::once`]),
+/// checks only the effort the pass runs at ([`super::config::Profile::pass_tier`]) of the
+/// profile's, not its other tiers' or its verification's, which the pass never uses.
+pub fn validate_run(
+    s: &LoopSettings,
+    avail: &Availability,
+    config: &LoopsConfig,
+    once: bool,
+) -> Vec<Problem> {
     let mut out = Vec::new();
     let profile = config.profile(&s.profile);
     if profile.is_none() {
@@ -595,14 +607,23 @@ pub fn validate(s: &LoopSettings, avail: &Availability, config: &LoopsConfig) ->
             None => {}
         }
         if let Some(p) = &profile {
-            let mut efforts: Vec<&str> = p.tiers.iter().map(|t| t.effort.as_str()).collect();
-            efforts.push(&p.verify.effort);
+            let mut efforts: Vec<String> = match once {
+                true => p.pass_tier().map(|t| t.effort).into_iter().collect(),
+                false => p
+                    .tiers
+                    .iter()
+                    .map(|t| t.effort.clone())
+                    .chain([p.verify.effort.clone()])
+                    .collect(),
+            };
             efforts.dedup();
-            for e in efforts {
+            let asks = match once {
+                true => format!("profile {}'s single pass asks for it", p.name),
+                false => format!("profile {} asks for it", p.name),
+            };
+            for e in &efforts {
                 if let Some(mut problem) = effort_problem(Role::Reviewer, &r.runtime, e, avail) {
-                    problem
-                        .message
-                        .push_str(&format!(": profile {} asks for it", p.name));
+                    problem.message.push_str(&format!(": {asks}"));
                     out.push(problem);
                     break;
                 }
@@ -694,9 +715,19 @@ fn next_runtime(not: &str, avail: &Availability) -> Option<&'static str> {
 /// ([`SAME_FAMILY_WARNING`]) if the reviewer is the implementer's family. Nothing is swapped
 /// without a warning saying so.
 pub fn propose(s: &LoopSettings, avail: &Availability, config: &LoopsConfig) -> Proposal {
+    propose_run(s, avail, config, false)
+}
+
+/// [`propose`] for a run: `once`, a single review pass, as [`validate_run`] checks it.
+pub fn propose_run(
+    s: &LoopSettings,
+    avail: &Availability,
+    config: &LoopsConfig,
+    once: bool,
+) -> Proposal {
     let mut out = s.clone();
     let mut warnings = Vec::new();
-    for p in validate(s, avail, config) {
+    for p in validate_run(s, avail, config, once) {
         match (p.role, p.kind) {
             (Role::Profile, _) => {
                 let fallback = LoopSettings::first_card(config).profile;
@@ -827,7 +858,7 @@ pub fn propose(s: &LoopSettings, avail: &Availability, config: &LoopsConfig) -> 
     {
         warnings.push(w.to_string());
     }
-    let problems = validate(&out, avail, config);
+    let problems = validate_run(&out, avail, config, once);
     Proposal {
         settings: out,
         warnings,
@@ -1239,6 +1270,34 @@ mod tests {
         assert_eq!(p.settings, first());
         assert_eq!(p.warnings, Vec::<String>::new());
         assert!(p.problems.is_empty());
+    }
+
+    /// A single pass checks only the effort it runs at: profile `medium`'s pass is its medium
+    /// tier, so a reviewer that takes no xhigh (its verification's) runs it, while a full loop
+    /// on it does not hold. Profile `high`'s pass runs at xhigh: refused both ways.
+    #[test]
+    fn a_single_pass_checks_only_its_own_effort() {
+        let c = LoopsConfig::default();
+        let mut a = all_found();
+        a.runtimes[1].efforts = vec!["low".into(), "medium".into()];
+        let mut s = first();
+        s.profile = "medium".into();
+        let full = validate(&s, &a, &c);
+        assert_eq!(
+            full.iter().map(|p| p.message.as_str()).collect::<Vec<_>>(),
+            ["codex takes no effort xhigh (low, medium): profile medium asks for it"]
+        );
+        assert_eq!(validate_run(&s, &a, &c, true), vec![]);
+        assert!(propose_run(&s, &a, &c, true).problems.is_empty());
+        assert_eq!(propose(&s, &a, &c).problems, full);
+        s.profile = "high".into();
+        assert_eq!(
+            validate_run(&s, &a, &c, true)
+                .iter()
+                .map(|p| p.message.as_str())
+                .collect::<Vec<_>>(),
+            ["codex takes no effort xhigh (low, medium): profile high's single pass asks for it"]
+        );
     }
 
     #[test]

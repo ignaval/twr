@@ -1,5 +1,5 @@
 //! Slash commands of the input line: `/open`, `/back`, `/unsend`, `/mode`, `/model`,
-//! `/account`, `/accounts`, `/rename`, `/orch`, `/new`, `/review`, `/implement`, `/loop`,
+//! `/account`, `/accounts`, `/rename`, `/orch`, `/access`, `/new`, `/review`, `/implement`, `/loop`,
 //! `/park`, `/resume`,
 //! `/compact-context`,
 //! `/stop`, `/pin`, `/delete`, `/trash`, `/attach`,
@@ -101,6 +101,9 @@ pub enum Slash {
     },
     /// `/orch` without arguments: pick the runtime to switch the orchestrator to.
     OrchPick,
+    /// `/access [limited|full]`: show the orchestrator's access level, or set it
+    /// (`orchestrator.access`; `full` asks first, `the client`).
+    Access(Option<String>),
     /// `/new <project> [--runtime r] [--name n] [--account a [--outside-pin]] [--implement
     /// [--setup] <task>]`: a new thread; with `--implement`, one whose first prompt is the task,
     /// run as an implementation loop (`thread.new {loop: {kind: implement, setup?}}`).
@@ -123,9 +126,9 @@ pub enum Slash {
         /// With `implement`: the task, the words after the project (required).
         task: Option<String>,
     },
-    /// `/review [thread] [--setup] [--scope s] [--profile p] [--reviewer r] [--implementer m]
-    /// [--workers w] [--commit c]`: start a review loop on a thread's work (`loop.request
-    /// {kind: review}`). The hub decides whether it starts on the saved settings or raises the
+    /// `/review [thread] [--setup] [--once] [--scope s] [--profile p] [--reviewer r]
+    /// [--implementer m] [--workers w] [--commit c]`: start a review loop on a thread's work
+    /// (`loop.request {kind: review}`; `--once`: a single pass, `once: true`). The hub decides whether it starts on the saved settings or raises the
     /// setup card; every value is checked here with the loop settings' own parsers, so a typo
     /// is a usage error.
     Review {
@@ -133,6 +136,8 @@ pub enum Slash {
         thread: Option<String>,
         /// Show the setup card first, even with saved settings that hold.
         setup: bool,
+        /// A single pass: one review, its triage, the report (`--once`).
+        once: bool,
         /// The scope, as [`crate::loops::settings::Scope`] writes it (`branch`,
         /// `uncommitted`, `since <ref>`, `last <n>`).
         scope: Option<String>,
@@ -330,7 +335,10 @@ pub const READ_WORDS: &[(&str, &str)] = &[
         "the speakers connected, live mode on each, what is read",
     ),
     ("this", "the long message selected in the conversation"),
-    ("voice", "the speakers' voice: /read voice <name>"),
+    (
+        "voice",
+        "the speakers' voice: /read voice <name> (`twr voices list`; kokoro/af_heart is one of twr's natural voices)",
+    ),
     (
         "rate",
         "the speakers' speed: /read rate <80-500 words per minute>",
@@ -378,7 +386,9 @@ fn parse_read(args: &[String], usage: &str) -> Result<Slash, String> {
         ["status"] if on.is_none() => ReadCmd::Status,
         ["status"] => return Err("/read status lists every speaker; --on is for the others".into()),
         ["this"] => ReadCmd::This,
-        ["voice"] => return Err("usage: /read voice <name> (quote a name with spaces)".into()),
+        ["voice"] => return Err(
+            "usage: /read voice <name> (quote a name with spaces; `twr voices list` names them, and a voice per language is `[speech] voices`)".into(),
+        ),
         ["voice", name @ ..] => ReadCmd::Voice(name.join(" ")),
         ["rate", wpm] => match wpm.parse::<u32>() {
             Ok(r) if (RATE_MIN..=RATE_MAX).contains(&r) => ReadCmd::Rate(r),
@@ -440,6 +450,10 @@ pub const REVIEW_FLAGS: &[(&str, &str)] = &[
     (
         "--setup",
         "show the settings card first; start and save from it",
+    ),
+    (
+        "--once",
+        "a single pass: one review, the thread's triage, the report",
     ),
     (
         "--scope",
@@ -551,7 +565,7 @@ fn parse_review(args: &[String], usage: &str) -> Result<Slash, String> {
         check_profile_name, parse_implementer, ReviewCommit, ReviewerChoice, WorkersChoice,
     };
     let bad = || format!("usage: {usage}");
-    let (mut thread, mut setup) = (None, false);
+    let (mut thread, mut setup, mut once) = (None, false, false);
     let (mut scope, mut profile, mut reviewer, mut implementer, mut workers, mut commit) =
         (None, None, None, None, None, None);
     let mut it = args.iter().peekable();
@@ -566,6 +580,11 @@ fn parse_review(args: &[String], usage: &str) -> Result<Slash, String> {
                 continue;
             }
             "--setup" => return Err(format!("--setup takes no value; {}", bad())),
+            "--once" if inline.is_none() => {
+                once = true;
+                continue;
+            }
+            "--once" => return Err(format!("--once takes no value; {}", bad())),
             "--scope" => &mut scope,
             "--profile" => &mut profile,
             "--reviewer" => &mut reviewer,
@@ -619,6 +638,7 @@ fn parse_review(args: &[String], usage: &str) -> Result<Slash, String> {
     Ok(Slash::Review {
         thread,
         setup,
+        once,
         scope,
         profile,
         reviewer,
@@ -830,6 +850,8 @@ pub enum ArgKind {
     ModeOrThread,
     /// `on` or `off`.
     OnOff,
+    /// An orchestrator access level ([`ACCESS_LEVELS`]).
+    Access,
     /// A workspace name.
     Workspace,
     /// An account of the thread named before it (else of the thread dived into or selected).
@@ -919,6 +941,14 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
         &[ArgKind::Runtime],
     ),
     (
+        "/access",
+        "/access [limited|full]",
+        "show the orchestrator's access, or set it: limited (twr's tools and a web search) or \
+         full (every tool, its shell included, without asking; asks y); applies now, after its \
+         current turn",
+        &[ArgKind::Access],
+    ),
+    (
         "/clear",
         "/clear",
         "fresh orchestrator session, no handoff (asks y; history stays in the log)",
@@ -934,11 +964,12 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
     ),
     (
         "/review",
-        "/review [thread] [--setup] [--scope s] [--profile p] [--reviewer r] [--implementer m] \
-         [--workers w] [--commit c]",
+        "/review [thread] [--setup] [--once] [--scope s] [--profile p] [--reviewer r] \
+         [--implementer m] [--workers w] [--commit c]",
         "start a review loop on a thread's work (in a dive: that thread); the first one shows \
-         its settings card; --setup shows it again; --scope is branch, uncommitted, since <ref> \
-         or last <n>; the other flags change this run only",
+         its settings card; --setup shows it again; --once runs a single pass (one review, its \
+         triage, the report); --scope is branch, uncommitted, since <ref> or last <n>; the \
+         other flags change this run only",
         &[ArgKind::Review],
     ),
     (
@@ -1130,6 +1161,12 @@ pub const MODES: &[&str] = &[
     "bypassPermissions",
 ];
 
+/// The orchestrator's access levels, as `/access` takes them, with what each gives.
+pub const ACCESS_LEVELS: &[(&str, &str)] = &[
+    ("limited", "twr's tools and a web search only"),
+    ("full", "every tool, its shell included, without asking"),
+];
+
 /// Whether command `name` (canonical) takes arguments at all.
 pub fn takes_args(name: &str) -> bool {
     COMMANDS
@@ -1282,6 +1319,13 @@ pub fn parse(line: &str) -> Result<Slash, String> {
                 model: Some(model.clone()),
             }),
             _ => bad(),
+        },
+        "/access" => match one(args)?.as_deref() {
+            None => Ok(Slash::Access(None)),
+            Some(level) if ACCESS_LEVELS.iter().any(|(l, _)| *l == level) => {
+                Ok(Slash::Access(Some(level.to_string())))
+            }
+            Some(_) => bad(),
         },
         "/account" => {
             if let [add, runtime, name] = args {
@@ -1533,6 +1577,7 @@ pub fn complete(
         };
         let modes: Vec<String> = MODES.iter().map(|m| m.to_string()).collect();
         let on_off = ["on".to_string(), "off".into()];
+        let levels: Vec<String> = ACCESS_LEVELS.iter().map(|l| l.0.to_string()).collect();
         let read: Vec<String> = READ_WORDS.iter().map(|w| w.0.to_string()).collect();
         let loop_words: Vec<String> = LOOP_WORDS
             .iter()
@@ -1549,6 +1594,7 @@ pub fn complete(
             | ArgKind::AccountOrThread => threads,
             ArgKind::Mode => &modes[..],
             ArgKind::OnOff => &on_off[..],
+            ArgKind::Access => &levels[..],
             ArgKind::Workspace => workspaces,
             ArgKind::Read => &read[..],
             ArgKind::Account | ArgKind::Free => &[][..],
@@ -1853,6 +1899,10 @@ pub fn suggest(line: &str, pools: &Pools) -> Suggestions {
         Some(ArgKind::Read) => READ_WORDS
             .iter()
             .map(|(w, what)| (w.to_string(), what.to_string()))
+            .collect(),
+        Some(ArgKind::Access) => ACCESS_LEVELS
+            .iter()
+            .map(|(l, what)| (l.to_string(), what.to_string()))
             .collect(),
         // (Answered before: `review_rows`, `implement_rows`, `loop_rows`.)
         Some(ArgKind::Review | ArgKind::Implement | ArgKind::Loop | ArgKind::Free) | None => {
@@ -2210,16 +2260,19 @@ mod tests {
                --commit none"
             ),
             serde_json::json!({"kind": "Review", "args": {
-                "thread": "api", "setup": true, "scope": "since main", "profile": "low",
+                "thread": "api", "setup": true, "once": false, "scope": "since main",
+                "profile": "low",
                 "reviewer": "claude-code/claude-opus-5-5", "implementer": "thread",
                 "workers": "claude-opus-5-5:high", "commit": "none"}})
         );
         assert_eq!(
             v("/review"),
             serde_json::json!({"kind": "Review", "args": {
-                "thread": null, "setup": false, "scope": null, "profile": null,
+                "thread": null, "setup": false, "once": false, "scope": null, "profile": null,
                 "reviewer": null, "implementer": null, "workers": null, "commit": null}})
         );
+        // `--once`: a single pass, as the apps send it (`loop.request {once: true}`).
+        assert_eq!(v("/review api --once")["args"]["once"], true);
         assert_eq!(
             v("/loop api skip"),
             serde_json::json!({"kind": "Loop", "args": {
@@ -2254,6 +2307,7 @@ mod tests {
             Ok(Slash::Review {
                 thread,
                 setup,
+                once: _,
                 scope,
                 profile,
                 reviewer,
@@ -2975,6 +3029,21 @@ mod tests {
         assert_eq!(parse("/mouse"), Ok(Slash::Mouse(None)));
         assert_eq!(parse("/mouse off"), Ok(Slash::Mouse(Some(false))));
         assert_eq!(parse("/mouse on"), Ok(Slash::Mouse(Some(true))));
+        assert_eq!(parse("/access"), Ok(Slash::Access(None)));
+        assert_eq!(
+            parse("/access full"),
+            Ok(Slash::Access(Some("full".into())))
+        );
+        assert_eq!(
+            parse("/access limited"),
+            Ok(Slash::Access(Some("limited".into())))
+        );
+        assert!(parse("/access root").is_err());
+        assert!(parse("/access full now").is_err());
+        assert_eq!(
+            complete("/access f", &[], &[], &[]).0.as_deref(),
+            Some("/access full ")
+        );
         // `/orch` alone picks the runtime; the views, pins and quitting.
         assert_eq!(parse("/orch"), Ok(Slash::OrchPick));
         assert_eq!(parse("/orchestrator"), Ok(Slash::OrchPick));

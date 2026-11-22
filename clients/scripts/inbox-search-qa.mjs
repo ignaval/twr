@@ -1,4 +1,5 @@
 // Focused Electron + Rust QA. All hub processes and SQLite rows are disposable.
+import { floatTestWindow } from "./hyprland-window.mjs";
 import { clientProtocol } from "./client-protocol.mjs";
 import { stopFixture } from "./fixture-cleanup.mjs";
 import { _electron as electron, expect } from "@playwright/test";
@@ -277,6 +278,7 @@ archive.commit()
     env,
     timeout: 60000,
   });
+  await floatTestWindow(app.process().pid);
   const page = await app.firstWindow();
   page.on("pageerror", (error) => errors.push(error.message));
   await page
@@ -354,9 +356,6 @@ archive.commit()
     .locator(".thread-list .thread-card")
     .filter({ hasText: "history" })
     .click();
-  await page
-    .getByRole("button", { name: "Talk to this thread", exact: true })
-    .click();
   const composer = page.locator(".composer textarea");
   await composer.fill("KEEP_MY_DESTINATION_AND_DRAFT");
   const destination = await page.locator(".destination-chip").innerText();
@@ -390,9 +389,8 @@ archive.commit()
   await expect(context.locator(".search-event.selected")).toContainText(
     "ARCHIVED_RESULT_MARKER exact tool output",
   );
-  await expect(context.locator(".search-event.selected")).toContainText(
-    "#9999",
-  );
+  // An event reads by who it came from and when, not by its sequence number.
+  await expect(context.locator(".search-event.selected")).toContainText("Tool");
   await expect(context).toContainText("This computer / default");
   await context
     .getByRole("button", { name: "Close dialog", exact: true })

@@ -329,6 +329,14 @@ fn start_hub(home: &Path) -> HubProc {
     start_hub_with(home, &[])
 }
 
+/// Waits for the hub's first `hub.info`, which waits for the hub's build id (the SHA-256 of
+/// the whole executable, hashed as it starts): over a second for a debug build on a CPU
+/// without SHA instructions. A test that gives a command a one-second deadline for its own
+/// `hub.info` calls this first, so the deadline measures what the test is about.
+fn warm_info(home: &Path) {
+    ok(home, &["info"]);
+}
+
 /// [`start_hub`] with `env` added to the hub's environment.
 fn start_hub_with(home: &Path, env: &[(&str, &str)]) -> HubProc {
     let log = std::fs::File::create(home.join("hub-test.log")).unwrap();
@@ -1544,6 +1552,49 @@ fn orchestrator_show_and_use_switch_the_runtime() {
     assert_eq!(v["retired"], 1);
 }
 
+/// `twr orchestrator access`: prints the level, sets it (said when the orchestrator picks it
+/// up, and that it is kept in config.toml, whose comments stay), says what full access means,
+/// and `twr orchestrator show` reports it.
+#[test]
+fn orchestrator_access_shows_and_sets_the_level() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let config = "default_runtime = \"fake\"\n[orchestrator]\nruntime = \"claude-code\" # mine\n";
+    std::fs::write(home.join("config.toml"), config).unwrap();
+    let _hub = start_hub(home);
+    assert_eq!(
+        ok(home, &["orchestrator", "access"]),
+        "orchestrator access: limited\n"
+    );
+    let out = ok(home, &["orchestrator", "access", "full"]);
+    assert!(
+        out.starts_with(
+            "orchestrator access: full (was limited): the orchestrator starts with it next time it runs\n"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("Kept in config.toml."), "{out}");
+    assert!(out.contains("runs any command"), "{out}");
+    let file = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    assert_eq!(
+        file,
+        config.replace("[orchestrator]\n", "[orchestrator]\naccess = \"full\"\n")
+    );
+    assert!(ok(home, &["orchestrator", "show"]).contains("access:       full"));
+    let out = ok(home, &["orchestrator", "access", "full"]);
+    assert!(
+        out.starts_with("orchestrator access is already full\n"),
+        "{out}"
+    );
+    let v: Value =
+        serde_json::from_str(&ok(home, &["orchestrator", "access", "limited", "--json"])).unwrap();
+    assert_eq!(v["access"], "limited");
+    assert_eq!(v["restart"], "none");
+    assert!(!twr(home, &["orchestrator", "access", "root"])
+        .status
+        .success());
+}
+
 /// Text agents (or prompts) control reaches the terminal with its control characters escaped:
 /// `--pretty`, the attention listing, `thread list` and the JSON lines of `events` (where a C1
 /// control, which JSON leaves raw, is written as `\u009b`: still the same JSON).
@@ -1694,6 +1745,7 @@ fn hub_stop_timeout_reports_a_runtime_still_shutting_down() {
     let project = home.join("proj");
     std::fs::create_dir(&project).unwrap();
     let mut hub = start_hub(home);
+    warm_info(home);
     let script = home.join("ignore-hup.sh");
     std::fs::write(
         &script,
@@ -2075,6 +2127,7 @@ fn update_reinstalls_the_running_executable() {
 
     // The real installer replaces bin/twr; the running hub is named as still on the old version.
     let _hub = start_hub(&home);
+    warm_info(&home);
     let out = update(&bin.join("twr"), &real);
     let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
     assert!(out.status.success(), "{stdout}\n{stderr}");
@@ -3799,6 +3852,90 @@ fn the_memory_guard_hook_keeps_file_tools_in_the_memory_directory() {
         hook(&call(&project.join("memory/a.md"))).status.code(),
         Some(2)
     );
+}
+
+/// The guard of an orchestrator with full access (`--protect`, the command the hub configures,
+/// run by `sh`): a write outside twr's directories goes on (exit 0, no output), one inside
+/// them is blocked (exit 2), and so is a call that names no path or a tool it does not check.
+#[test]
+fn the_full_access_guard_hook_keeps_writes_out_of_twrs_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let config = root.join("config/twr");
+    let data = root.join("data/twr");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    // An unreadable config does not matter.
+    std::fs::write(config.join("config.toml"), "not = [valid").unwrap();
+    let settings = twr_adapters::claude_code::guard::protect_settings(
+        Path::new(TWR),
+        &[config.clone(), data.clone()],
+        None,
+    );
+    let command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let hook = |input: &str| {
+        let mut child = Command::new("sh")
+            .args(["-c", &command])
+            .env("TWR_HOME", &root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(input.as_bytes()).unwrap();
+        drop(stdin);
+        child.wait_with_output().unwrap()
+    };
+    let call = |tool: &str, path: &Path| {
+        serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool,
+            "tool_input": {"file_path": path, "content": "x"},
+            "cwd": root,
+        })
+        .to_string()
+    };
+    let out = hook(&call("Write", &root.join("notes/a.md")));
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    for (tool, path) in [
+        ("Write", config.join("config.toml")),
+        ("Edit", config.join("boxes.toml")),
+        ("Write", data.join("twr.db")),
+        ("Bash", root.join("notes/a.md")),
+    ] {
+        let out = hook(&call(tool, &path));
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{tool} {}: {out:?}",
+            path.display()
+        );
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(v["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .contains("set_config"));
+    }
+    assert_eq!(hook("{").status.code(), Some(2));
+    // `--memory-dir` and `--protect` are two modes, not one.
+    let out = twr_cmd()
+        .args([
+            "claude-memory-guard",
+            "--memory-dir",
+            "/m",
+            "--protect",
+            "/p",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
 }
 
 /// A guard that cannot decide within its deadline (here: input that never ends) denies, with

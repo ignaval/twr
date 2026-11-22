@@ -319,6 +319,33 @@ export function controlPairs(
       checked,
     );
   });
+  part("switch", () => {
+    // A switch (`role="switch"`): its track's edge on every surface and on its fill, its
+    // thumb on the track off; on, the track on every surface and the thumb on the track.
+    const sw = 'input[type="checkbox"][role="switch"]';
+    const track = paint(style(sw, "background"), on("bg"));
+    const edge = paint(colorOf(style(sw, "border")), track);
+    check("switch track edge on its fill", edge, track);
+    for (const [where, bg] of bases)
+      check(`switch track edge on ${where}`, edge, bg);
+    check(
+      "switch thumb on its track",
+      paint(style(`${sw}::before`, "background"), track),
+      track,
+    );
+    const on_ = paint(style(`${sw}:checked`, "background"), on("bg"));
+    expect(
+      style(`${sw}:checked`, "border-color"),
+      style(`${sw}:checked`, "background"),
+    );
+    for (const [where, bg] of bases)
+      check(`switched-on track on ${where}`, on_, bg);
+    check(
+      "switched-on thumb on its track",
+      paint(style(`${sw}:checked::before`, "background"), on_),
+      on_,
+    );
+  });
   part("slider", () => {
     // A slider: its track on every surface; its thumb on its ring, which is the page.
     const range = 'input[type="range"]';
@@ -436,7 +463,7 @@ export function controlPairs(
     }
   });
   part("pressed icon toggle", () => {
-    // A pressed icon toggle (Toggle tool calls, Toggle reasoning, Focus): its edge on its
+    // A pressed icon toggle (Focus, the thread details): its edge on its
     // fill, where it sits on the page or the panel.
     for (const where of ["bg", "panel"]) {
       const fill = paint(
@@ -451,13 +478,13 @@ export function controlPairs(
     }
   });
   part("menu toggle", () => {
-    // A narrow window's menu: an on toggle's check, on the menu.
+    // An actions menu (the conversation's ⋯): an on toggle's check, on the menu.
     check(
-      "conversation menu's check on the menu",
+      "actions menu's check on the menu",
       paint(
         colorOf(
           style(
-            '.conversation-menu > div > button[aria-pressed="true"]::after',
+            '.actions-menu > div > button[aria-pressed="true"]::after',
             "border",
           ),
         ),
