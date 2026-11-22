@@ -78,12 +78,15 @@ jobs:
           rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy --no-self-update
           rustc --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # rust-cache deletes the files sherpa-onnx-sys downloaded into target/sherpa-onnx-prebuilt
-      # but keeps their directories, and its build script takes an existing lib/ directory
-      # for an extracted download: after a dependency change it linked against an empty one.
-      - name: Remove the emptied sherpa-onnx download
+      # rust-cache deletes the libraries sherpa-onnx-sys downloads into target/sherpa-onnx-prebuilt
+      # but keeps their directories and the build script's recorded output, so a rebuild linked
+      # against an empty lib/ ("could not find native static library"). Drop both: the build
+      # script runs again and downloads them.
+      - name: Remove sherpa-onnx's emptied download and its cached build
         shell: bash
-        run: rm -rf target/sherpa-onnx-prebuilt
+        run: |
+          [ -d target ] || exit 0
+          find target -maxdepth 4 \( -name sherpa-onnx-prebuilt -o -name 'sherpa-onnx-sys-*' -o -name 'libsherpa_onnx_sys-*' \) -prune -exec rm -rf {} +
       - name: Install Git LFS (the LFS tests of twr-runner skip without it)
         shell: bash
         run: |
@@ -141,12 +144,15 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: twr-ps
-      # rust-cache deletes the files sherpa-onnx-sys downloaded into target/sherpa-onnx-prebuilt
-      # but keeps their directories, and its build script takes an existing lib/ directory
-      # for an extracted download: after a dependency change it linked against an empty one.
-      - name: Remove the emptied sherpa-onnx download
+      # rust-cache deletes the libraries sherpa-onnx-sys downloads into target/sherpa-onnx-prebuilt
+      # but keeps their directories and the build script's recorded output, so a rebuild linked
+      # against an empty lib/ ("could not find native static library"). Drop both: the build
+      # script runs again and downloads them.
+      - name: Remove sherpa-onnx's emptied download and its cached build
         shell: bash
-        run: rm -rf target/sherpa-onnx-prebuilt
+        run: |
+          [ -d target ] || exit 0
+          find target -maxdepth 4 \( -name sherpa-onnx-prebuilt -o -name 'sherpa-onnx-sys-*' -o -name 'libsherpa_onnx_sys-*' \) -prune -exec rm -rf {} +
       - run: cargo test -p twr-runner --locked --no-fail-fast
 
   deny:
@@ -265,12 +271,15 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: real-systemd
-      # rust-cache deletes the files sherpa-onnx-sys downloaded into target/sherpa-onnx-prebuilt
-      # but keeps their directories, and its build script takes an existing lib/ directory
-      # for an extracted download: after a dependency change it linked against an empty one.
-      - name: Remove the emptied sherpa-onnx download
+      # rust-cache deletes the libraries sherpa-onnx-sys downloads into target/sherpa-onnx-prebuilt
+      # but keeps their directories and the build script's recorded output, so a rebuild linked
+      # against an empty lib/ ("could not find native static library"). Drop both: the build
+      # script runs again and downloads them.
+      - name: Remove sherpa-onnx's emptied download and its cached build
         shell: bash
-        run: rm -rf target/sherpa-onnx-prebuilt
+        run: |
+          [ -d target ] || exit 0
+          find target -maxdepth 4 \( -name sherpa-onnx-prebuilt -o -name 'sherpa-onnx-sys-*' -o -name 'libsherpa_onnx_sys-*' \) -prune -exec rm -rf {} +
       - id: manager
         name: Start a systemd user manager
         shell: bash
