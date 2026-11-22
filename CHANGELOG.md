@@ -4,6 +4,12 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-22
+
+Simpler desktop and phone apps: Settings in tabs, forms that pick from lists, fewer pages for the same thing and one menu per conversation. twr's own neural voices read aloud on your machine (Kokoro, Supertonic 3 and Piper), with a voice for each language picked in the apps, and whisper's `small` models make dictation more accurate. The model and effort change from the message box, the orchestrator's in place; the orchestrator can search the web, run with full access and change twr's configuration when you ask; the apps show usage limits; and a single review pass (`--once`) runs one round. Also many fixes to drafts and attached files in the apps.
+
+Upgrading: the runner and client protocols (8 and 2), the database schema (9) and the checkpoint format are those of 0.5.0, so 0.5.0 boxes and clients keep working with a 0.6.0 hub, and the 0.5.0 desktop app updates itself. Building twr on Linux now needs ALSA's headers (`alsa-lib` on Arch, `libasound2-dev` on Debian and Ubuntu). The static Linux release binaries don't include twr's own voices: install twr from source there for them. Kokoro and Piper also need the `espeak-ng` program. A phone no longer reads aloud with the hub machine's `[speech]` voices; pick its voices in its Settings.
+
 ### Added
 
 - A single review pass: `twr loop review <thread> --once`, `/review --once`, `review once` in the TUI's action popup and **Review once** in the apps run one review round at the profile's strongest tier, the thread's triage of what it found, and the report, with no second round, sweep or verification. It ends `clean`, or `triaged` with its findings counted (`single review pass: 3 findings, 2 fixed, 1 dismissed`), and the loop line says `single pass`. The socket's `loop.request` and the orchestrator's `start_loop` take `once: true`. A pass checks only the effort it runs at, so a profile whose verification asks for one the reviewer doesn't take still runs it ([usage.md](docs/usage.md#a-single-review-pass)).

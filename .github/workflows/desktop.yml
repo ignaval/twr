@@ -99,6 +99,15 @@ jobs:
           cache-dependency-path: clients/package-lock.json
       - if: ${{ !inputs.release }}
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # rust-cache deletes the libraries sherpa-onnx-sys downloads into target/sherpa-onnx-prebuilt
+      # but keeps their directories and the build script's recorded output, so a rebuild linked
+      # against an empty lib/ ("could not find native static library"). Drop both: the build
+      # script runs again and downloads them.
+      - name: Remove sherpa-onnx's emptied download and its cached build
+        shell: bash
+        run: |
+          [ -d target ] || exit 0
+          find target -maxdepth 4 \( -name sherpa-onnx-prebuilt -o -name 'sherpa-onnx-sys-*' -o -name 'libsherpa_onnx_sys-*' \) -prune -exec rm -rf {} +
       - name: Install desktop dependencies
         working-directory: clients
         run: npm ci
@@ -254,6 +263,15 @@ jobs:
           cache-dependency-path: clients/package-lock.json
       - if: ${{ !inputs.release }}
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # rust-cache deletes the libraries sherpa-onnx-sys downloads into target/sherpa-onnx-prebuilt
+      # but keeps their directories and the build script's recorded output, so a rebuild linked
+      # against an empty lib/ ("could not find native static library"). Drop both: the build
+      # script runs again and downloads them.
+      - name: Remove sherpa-onnx's emptied download and its cached build
+        shell: bash
+        run: |
+          [ -d target ] || exit 0
+          find target -maxdepth 4 \( -name sherpa-onnx-prebuilt -o -name 'sherpa-onnx-sys-*' -o -name 'libsherpa_onnx_sys-*' \) -prune -exec rm -rf {} +
       # For THIRD-PARTY-LICENSES.html (clients/scripts/notices.mjs), as in the Mac job.
       - name: Install cargo-about (release binary, checksum pinned)
         run: |
