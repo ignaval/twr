@@ -3719,7 +3719,7 @@ export default function App({
               : connecting
                 ? "Connecting…"
                 : "Disconnected"}
-            <span>v{paths?.version || "0.5.0"}</span>
+            <span>v{paths?.version || "0.6.0"}</span>
           </div>
         </div>
       </aside>

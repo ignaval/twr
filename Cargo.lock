@@ -5295,7 +5295,7 @@ dependencies = [
 
 [[package]]
 name = "twr-adapters"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5314,7 +5314,7 @@ dependencies = [
 
 [[package]]
 name = "twr-app"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -5347,7 +5347,7 @@ dependencies = [
 
 [[package]]
 name = "twr-avspeech"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "objc2",
  "objc2-avf-audio",
@@ -5356,7 +5356,7 @@ dependencies = [
 
 [[package]]
 name = "twr-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -5394,7 +5394,7 @@ dependencies = [
 
 [[package]]
 name = "twr-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5418,7 +5418,7 @@ dependencies = [
 
 [[package]]
 name = "twr-decisions"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5427,11 +5427,11 @@ dependencies = [
 
 [[package]]
 name = "twr-docs"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "twr-hub"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5460,7 +5460,7 @@ dependencies = [
 
 [[package]]
 name = "twr-link"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5485,7 +5485,7 @@ dependencies = [
 
 [[package]]
 name = "twr-mcp"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5501,7 +5501,7 @@ dependencies = [
 
 [[package]]
 name = "twr-neural"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "cpal",
@@ -5515,7 +5515,7 @@ dependencies = [
 
 [[package]]
 name = "twr-runner"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -5537,7 +5537,7 @@ dependencies = [
 
 [[package]]
 name = "twr-source"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -5553,7 +5553,7 @@ dependencies = [
 
 [[package]]
 name = "twr-speech"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -5573,7 +5573,7 @@ dependencies = [
 
 [[package]]
 name = "twr-tui"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5593,7 +5593,7 @@ dependencies = [
 
 [[package]]
 name = "twr-voice"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "libc",
