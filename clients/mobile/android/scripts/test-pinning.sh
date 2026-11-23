@@ -65,7 +65,11 @@ main="$android/app/src/main/java/tools/twr/mobile/dev"
 tests="$android/app/src/test/java/tools/twr/mobile/dev/pairing"
 "${bin}javac" -encoding UTF-8 -Xlint:-serial -d "$out" -cp "$classpath" \
     "$main"/pairing/*.java "$main"/PinnedHttp.java "$tests"/*.java
-classes=$(cd "$tests" && ls *Test.java | sed 's/\.java$//; s/^/tools.twr.mobile.dev.pairing./')
+classes=
+for file in "$tests"/*Test.java; do
+    name=${file##*/}
+    classes="$classes tools.twr.mobile.dev.pairing.${name%.java}"
+done
 # The fixture is found by walking up from the working directory.
 cd "$android"
 # shellcheck disable=SC2086
