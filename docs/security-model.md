@@ -75,9 +75,12 @@ HTTPS/WSS authenticated in one of two ways, fixed at pairing:
 A credential paired one way is never used the other way. The invitation's code is one use;
 its `twr://pair#` link can be received by any app that registers that scheme, so the
 pairing hub prints the name of the device that paired, and an unexpected one can be revoked.
-A pinned gateway that starts with the hub listens on all addresses (`0.0.0.0` and `[::]`,
-port 47321) while a device is paired or a code is open; without a code it pairs nobody and
-serves only paired devices' tokens. `twr phone off` stops it.
+Only `twr phone` makes the pinned gateway start with the hub: after it, a hub that starts
+while a device is paired or a code is open starts the gateway on the addresses `twr phone`
+saved (by default all of them, `0.0.0.0` and `[::]`, port 47321). A gateway the desktop app
+or a bare `twr gateway` starts never does. Without an open code the gateway pairs nobody
+and serves only paired devices' tokens. `twr phone off`, and the desktop's **Stop gateway**,
+stop it and keep it from starting with the hub.
 
 A local owner grants a short-lived, one-use pairing code and chooses device capabilities: read and operate, with terminal and
 admin access separately granted. A bearer credential is checked before WebSocket upgrade,
