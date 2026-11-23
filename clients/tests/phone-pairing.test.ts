@@ -330,6 +330,37 @@ describe("phone pairing vectors: the proof", () => {
     );
     expect(Buffer.from(stretched).toString("hex")).toBe(vectors.stretched_hex);
   }, 30_000);
+  it("the bundled worker thread gives the same stretch without blocking the event loop", async () => {
+    // What scripts/build-host.mjs inlines into the app: the worker's bundle as source.
+    const { build } = await import("esbuild");
+    const bundle = await build({
+      entryPoints: [
+        new URL("../desktop/argon2-worker.ts", import.meta.url).pathname,
+      ],
+      bundle: true,
+      platform: "node",
+      format: "cjs",
+      write: false,
+    });
+    const global = globalThis as { __TWR_ARGON2_WORKER__?: string };
+    // The worker's answer is the answer: a stand-in worker proves this path is taken.
+    global.__TWR_ARGON2_WORKER__ =
+      'require("node:worker_threads").parentPort.postMessage({ ok: new Uint8Array([7]) })';
+    expect(await stretchCode(vectors.code)).toEqual(Uint8Array.from([7]));
+    global.__TWR_ARGON2_WORKER__ = bundle.outputFiles[0].text;
+    let ticks = 0;
+    const timer = setInterval(() => ticks++, 5);
+    try {
+      const stretched = await stretchCode(vectors.code);
+      expect(Buffer.from(stretched).toString("hex")).toBe(
+        vectors.stretched_hex,
+      );
+      expect(ticks).toBeGreaterThan(10);
+    } finally {
+      clearInterval(timer);
+      delete global.__TWR_ARGON2_WORKER__;
+    }
+  }, 60_000);
   it("the desktop's stretch, HKDF and HMAC give the vectors' key and proof", async () => {
     // Unbundled, stretchCode runs noble's async variant; bundled, a worker thread.
     const stretched = await stretchCode("abcd-efgh-jk23");

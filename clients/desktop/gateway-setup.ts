@@ -138,6 +138,22 @@ export function validateGatewaySettings(input: unknown): GatewaySettings {
     throw new Error("The TLS private key does not match the certificate");
   return settings;
 }
+/** The detached gateway's arguments. Without a certificate the gateway serves its own
+ * key: pinned mode, the default. */
+export function gatewayLaunchArgs(
+  settings: GatewaySettings,
+  logPath: string,
+): string[] {
+  return [
+    "--log-file",
+    logPath,
+    "--listen",
+    settings.listen,
+    ...(gatewayMode(settings) === "pinned"
+      ? []
+      : ["--tls-cert", settings.cert, "--tls-key", settings.key]),
+  ];
+}
 export function certificateDigest(path: string): string {
   return createHash("sha256").update(pem(path)).digest("hex");
 }
@@ -258,16 +274,7 @@ export class GatewaySetup {
         try {
           const child = spawn(
             binary,
-            [
-              "--log-file",
-              this.logPath,
-              "--listen",
-              settings.listen,
-              // Without a certificate the gateway serves its own key: pinned mode.
-              ...(gatewayMode(settings) === "pinned"
-                ? []
-                : ["--tls-cert", settings.cert, "--tls-key", settings.key]),
-            ],
+            gatewayLaunchArgs(settings, this.logPath),
             {
               env: this.environment(),
               detached: true,
