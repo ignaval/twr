@@ -84,14 +84,13 @@ final class PinCheck {
 enum PinnedTLS {
     private static let verifyQueue = DispatchQueue(label: "tools.twr.pin-verify")
 
-    /// SHA-256 of the leaf certificate's SPKI; nil unless the key is P-256. The chain, the
-    /// name and the validity dates are ignored on purpose: the pin is the hub's identity.
+    /// SHA-256 of the leaf certificate's SPKI; nil unless the key is P-256 (the only key whose
+    /// external representation is a 65-byte point starting 0x04; P-384 gives 97 bytes, RSA a
+    /// DER sequence). The chain, the name and the validity dates are ignored on purpose: the
+    /// pin is the hub's identity.
     static func leafPin(_ trust: SecTrust) -> Data? {
         guard let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate], let leaf = chain.first,
               let key = SecCertificateCopyKey(leaf),
-              let attributes = SecKeyCopyAttributes(key) as? [String: Any],
-              (attributes[kSecAttrKeyType as String] as? String) == (kSecAttrKeyTypeECSECPrimeRandom as String),
-              (attributes[kSecAttrKeySizeInBits as String] as? NSNumber)?.intValue == 256,
               let point = SecKeyCopyExternalRepresentation(key, nil) as Data?,
               let spki = Pairing.p256SPKI(point: point) else { return nil }
         return Pairing.pin(spki: spki)
@@ -105,6 +104,10 @@ enum PinnedTLS {
         sec_protocol_options_set_min_tls_protocol_version(options, .TLSv12)
         sec_protocol_options_set_max_tls_protocol_version(options, .TLSv13)
         sec_protocol_options_add_tls_application_protocol(options, "http/1.1")
+        // A resumed session presents no certificate, so the verify block might not run: every
+        // connection does a full handshake.
+        sec_protocol_options_set_tls_resumption_enabled(options, false)
+        sec_protocol_options_set_tls_tickets_enabled(options, false)
         sec_protocol_options_set_verify_block(options, { _, trust, complete in
             complete(check.evaluate(sec_trust_copy_ref(trust).takeRetainedValue()))
         }, verifyQueue)
@@ -370,6 +373,7 @@ final class PinnedSocket {
 
     func start() {
         queue.async {
+            guard !self.ended else { return }
             self.connection.stateUpdateHandler = { state in self.changed(state) }
             self.connection.start(queue: self.queue)
             self.queue.asyncAfter(deadline: .now() + PinnedSocket.handshakeTimeout) {
@@ -420,9 +424,9 @@ final class PinnedSocket {
         var bytes = incoming
         if !open {
             head.append(contentsOf: bytes)
-            let parsed: HTTPWire.Head?
-            do { parsed = try HTTPWire.parseHead(head) } catch { end(.closed); return }
-            guard let parsed else { return }
+            let answer: HTTPWire.Head?
+            do { answer = try HTTPWire.parseHead(head) } catch { end(.closed); return }
+            guard let parsed = answer else { return }
             guard parsed.status == 101 else { end(.refused(parsed.status)); return }
             guard WebSocketWire.accepts(parsed, key: key) else { end(.closed); return }
             open = true
@@ -449,7 +453,9 @@ final class PinnedSocket {
             case .pong:
                 break
             case .close(let code):
-                end(.closed, closing: code.map { $0 == 1005 ? 1000 : $0 } ?? 1000)
+                // Echo a code that may be sent; anything else (1005, 1006, 1015, < 1000) as 1000.
+                let echo = code.flatMap { [1000, 1001, 1002, 1003].contains($0) || (1007...1014).contains($0) || (3000...4999).contains($0) ? $0 : nil }
+                end(.closed, closing: echo ?? 1000)
             }
         }
     }

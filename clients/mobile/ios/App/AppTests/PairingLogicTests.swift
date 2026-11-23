@@ -94,7 +94,7 @@ final class PairingLogicTests: XCTestCase {
         XCTAssertEqual(PairingRoute("tls:Box.Tail1234.ts.net:443"), .tls(host: "box.tail1234.ts.net", port: 443))
         XCTAssertEqual(PairingRoute("relay:anything"), .other("relay:anything"))
         for invalid in ["tls:1.2.3.4", "tls:1.2.3.4:0", "tls:[::1:47321", "tls:-bad-.example:1", "tls:12345:1", ":x", "TLS:1.2.3.4:1",
-                        "tls:2001:db8::5:47321", "tls:host:65536", "tls:[]:1", ""] {
+                        "tls:2001:db8::5:47321", "tls:host:65536", "tls:[]:1", "tls:host.example:+80", ""] {
             XCTAssertNil(PairingRoute(invalid), invalid)
         }
         XCTAssertEqual(PairingRoute("tls:[2001:db8::5]:47321")?.text, "tls:[2001:db8::5]:47321")
@@ -172,6 +172,8 @@ final class PairingLogicTests: XCTestCase {
         XCTAssertNil(try HTTPWire.parseResponse(unsized, eof: false))
         XCTAssertEqual(try HTTPWire.parseResponse(unsized, eof: true)?.body, Data("all".utf8))
 
+        XCTAssertThrowsError(try HTTPWire.parseResponse(Array("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n-2\r\nxx\r\n".utf8), eof: false), "a negative chunk size")
+        XCTAssertThrowsError(try HTTPWire.parseResponse(Array("HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\nxx".utf8), eof: false))
         XCTAssertThrowsError(try HTTPWire.parseHead(Array("SSH-2.0-OpenSSH\r\n\r\n".utf8)))
         XCTAssertThrowsError(try HTTPWire.parseHead([UInt8](repeating: 0x41, count: HTTPWire.maxHead + 1)))
     }

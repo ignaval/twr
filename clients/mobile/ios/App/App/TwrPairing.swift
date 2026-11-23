@@ -161,6 +161,11 @@ enum Pairing {
         }
     }
 
+    /// Non-empty ASCII digits only (no sign, unlike Int's parser).
+    static func isDigits<S: StringProtocol>(_ text: S) -> Bool {
+        !text.isEmpty && text.utf8.allSatisfy { $0 >= 0x30 && $0 <= 0x39 }
+    }
+
     private static func isASCIILetter(_ byte: UInt8) -> Bool { (byte >= 0x41 && byte <= 0x5a) || (byte >= 0x61 && byte <= 0x7a) }
 
     /// A host as routes carry it: an IPv4 literal, an IPv6 literal (unbracketed), or a DNS
@@ -223,7 +228,8 @@ enum PairingRoute: Equatable {
     static func parseHostPort(_ text: String) -> PairingRoute? {
         guard let colon = text.lastIndex(of: ":") else { return nil }
         let rawHost = String(text[..<colon])
-        guard let port = UInt16(text[text.index(after: colon)...]), port != 0 else { return nil }
+        let portText = text[text.index(after: colon)...]
+        guard Pairing.isDigits(portText), let port = UInt16(portText), port != 0 else { return nil }
         if rawHost.hasPrefix("[") {
             guard rawHost.hasSuffix("]"), rawHost.count >= 2 else { return nil }
             let inner = String(rawHost.dropFirst().dropLast())
@@ -373,7 +379,7 @@ enum HTTPWire {
         guard end <= maxHead else { throw Failure.tooLarge }
         let lines = String(decoding: buffer[..<end], as: UTF8.self).components(separatedBy: "\r\n")
         let status = lines[0].split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
-        guard status.count >= 2, status[0].hasPrefix("HTTP/1."), status[1].count == 3, let code = Int(status[1]) else { throw Failure.malformed }
+        guard status.count >= 2, status[0].hasPrefix("HTTP/1."), status[1].count == 3, Pairing.isDigits(status[1]), let code = Int(status[1]) else { throw Failure.malformed }
         var headers: [String: String] = [:]
         for line in lines.dropFirst() {
             guard let colon = line.firstIndex(of: ":") else { continue }
@@ -403,7 +409,7 @@ enum HTTPWire {
             return HTTPResponse(status: head.status, headers: head.headers, body: body)
         }
         if let lengthText = head.headers["content-length"] {
-            guard let length = Int(lengthText), length >= 0 else { throw Failure.malformed }
+            guard Pairing.isDigits(lengthText), let length = Int(lengthText) else { throw Failure.malformed }
             guard rest.count >= length else {
                 if eof { throw Failure.malformed }
                 return nil
@@ -421,7 +427,7 @@ enum HTTPWire {
             guard let lineEnd = find([13, 10], in: bytes, from: offset) else { return nil }
             let line = String(decoding: bytes[offset..<lineEnd], as: UTF8.self)
             let sizeText = line.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)[0].trimmingCharacters(in: .whitespaces)
-            guard !sizeText.isEmpty, sizeText.count <= 8, let size = Int(sizeText, radix: 16) else { throw Failure.malformed }
+            guard !sizeText.isEmpty, sizeText.count <= 8, sizeText.allSatisfy(\.isHexDigit), let size = Int(sizeText, radix: 16) else { throw Failure.malformed }
             offset = lineEnd + 2
             if size == 0 { return body }
             guard bytes.count >= offset + size + 2 else { return nil }
