@@ -57,6 +57,9 @@ webpki-roots.workspace = true
 
 [dev-dependencies]
 twr-docs.workspace = true
+# tests/phone_pairing.rs: a phone's pin is the SHA-256 of the leaf's SubjectPublicKeyInfo (the
+# webpki rustls already builds).
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc"] }
 crossterm.workspace = true
 portable-pty.workspace = true
 
