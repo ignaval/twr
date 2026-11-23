@@ -61,6 +61,8 @@ server = [
 
 [dev-dependencies]
 tempfile.workspace = true
+# The record store against pkarr's own packets (docs/relay-protocol.md §9), at twr-link's version.
+pkarr = { version = "=8.1.0", default-features = false, features = ["signed_packet"] }
 
 [[test]]
 name = "conformance"

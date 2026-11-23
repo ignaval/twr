@@ -858,3 +858,34 @@ async fn a_probe_every_minute_stays_within_the_limits() {
     }
     r.stop().await;
 }
+
+#[tokio::test]
+async fn record_store_takes_pkarr_packets() {
+    // Packets made and read by the pkarr crate itself, as iroh's publisher and resolver do.
+    let r = named("").await;
+    let kp = pkarr::Keypair::random();
+    let packet = pkarr::SignedPacket::builder()
+        .a(
+            pkarr::dns::Name::new("_relay").unwrap(),
+            "192.0.2.1".parse().unwrap(),
+            30,
+        )
+        .sign(&kp)
+        .unwrap();
+    let path = format!("/pkarr/{}", kp.public_key().to_z32());
+    let (st, _) = client::https(
+        &r.t(),
+        "PUT",
+        &path,
+        Some(packet.to_relay_payload().to_vec()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(st, 200);
+    let (st, body) = client::https(&r.t(), "GET", &path, None).await.unwrap();
+    assert_eq!(st, 200);
+    let back = pkarr::SignedPacket::from_relay_payload(&kp.public_key(), &bytes::Bytes::from(body))
+        .unwrap();
+    assert_eq!(back.as_bytes(), packet.as_bytes());
+    r.stop().await;
+}

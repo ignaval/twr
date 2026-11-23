@@ -5792,6 +5792,7 @@ dependencies = [
  "iroh-dns",
  "iroh-relay",
  "libc",
+ "pkarr",
  "rcgen",
  "ring",
  "rustls",

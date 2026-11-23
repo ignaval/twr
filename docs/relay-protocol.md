@@ -143,7 +143,7 @@ Server names compare case-insensitively, and a trailing dot is ignored. The rela
    - ALPN: the hub protocol versions it supports, newest first, for example `["twr-relay/2", "twr-relay/1"]`. Version 1 is `twr-relay/1`.
 2. The hub checks the relay's certificate as [§3.4](#34-relay-urls) says.
 3. The relay selects one ALPN value. If it selected none, or one the hub didn't offer, the hub must close.
-4. Both sides run **yamux** (the [yamux specification](https://github.com/hashicorp/yamux/blob/master/spec.md), version 0) over the TLS stream. The hub is the yamux client (odd stream ids), the relay the server. twr uses the `yamux` crate 0.13 with its default configuration: 256 KiB initial window, at most 512 streams.
+4. Both sides run **yamux** (the [yamux specification](https://github.com/hashicorp/yamux/blob/master/spec.md), version 0) over the TLS stream. The hub is the yamux client (odd stream ids), the relay the server. Streams start with yamux's 256 KiB window. twr uses the `yamux` crate 0.13. Its relay allows at most 32 streams and a 16 MiB receive window per hub connection; twr's hub client allows 64 streams and 64 MiB. Each side enforces only its own limits, so other implementations may choose theirs.
 5. The hub opens the first stream, the **control stream**. It carries [frames](#2-common-encodings) in both directions for the life of the connection. Every later stream is opened by the relay and carries one phone connection.
 
 TLS 1.2 must be refused: the authentication below depends on a TLS 1.3 exporter.
@@ -165,7 +165,9 @@ Every frame is a JSON object with a string member `type`. Version 1 defines:
 | `drain` | relay → hub | The relay is going away; reconnect elsewhere or later |
 | `error` | either | A refusal or a protocol error |
 
-A receiver that gets an unknown `type` must answer `{"type":"error","code":"unsupported","ref":"<that type>","fatal":false}` and carry on. Requests are answered in order.
+A receiver that gets an unknown `type` must answer `{"type":"error","code":"unsupported","ref":"<that type>","fatal":false}` and carry on.
+
+`phones` and `moved` are requests. The relay answers each, in order, with its `_ok` message or with a non-fatal `error` whose `ref` is the request's type (`"phones"` or `"moved"`). An `error` without a matching `ref`, such as `quota`, is a notice and answers nothing.
 
 ### 5.3 Authentication
 
@@ -434,6 +436,7 @@ Defaults for version 1. A relay operator can change them; a hub learns the value
 | | iroh relay connections, receive rate | 10 MB/s, bursts to 32 MB |
 
 - A **source address** is the IPv4 address, or the IPv6 /64.
+- An operator may exempt addresses from the per-source-address limits (twr's own relays exempt their monitoring hosts). The deny list still applies to them.
 - A relay may keep a deny list of hub names, endpoint ids and address prefixes.
 - Every refusal increments a counter by reason; none is logged with an address ([§14](#14-security-properties)).
 
@@ -462,10 +465,19 @@ Compatibility rules:
 
 ## 13. Conformance and test vectors
 
-- `crates/twr-relay/tests/vectors/v1.json` holds test vectors for version 1: hub names from pins, tags for given keys and windows, hub-auth and moved-note signatures for fixed exporters and keys, frames, admission messages and their signatures. Once version 1 is released, that file is frozen: a change to it is a protocol change. Client code in other crates and in the phone apps should test against it.
-- `crates/twr-relay/tests/conformance.rs` runs a relay in-process on loopback and exercises every section of this page with an independent client.
-- `twr relay probe <relay URL>` is a client that checks a running relay end to end: info, a test hub session, a phone stream through it, the record store and iroh admission. Monitoring runs it, and so does the compatibility job below.
-- `docs/tools/relay-compat.sh` runs the relay at HEAD against `twr relay probe` from the last two releases, and HEAD's probe against the last two releases' relays. Releases from before the relay existed are skipped and reported as such. CI runs it.
+- `crates/twr-relay/tests/vectors/v1.json` holds test vectors for version 1:
+  - hub names from pins;
+  - tags, labels and server names for given keys and windows;
+  - hub-auth signatures for a fixed exporter, Ed25519 (reproducible) and P-256 (randomized, so verify only);
+  - a moved note, and both admission kinds with their signed bytes;
+  - a frame and a record signable.
+
+  Once version 1 is released, that file is frozen: a change to it is a protocol change. `tests/vectors.rs` checks that the Rust code computes exactly the file's values. Client code in other crates and in the phone apps should test against the file directly.
+- `crates/twr-relay/tests/conformance.rs` runs relays in-process on loopback, with and without a DNS name, and exercises every section of this page through `twr_relay::client` and raw frames.
+- `crates/twr-relay/tests/parse_fuzz.rs` fuzzes what the relay reads before authentication: ClientHellos, certificates, frames, admission bodies, relay URLs and labels.
+- `crates/twr-relay/tests/acme.rs`, run by `docs/tools/relay-acme-pebble.sh`, takes the Let's Encrypt path against a local pebble in Docker.
+- `twr relay probe <relay URL>` checks a running relay end to end: info, a test hub session, a phone stream through it, the status page, the record store, iroh admission and an iroh relay handshake. `--state <dir>` keeps its keys between runs. Monitoring runs it, and so does the compatibility job below.
+- `docs/tools/relay-compat.sh` runs the relay at HEAD against `twr relay probe` from the last two releases, and HEAD's probe against the last two releases' relays. Releases from before the relay existed are skipped and reported as such. CI runs it as the `relay compatibility` job.
 
 ## 14. Security properties
 
@@ -479,10 +491,11 @@ What the relay can do, if it is compromised or run by someone hostile:
 
 What an on-path observer of a phone sees: the SNI, so the hub name and a tag that changes every 5 minutes. A tag observed on the path can be replayed for up to 15 minutes to reach the hub, which then still requires the pinned key's TLS and a device token. Encrypted Client Hello would hide the SNI; version 1 doesn't depend on it.
 
-What the relay records: counters (connections, bytes, refusals by reason), per-hub daily byte totals kept 30 days for the monthly quota, admissions and moved notes until they expire. It logs no content, no SNI, no addresses and no keys. Operators' log levels must not change that: the relay has no logging of those at any level.
+What the relay records: counters (connections, bytes, refusals by reason), per-hub daily byte totals kept 30 days for the monthly quota, admissions and moved notes until they expire. It logs no content, no SNI, no addresses and no keys. Operators' log levels must not change that: the relay's own code has no logging of those at any level, and `twr relay serve` turns off the embedded iroh relay's log, which has, whatever `RUST_LOG` says.
 
 ## Changes
 
 | Date | Change |
 |---|---|
 | 2026-11-23 | First draft of version 1. |
+| 2026-11-23 | Built and tested. Clarified: error answers carry the request's type in `ref` (§5.2); each side's yamux limits (§5.1); exempt addresses (§11); the test files (§13); the iroh relay's log (§14). No wire change. |

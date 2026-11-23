@@ -5,10 +5,11 @@
 #
 #   sh docs/tools/relay-acme-pebble.sh
 #
-# Needs Docker. PEBBLE_IMAGE overrides the image (default ghcr.io/letsencrypt/pebble:latest).
+# Needs Docker.
 set -eu
 
-image=${PEBBLE_IMAGE:-ghcr.io/letsencrypt/pebble:latest}
+# Pinned by digest (the image of 2026-11-23); PEBBLE_IMAGE overrides it.
+image=${PEBBLE_IMAGE:-ghcr.io/letsencrypt/pebble@sha256:0c81f05db371f436c97fb894bd6d2ab8fc9c8e2ce40f8bef8a8e15941bcd75ef}
 port=${TWR_PEBBLE_PORT:-18444}
 name=twr-relay-pebble-$$
 work=$(mktemp -d "${TMPDIR:-/tmp}/twr-relay-pebble.XXXXXXXX")

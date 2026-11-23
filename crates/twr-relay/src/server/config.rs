@@ -85,7 +85,9 @@ pub struct IrohSection {
     pub enabled: bool,
     /// Default `iroh.<hostname>`.
     pub hostname: Option<String>,
-    /// iroh's QUIC address discovery (UDP). `None` turns it off.
+    /// iroh's QUIC address discovery (UDP).
+    #[serde(default = "yes")]
+    pub quic: bool,
     #[serde(default = "default_quic")]
     pub quic_listen: Option<SocketAddr>,
     /// Without a hostname, iroh can't share the main port (§10): it gets this one.

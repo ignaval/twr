@@ -108,7 +108,7 @@ impl Iroh {
             Arc::new(Metrics::default()),
         );
         let tls = certs.iroh_config();
-        let quic = match cfg.iroh.quic_listen {
+        let quic = match cfg.iroh.quic_listen.filter(|_| cfg.iroh.quic) {
             Some(addr) => {
                 let mut q = iroh_relay::server::QuicConfig::new(addr);
                 q.server_config = Some((*certs.iroh_config()).clone());
