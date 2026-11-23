@@ -117,13 +117,23 @@ Hubs print IPv6 hosts in RFC 5952 form (lowercase, compressed), so one address h
 **How the hub builds the list:**
 
 1. The configured `address` first, if set: a DNS name or a forwarded `host:port`.
-2. Then addresses from the interfaces that are up and not loopback or link-local, in this order:
-   - global IPv4 and IPv6;
-   - tailnet addresses (100.64.0.0/10, fd7a:115c:a1e0::/48);
-   - private LAN addresses (RFC 1918, fc00::/7 outside the tailnet range).
-3. Cut the list off at 8.
+2. Then addresses from the interfaces that are up, each class up to its quota, in this order:
+   - at most 2 global IPv4;
+   - at most 2 global IPv6;
+   - at most 2 tailnet addresses (100.64.0.0/10, fd7a:115c:a1e0::/48);
+   - at most 3 private LAN addresses (RFC 1918, fc00::/7 outside the tailnet range).
+3. Then the addresses the quotas left out, in the same order, while there is room.
+4. Cut the list off at 8.
 
-Interface addresses come only for a listener on all addresses (`0.0.0.0` gives IPv4 ones, `[::]` IPv6 ones). A listener on one address offers that address, a loopback one included. Within each class, IPv4 comes before IPv6. When there is no route at all, the gateway opens no invitation and asks for `--address`.
+The quotas keep one class, such as a host's many global IPv6 addresses, from pushing the others out. Duplicates are dropped before they count.
+
+**Left out:**
+
+- loopback interfaces, and loopback, link-local, unspecified and multicast addresses;
+- virtual bridges of containers and virtual machines, by interface name: `docker*`, `br-*`, `veth*`, `virbr*`, `cni*`, `podman*`, `lxcbr*`, `flannel*`;
+- IPv6 addresses the system marks temporary (privacy addresses, which change daily), deprecated, tentative or failed duplicate address detection. Linux reads the flags column of `/proc/net/if_inet6` (`IFA_F_TEMPORARY` 0x01, `IFA_F_DADFAILED` 0x08, `IFA_F_DEPRECATED` 0x20, `IFA_F_TENTATIVE` 0x40). macOS asks `ioctl(SIOCGIFAFLAG_IN6)` (`IN6_IFF_TEMPORARY`, `IN6_IFF_DEPRECATED`, `IN6_IFF_TENTATIVE`, `IN6_IFF_DUPLICATED`, `IN6_IFF_DETACHED`). When neither answers, every address is offered.
+
+Interface addresses come only for a listener on all addresses (`0.0.0.0` gives IPv4 ones, `[::]` IPv6 ones). A listener on one address offers that address, a loopback one included. Within the tailnet and private classes, IPv4 comes before IPv6. When there is no route at all, the gateway opens no invitation and asks for `--address`.
 
 **Saved settings.** The pinned gateway keeps `address`, `listen` and `autostart` in `gateway-settings.json` in its directory (0600). The desktop app keeps its certificate-mode gateway's settings in its own settings file, which the gateway cannot read, so `--address` is saved only in pinned mode.
 
