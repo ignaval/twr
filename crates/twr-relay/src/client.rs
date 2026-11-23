@@ -462,11 +462,14 @@ pub fn sign_moved(
     issued: u64,
     routes: serde_json::Value,
 ) -> Result<(String, String)> {
-    let body = serde_json::to_vec(&serde_json::json!({
-        "hub": names::hub_name(&key.pin()),
-        "issued": issued,
-        "routes": routes,
-    }))?;
+    // Written out by hand, so the bytes don't depend on serde_json's map order.
+    let body = format!(
+        r#"{{"hub":"{}","issued":{},"routes":{}}}"#,
+        names::hub_name(&key.pin()),
+        issued,
+        serde_json::to_string(&routes)?
+    )
+    .into_bytes();
     if body.len() > proto::MAX_MOVED_BODY {
         bail!("the moved note is over {} bytes", proto::MAX_MOVED_BODY);
     }

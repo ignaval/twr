@@ -65,3 +65,7 @@ tempfile.workspace = true
 [[test]]
 name = "conformance"
 required-features = ["server"]
+
+[[test]]
+name = "parse_fuzz"
+required-features = ["server"]
