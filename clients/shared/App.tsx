@@ -206,6 +206,16 @@ import {
   useModal,
 } from "./a11y";
 import { omarchyProperties } from "./omarchy";
+import {
+  type AwaitedTurn,
+  AWAIT_LIMIT_MS,
+  animateChange,
+  animateSetting,
+  conversationWorks,
+  cursorPlace,
+  lastTurnEnd,
+  stillAwaited,
+} from "./working";
 import { omarchyInkVar, parseHex, threadInk, threadStyle } from "./threadColor";
 const Terminal = lazy(() =>
   import("./Terminal").then((module) => ({ default: module.Terminal })),
@@ -547,6 +557,10 @@ export default function App({
     };
   }, [journal, drafts, uploads]);
   const [sending, setSending] = useState(false);
+  // The thread a message in flight goes to, for its conversation's working cursor: from
+  // the send until the hub says its turn runs (`awaited`, ./working).
+  const [sendingTo, setSendingTo] = useState<string>();
+  const [awaited, setAwaited] = useState<AwaitedTurn>();
   const slashPending = useRef(false);
   const [queued, setQueued] = useState<Json[]>([]);
   const [queueInfo, setQueueInfo] = useState<Json>({});
@@ -716,6 +730,28 @@ export default function App({
     resyncs,
   ]);
   const [visibleRoutines, setVisibleRoutines] = useState<string[]>([]);
+  // The conversation's working cursor (./working): while a message to it is in flight or
+  // awaited, and while its thread works, never while it waits on the user.
+  const waitingForTurn = stillAwaited(awaited, target, events, Date.now());
+  const working = conversationWorks({
+    thread: target,
+    attention: view.attention,
+    sending: !!target && sendingTo === target.id,
+    awaited: waitingForTurn,
+  });
+  useEffect(() => {
+    if (!awaited) return;
+    if (!waitingForTurn && awaited.thread === target?.id) {
+      setAwaited(undefined);
+      return;
+    }
+    // A turn that never shows running stops being awaited, even if nothing else changes.
+    const timer = setTimeout(
+      () => setAwaited((old) => (old === awaited ? undefined : old)),
+      Math.max(0, awaited.at + AWAIT_LIMIT_MS - Date.now()),
+    );
+    return () => clearTimeout(timer);
+  }, [awaited, waitingForTurn, target?.id]);
   const presentedEvents = useMemo(() => {
     const resolved = new Set(view.went_on || []);
     return events.map((event) =>
@@ -900,18 +936,29 @@ export default function App({
   // `[loops] offer_review` (`config.show`), once per connection: the Review loop button on
   // a finished turn with changes. An older hub has no `loops`, and offers it.
   const [offerReview, setOfferReview] = useState(true);
+  // `[tui] animate` too: `false` keeps the conversation's working cursor a still `_`. Read
+  // again when the conversation shows it changed (the orchestrator sets it at once).
+  const [animate, setAnimate] = useState(true);
+  // The latest change seen, kept while a worker's conversation (which has none) is open.
+  const [animateChanged, setAnimateChanged] = useState<string>();
+  const animateChangeShown = animateChange(events);
+  useEffect(() => {
+    if (animateChangeShown) setAnimateChanged(animateChangeShown);
+  }, [animateChangeShown]);
   useEffect(() => {
     if (!connected) return;
     let live = true;
     void rpc("config.show")
       .then((config) => {
-        if (live) setOfferReview(offerReviewSetting(config));
+        if (!live) return;
+        setOfferReview(offerReviewSetting(config));
+        setAnimate(animateSetting(config));
       })
       .catch(() => {});
     return () => {
       live = false;
     };
-  }, [connected, workspace, rpc]);
+  }, [connected, workspace, rpc, animateChanged]);
   const refreshWorkspaces = useCallback(async () => {
     const value = await hostApi.cli(["ws", "list", "--json"]);
     if (value.code !== 0) throw new Error(value.stderr || value.stdout);
@@ -1884,6 +1931,11 @@ export default function App({
     const fileIds = files.map((file) => file.id);
     if (!uploads.reserve(fileIds)) return;
     setSending(true);
+    // A message (not a `!` command) to a hub that is there starts a turn: its
+    // conversation shows the working cursor from now on.
+    const turnTo = connected && !isShellDraft(draft) ? target.id : undefined;
+    const endedBefore = lastTurnEnd(events);
+    setSendingTo(turnTo);
     const key = draftKey;
     const text = messageText(draft);
     // What is sent, and what the outbox keeps to put back in the draft: with the files.
@@ -2013,6 +2065,8 @@ export default function App({
       }
       drafts.set(key, (old) => (old === draft ? "" : old));
       takeFiles();
+      if (turnTo && !response.saved_offline)
+        setAwaited({ thread: turnTo, endedBefore, at: Date.now() });
       announce(
         response.saved_offline
           ? "Message saved on this device. It sends when the hub reconnects."
@@ -2029,6 +2083,7 @@ export default function App({
     } finally {
       uploads.release(fileIds);
       setSending(false);
+      setSendingTo(undefined);
       input.current?.focus();
     }
   };
@@ -3990,6 +4045,8 @@ export default function App({
                   }
                   earlierBusy={earlierBusy}
                   target={target}
+                  working={working}
+                  animate={animate}
                   threads={view.threads}
                   onSetup={setupOrchestrator}
                   connected={connected}
@@ -5669,7 +5726,14 @@ const Conversation = memo(function Conversation({
   onError,
   offer,
   sentImage,
+  working = false,
+  animate = true,
 }: {
+  /** The thread shown runs a turn ([`conversationWorks`]): the working cursor waits where
+   * its next text will appear. */
+  working?: boolean;
+  /** `[tui] animate`: `false` keeps the cursor a still `_`. */
+  animate?: boolean;
   /** The thread whose finished turn with changes the conversation offers a review loop. */
   offer?: Thread;
   /** The preview this client still holds of a file a message named, by its path. */
@@ -5894,6 +5958,11 @@ const Conversation = memo(function Conversation({
     onVisibleRoutines(visibleRoutineKey ? visibleRoutineKey.split(",") : []);
   }, [visibleRoutineKey, onVisibleRoutines]);
   const last = blocks.at(-1);
+  // The working cursor shows only while the conversation is at its bottom (followed), and
+  // never takes room: inline it is drawn over the text's end, on its own line in the gap
+  // below the last message. So it neither moves the view nor shows where you read.
+  const cursor =
+    working && following && !loading && last ? cursorPlace(last) : undefined;
   function loadEarlier() {
     if (!earlier || earlierBusy || !parent.current) return;
     follow.current = false;
@@ -5915,6 +5984,7 @@ const Conversation = memo(function Conversation({
       role="region"
       aria-label={`Conversation with ${target?.name || "orchestrator"}`}
       aria-busy={loading || undefined}
+      data-still={animate ? undefined : ""}
       tabIndex={0}
       onWheel={cancelMessageJump}
       onTouchStart={cancelMessageJump}
@@ -6140,6 +6210,7 @@ const Conversation = memo(function Conversation({
                 <MessageBody
                   text={block.text}
                   streaming={block.kind === "assistant" && !!block.pending}
+                  working={cursor === "inline" && block === last}
                   threadTags={
                     block.kind === "assistant" && !!target?.is_orchestrator
                   }
@@ -6153,6 +6224,11 @@ const Conversation = memo(function Conversation({
           );
         })}
       </div>
+      {cursor === "line" && (
+        <div className="working-line" aria-hidden="true">
+          <span className="working-cursor" />
+        </div>
+      )}
       {offer && !loading && (
         <div className="loop-offer-row">
           <span>
