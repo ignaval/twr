@@ -1,5 +1,7 @@
 //! Authenticated remote user transport. Runner tokens are never accepted here.
-mod remote;
+//!
+//! The `twr-mobile-gateway` binary of the desktop bundle and `twr gateway` both run [`run`].
+use crate::remote;
 use anyhow::{Context, Result};
 use axum::{
     extract::{
@@ -33,11 +35,11 @@ use std::{
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock, Semaphore};
 use twr_core::proto::codes;
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(
     about = "Remote mobile clients for twr. Start from your own terminal or desktop launcher."
 )]
-struct Args {
+pub struct Args {
     #[arg(long, default_value = "127.0.0.1:47321")]
     listen: SocketAddr,
     #[arg(long)]
@@ -113,7 +115,7 @@ struct Server {
     connections: Arc<remote::limits::Connections>,
     terminal_slots: Arc<Semaphore>,
     binary: PathBuf,
-    companion: PathBuf,
+    companion: remote::companion::Command,
     owner: Mutex<Option<twr_core::client::Client>>,
     auth: Arc<Auth>,
     slots: Arc<Semaphore>,
@@ -160,8 +162,8 @@ fn authorize_mutation(device: &Device, call: &Call) -> Result<()> {
     Ok(())
 }
 
-const MAX_SOCKET_REPLY: usize = 16 * 1024 * 1024;
-const OVERSIZED_REPLY_ERROR: &str =
+pub(crate) const MAX_SOCKET_REPLY: usize = 16 * 1024 * 1024;
+pub(crate) const OVERSIZED_REPLY_ERROR: &str =
     "Hub response exceeds 16 MiB. Load a smaller transcript page or open it on desktop.";
 
 /// Keep a large transcript or state event from tearing down a healthy native socket.
@@ -173,7 +175,7 @@ fn send_budget(message: &Message) -> Duration {
     };
     Duration::from_secs(20 + (bytes as u64).div_ceil(32 * 1024))
 }
-fn socket_message(event: &Value) -> Message {
+pub(crate) fn socket_message(event: &Value) -> Message {
     let text = event.to_string();
     let text = if text.len() > MAX_SOCKET_REPLY {
         match event.get("id") {
@@ -290,7 +292,10 @@ mod socket_tests {
             remote::push::Push::new(dir, None, None).unwrap(),
             remote::receipts::Receipts::new(dir).unwrap(),
             None,
-            (dir.join("twr"), dir.join("twr-desktop-bridge")),
+            (
+                dir.join("twr"),
+                remote::companion::Command::program(dir.join("twr-desktop-bridge")),
+            ),
             true,
             TEST_LIMITS,
         ))
@@ -777,7 +782,7 @@ impl Server {
         push: Arc<remote::push::Push>,
         receipts: remote::receipts::Receipts,
         owner: Option<twr_core::client::Client>,
-        (binary, companion): (PathBuf, PathBuf),
+        (binary, companion): (PathBuf, remote::companion::Command),
         development: bool,
         limits: remote::limits::Limits,
     ) -> Self {
@@ -1226,12 +1231,8 @@ impl Session {
                 if self.device.scopes.iter().any(|s| s == "operate") {
                     let paths = twr_core::paths::Paths::from_env_in(Some(workspace))?;
                     let config = twr_core::config::Config::load_from(&paths)?;
-                    twr_app::runtime::ensure_hub(
-                        &paths,
-                        &config.socket_path(&paths),
-                        &server.binary,
-                    )
-                    .await?;
+                    crate::runtime::ensure_hub(&paths, &config.socket_path(&paths), &server.binary)
+                        .await?;
                 }
                 let (events, mut received) = mpsc::channel::<Value>(256);
                 let output = self.events.clone();
@@ -1320,7 +1321,7 @@ impl Session {
                 bridge()?.call(method, p["params"].clone()).await
             }
             "catalog" => Ok(serde_json::from_str(include_str!(
-                "../../../clients/mobile/catalog.json"
+                "../../../../clients/mobile/catalog.json"
             ))?),
             "directories" => {
                 anyhow::ensure!(
@@ -2111,13 +2112,55 @@ async fn serve_socket(
     writer.abort();
     Ok(())
 }
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Where the gateway finds the programs it runs: `twr` (a hub, a device's shell, the CLI
+/// calls of a device) and the per-device companion (the desktop bridge).
+pub enum Programs {
+    /// The desktop bundle: `twr` and `twr-desktop-bridge` beside this executable, or in
+    /// `--binary-dir`.
+    Bundle,
+    /// `twr gateway`: this executable is `twr`, and its hidden `desktop-bridge` subcommand is
+    /// the companion (or `twr` in `--binary-dir`, run the same way).
+    Twr,
+}
+
+impl Programs {
+    /// `twr` and the companion's command, from `binary_dir` when given.
+    fn resolve(&self, binary_dir: Option<&Path>) -> Result<(PathBuf, remote::companion::Command)> {
+        let this = std::env::current_exe()?;
+        let dir = match binary_dir {
+            Some(dir) => dir.to_owned(),
+            None => this.parent().context("Binary directory")?.to_owned(),
+        };
+        Ok(match self {
+            Programs::Bundle => (
+                dir.join("twr"),
+                remote::companion::Command::program(dir.join("twr-desktop-bridge")),
+            ),
+            Programs::Twr => {
+                let twr = if binary_dir.is_some() {
+                    dir.join("twr")
+                } else {
+                    this
+                };
+                let companion = remote::companion::Command {
+                    program: twr.clone(),
+                    args: vec![BRIDGE_SUBCOMMAND.into()],
+                };
+                (twr, companion)
+            }
+        })
+    }
+}
+
+/// `twr`'s hidden subcommand that runs the desktop bridge ([`crate::bridge::run`]).
+pub const BRIDGE_SUBCOMMAND: &str = "desktop-bridge";
+
+/// The gateway, given its arguments: what `twr-mobile-gateway` and `twr gateway` run.
+pub async fn run(args: Args, programs: Programs) -> Result<()> {
     // The app starts the gateway, which outlives it and may start a hub: neither may keep
     // the app's crash handler.
-    twr_app::runtime::forget_inherited_crash_handler();
+    crate::runtime::forget_inherited_crash_handler();
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let args = Args::parse();
     if let Some(path) = args.log_file.clone() {
         remote::gateway_lifecycle::set_log_file(path);
     }
@@ -2136,14 +2179,7 @@ async fn main() -> Result<()> {
         administration || args.development || (args.tls_cert.is_some() && args.tls_key.is_some()),
         "TLS certificate and key are required. Debug loopback tests may use --development"
     );
-    let dir = args.binary_dir.unwrap_or(
-        std::env::current_exe()?
-            .parent()
-            .context("Binary directory")?
-            .to_owned(),
-    );
-    let binary = dir.join("twr");
-    let companion = dir.join("twr-desktop-bridge");
+    let (binary, companion) = programs.resolve(args.binary_dir.as_deref())?;
     let paths = twr_core::paths::Paths::from_env_in(Some("default"))?;
     let mobile_dir = paths.config_file.with_file_name("mobile");
     if args.gateway_info {
@@ -2194,7 +2230,7 @@ async fn main() -> Result<()> {
     }
     let auth = Auth::open(&paths.config_file.with_file_name("mobile"))?;
     let config = twr_core::config::Config::load_from(&paths)?;
-    twr_app::runtime::ensure_hub(&paths, &config.socket_path(&paths), &binary).await?;
+    crate::runtime::ensure_hub(&paths, &config.socket_path(&paths), &binary).await?;
     let mut local = owner_client().await?;
     if let Some(id) = args.revoke {
         local.call("device.revoke", json!({"id":id})).await?;

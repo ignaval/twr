@@ -20,6 +20,8 @@ neural = ["dep:twr-neural", "twr-speech/neural"]
 
 [dependencies]
 twr-adapters.workspace = true
+# `twr gateway` and the companion it runs (`twr desktop-bridge`): the phones' gateway.
+twr-app.workspace = true
 twr-core.workspace = true
 twr-link.workspace = true
 twr-hub.workspace = true

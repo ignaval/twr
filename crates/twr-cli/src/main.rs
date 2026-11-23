@@ -902,6 +902,17 @@ enum Cmd {
         #[arg(long, hide = true, value_name = "PATH", requires = "daemon")]
         log: Option<PathBuf>,
     },
+    /// Run the phones' gateway in the foreground (advanced: `twr phone` starts it for you).
+    ///
+    /// Without --tls-cert it serves its own key, which paired phones pin.
+    Gateway(twr_app::gateway::Args),
+    /// A device's companion, which the gateway runs: the desktop bridge for a workspace, on
+    /// stdin and stdout.
+    #[command(name = "desktop-bridge", hide = true)]
+    DesktopBridge {
+        #[arg(default_value = "default")]
+        workspace: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1724,6 +1735,19 @@ fn workspace_hint() -> &'static str {
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     refuse_runner_socket(&cli)?;
     refuse_bulk_stop_socket(&cli)?;
+    // The gateway and the companion it runs find their own paths (the default workspace's,
+    // the companion's named one).
+    let cli = match cli.cmd {
+        Some(Cmd::Gateway(args)) => {
+            twr_app::gateway::run(args, twr_app::gateway::Programs::Twr).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Cmd::DesktopBridge { workspace }) => {
+            twr_app::bridge::run(workspace).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        cmd => Cli { cmd, ..cli },
+    };
     // From the command definition alone: no twr home, config or hub.
     if let Some(Cmd::Completions { shell }) = &cli.cmd {
         let mut command = <Cli as clap::CommandFactory>::command();
@@ -2357,6 +2381,8 @@ async fn run_simple(cmd: Cmd, paths: Paths, socket: PathBuf) -> anyhow::Result<(
         | Cmd::Remote { .. }
         | Cmd::TerminalSetup { .. }
         | Cmd::Completions { .. }
+        | Cmd::Gateway(_)
+        | Cmd::DesktopBridge { .. }
         | Cmd::Account { .. }
         | Cmd::Thread {
             cmd: ThreadCmd::New { .. },

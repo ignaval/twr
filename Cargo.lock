@@ -5378,6 +5378,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "twr-adapters",
+ "twr-app",
  "twr-core",
  "twr-docs",
  "twr-hub",

@@ -19,6 +19,7 @@ twr-runner = { path = "crates/twr-runner" }
 twr-hub = { path = "crates/twr-hub" }
 twr-mcp = { path = "crates/twr-mcp" }
 twr-tui = { path = "crates/twr-tui" }
+twr-app = { path = "crates/twr-app" }
 twr-docs = { path = "crates/twr-docs" }
 twr-avspeech = { path = "crates/twr-avspeech" }
 twr-neural = { path = "crates/twr-neural" }

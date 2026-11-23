@@ -45,8 +45,8 @@ tokio = { workspace = true, features = ["test-util"] }
 
 [[bin]]
 name = "twr-desktop-bridge"
-path = "src/main.rs"
+path = "src/bin/twr-desktop-bridge.rs"
 
 [[bin]]
 name = "twr-mobile-gateway"
-path = "src/gateway.rs"
+path = "src/bin/twr-mobile-gateway.rs"
