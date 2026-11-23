@@ -44,6 +44,14 @@ struct RaceFailure: LocalizedError {
 
     var pinMismatch: Bool { failures.contains { $0.error == .pinMismatch } }
 
+    /// The contract's reject code (docs/design/phone-pairing.md, Error codes): PIN_MISMATCH
+    /// if any route presented another key, TIMEOUT if every one timed out, else UNREACHABLE.
+    var code: String {
+        if pinMismatch { return "PIN_MISMATCH" }
+        if !failures.isEmpty, failures.allSatisfy({ $0.error == .timedOut }) { return "TIMEOUT" }
+        return "UNREACHABLE"
+    }
+
     var errorDescription: String? {
         let text: String
         if failures.isEmpty {
@@ -286,22 +294,68 @@ enum HubProbe {
     }
 }
 
+/// The delayed routes' wait: `RouteBook.raceDelay`, or less when the remembered route fails
+/// first. `end()` lets every waiter go, at once and for good.
+final class HeadStart: @unchecked Sendable {
+    private let lock = NSLock()
+    private var ended = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func end() {
+        lock.lock()
+        ended = true
+        let pending = waiters
+        waiters = []
+        lock.unlock()
+        for waiter in pending { waiter.resume() }
+    }
+
+    /// Returns when `end()` is called, or when the waiting task is cancelled.
+    func wait() async {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                self.lock.lock()
+                if self.ended {
+                    self.lock.unlock()
+                    continuation.resume()
+                } else {
+                    self.waiters.append(continuation)
+                    self.lock.unlock()
+                }
+            }
+        } onCancel: {
+            // Only the race's own cancelAll cancels a waiter, and then they all go.
+            self.end()
+        }
+    }
+}
+
 enum RouteRace {
     /// The first route of `plan` to complete TLS with the pin and answer `/health` as the
-    /// expected gateway; the others are cancelled.
+    /// expected gateway; the others are cancelled. The delayed routes start `raceDelay`
+    /// after the first, or as soon as it fails.
     static func run(_ plan: [RouteBook.RaceEntry], pin: Data, gatewayID: String?, hubName: String, timeout: TimeInterval) async throws -> HubProbe.Found {
         guard !plan.isEmpty else { throw RaceFailure(failures: [], hubName: hubName) }
+        let headStart = HeadStart()
+        let timer = Task {
+            try? await Task.sleep(nanoseconds: UInt64(RouteBook.raceDelay * 1_000_000_000))
+            headStart.end()
+        }
+        defer { timer.cancel() }
         return try await withThrowingTaskGroup(of: (Int, Result<HubProbe.Found, RouteError>).self) { group in
             for (index, entry) in plan.enumerated() {
                 group.addTask {
-                    if entry.delayed { try? await Task.sleep(nanoseconds: UInt64(RouteBook.raceDelay * 1_000_000_000)) }
+                    if entry.delayed { await headStart.wait() }
                     if Task.isCancelled { return (index, .failure(.cancelled)) }
                     do {
                         let found = try await HubProbe.health(entry.route, check: PinCheck(expected: pin), expectedGateway: gatewayID, timeout: timeout)
                         return (index, .success(found))
                     } catch let error as RouteError {
+                        // The remembered route failed: the others need not wait out its head start.
+                        if !entry.delayed { headStart.end() }
                         return (index, .failure(error))
                     } catch {
+                        if !entry.delayed { headStart.end() }
                         return (index, .failure(.unreachable(error.localizedDescription)))
                     }
                 }

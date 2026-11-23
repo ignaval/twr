@@ -156,6 +156,27 @@ final class PairingLogicTests: XCTestCase {
                        "what the gateway reports now is the newest sighting")
     }
 
+    func testHeadStartEndsEarlyForEveryWaiter() async {
+        let headStart = HeadStart()
+        let started = Date()
+        async let first: Void = headStart.wait()
+        async let second: Void = headStart.wait()
+        headStart.end()
+        _ = await (first, second)
+        await headStart.wait()
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1, "end() lets current and later waiters go at once")
+    }
+
+    func testRaceFailuresCarryTheContractsCodes() {
+        func code(_ errors: [RouteError]) -> String {
+            RaceFailure(failures: errors.enumerated().map { (route: "tls:h\($0.offset).example:1", error: $0.element) }, hubName: "Box").code
+        }
+        XCTAssertEqual(code([.timedOut, .pinMismatch]), "PIN_MISMATCH")
+        XCTAssertEqual(code([.timedOut, .timedOut]), "TIMEOUT")
+        XCTAssertEqual(code([.timedOut, .unreachable("refused")]), "UNREACHABLE")
+        XCTAssertEqual(code([]), "UNREACHABLE")
+    }
+
     func testRacePlanStartsTheRememberedRouteFirst() {
         let routes = ["tls:192.168.1.20:47321", "tls:[2001:db8::5]:47321", "tls:box.tail1234.ts.net:47321", "relay:x", "tls:box.local:47321"]
         let plan = RouteBook.racePlan(routes, remembered: "tls:box.tail1234.ts.net:47321", cellular: false)
