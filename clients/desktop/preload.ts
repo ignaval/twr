@@ -91,12 +91,16 @@ const connections: DesktopConnections = {
   restart: (request) => ipcRenderer.invoke("twr:gateway-restart", request),
   invite: (request) => ipcRenderer.invoke("twr:gateway-invite", request),
   deactivateLocal: () => ipcRenderer.invoke("twr:deactivate-local"),
-  addListener: async (_event, callback) => {
+  updateRoutes: (request) =>
+    ipcRenderer.invoke("twr:remote-update-routes", request),
+  addListener: async (event, callback) => {
+    const channel =
+      event === "network" ? "twr:remote-network" : "twr:remote-message";
     const listener = (_: unknown, value: any) => callback(value);
-    ipcRenderer.on("twr:remote-message", listener);
+    ipcRenderer.on(channel, listener);
     return {
       remove: async () => {
-        ipcRenderer.removeListener("twr:remote-message", listener);
+        ipcRenderer.removeListener(channel, listener);
       },
     };
   },
