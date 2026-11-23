@@ -837,12 +837,22 @@ export default function App({
   const action = useCallback(
     (id: string, initialValues: Json = {}, options?: OperationOptions) => {
       const command = commands.find((c) => c.id === id);
-      // Choosing the first orchestrator starts from the one the hub would start: its
-      // runtime, and the runtime's default model unless one is picked.
+      // Choosing the first orchestrator starts from the one the hub would start: the
+      // configured runtime with its configured model and effort (`[orchestrator] model /
+      // effort`), unless the caller named a runtime of its own.
       const o = infoRef.current?.orchestrator;
       if (id === "orch" && !initialValues.runtime && o && !o.thread) {
         const runtime = o.configured?.runtime || o.runtime;
-        if (runtime) initialValues = { ...initialValues, runtime };
+        if (runtime) {
+          const model = o.configured ? o.configured.model : o.model;
+          const effort = o.configured ? o.configured.effort : o.effort;
+          initialValues = {
+            ...(model ? { model } : {}),
+            ...(effort ? { effort } : {}),
+            ...initialValues,
+            runtime,
+          };
+        }
       }
       if (command) openOperation(command, initialValues, options);
     },
@@ -5003,24 +5013,31 @@ export default function App({
                     >
                       {result !== undefined ? "Close" : "Cancel"}
                     </button>
-                    <button
-                      className="primary"
-                      type="submit"
-                      disabled={operationBusy}
-                    >
-                      {operationBusy ? (
-                        <Spinner />
-                      ) : operation.cli ? (
-                        <TerminalSquare size={15} />
-                      ) : operation.id === "new" ? (
-                        <Plus size={15} />
-                      ) : (
-                        <ArrowUpRight size={15} />
-                      )}{" "}
-                      {operation.cli
-                        ? "Open terminal"
-                        : operationAction(operation, result !== undefined)}
-                    </button>
+                    {/* An orchestrator chosen is final for this form: no offer to
+                        switch again (Close stays). */}
+                    {!(
+                      result !== undefined &&
+                      operation.method === "orchestrator.use"
+                    ) && (
+                      <button
+                        className="primary"
+                        type="submit"
+                        disabled={operationBusy}
+                      >
+                        {operationBusy ? (
+                          <Spinner />
+                        ) : operation.cli ? (
+                          <TerminalSquare size={15} />
+                        ) : operation.id === "new" ? (
+                          <Plus size={15} />
+                        ) : (
+                          <ArrowUpRight size={15} />
+                        )}{" "}
+                        {operation.cli
+                          ? "Open terminal"
+                          : operationAction(operation, result !== undefined)}
+                      </button>
+                    )}
                   </div>
                 </footer>
               </form>
