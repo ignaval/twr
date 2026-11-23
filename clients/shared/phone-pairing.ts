@@ -489,7 +489,10 @@ export interface SeenRoute {
 
 /** Merges `incoming` (just seen) into `saved`: canonical, deduplicated, routes unseen
  * for 30 days dropped, at most 16 kept. The incoming routes come first in their own
- * order, then the others, the most recently seen first. Non-routes are ignored. */
+ * order, then the others, the most recently seen first. Non-routes are ignored.
+ *
+ * "Unseen for 30 days" counts back from the newest sighting of any of the hub's routes,
+ * not from today: a phone left unused for a month keeps its routes. */
 export function mergeRoutes(
   saved: SeenRoute[],
   incoming: string[],
@@ -501,19 +504,41 @@ export function mergeRoutes(
     if (canonical && !merged.has(canonical))
       merged.set(canonical, { route: canonical, seen: now });
   }
-  const older = saved
+  const known = saved
     .map((entry) => ({ ...entry, route: canonicalRoute(entry.route) }))
     .filter(
       (entry): entry is SeenRoute =>
         !!entry.route &&
         !merged.has(entry.route) &&
-        Number.isFinite(entry.seen) &&
-        now - entry.seen <= ROUTE_TTL,
-    )
+        Number.isFinite(entry.seen),
+    );
+  const newest = Math.max(
+    ...(merged.size ? [now] : []),
+    ...known.map((entry) => entry.seen),
+  );
+  const older = known
+    .filter((entry) => newest - entry.seen <= ROUTE_TTL)
     .sort((a, b) => b.seen - a.seen);
   for (const entry of older)
     if (!merged.has(entry.route)) merged.set(entry.route, entry);
   return [...merged.values()].slice(0, MAX_SAVED_ROUTES);
+}
+
+/** `route` connected `now`: it is seen now, and the others age from the newest sighting
+ * before this one. A connection after a month away keeps the other routes; the routes the
+ * gateway's hello reports then refresh the ones it still has. */
+export function rememberRoute(
+  saved: SeenRoute[],
+  route: string,
+  now = Date.now(),
+): SeenRoute[] {
+  const canonical = canonicalRoute(route);
+  const kept = mergeRoutes(saved, [], now);
+  if (!canonical) return kept;
+  return [
+    { route: canonical, seen: now },
+    ...kept.filter((entry) => entry.route !== canonical),
+  ].slice(0, MAX_SAVED_ROUTES);
 }
 
 // ---------------------------------------------------------------- racing

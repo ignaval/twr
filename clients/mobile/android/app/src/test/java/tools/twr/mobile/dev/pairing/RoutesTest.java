@@ -107,6 +107,18 @@ public class RoutesTest {
     }
 
     @Test
+    public void aConnectionAfterAMonthAwayKeepsTheOtherRoutes() {
+        SavedRoutes saved = new SavedRoutes();
+        saved.merge(Arrays.asList("tls:192.168.1.20:47321", "tls:box.tail1234.ts.net:47321"), 0);
+        saved.connected(Route.parse("tls:box.tail1234.ts.net:47321"), NetworkType.CELLULAR, 40 * DAY);
+        assertEquals(Arrays.asList("tls:192.168.1.20:47321", "tls:box.tail1234.ts.net:47321"), saved.routes());
+        assertEquals("tls:box.tail1234.ts.net:47321", saved.lastByNetwork().get("cellular"));
+        // The hello then reports what the gateway has now; the LAN route it no longer has goes.
+        saved.merge(Collections.singletonList("tls:box.tail1234.ts.net:47321"), 40 * DAY);
+        assertEquals(Collections.singletonList("tls:box.tail1234.ts.net:47321"), saved.routes());
+    }
+
+    @Test
     public void planRemembersPerNetworkAndSkipsTheLanOnCellular() {
         SavedRoutes saved = new SavedRoutes();
         saved.merge(Arrays.asList("tls:box.example.com:47321", "tls:192.168.1.20:47321", "relay:later", "tls:[fd00::7]:47321", "tls:100.101.102.103:47321"), 1000);

@@ -285,10 +285,12 @@ enum RouteBook {
         routes.map { ["route": $0.route, "seen": $0.seen] }
     }
 
-    /// `incoming` (an invitation's routes, a winning route, or what the gateway's hello
-    /// reports) marked seen `now` and merged into `saved`, keeping the saved order and adding
-    /// new routes at the end; then the expired dropped, and past the limit the least recently
-    /// seen.
+    /// `incoming` (an invitation's routes, or what the gateway's hello reports) marked seen
+    /// `now` and merged into `saved`, keeping the saved order and adding new routes at the
+    /// end; then the expired dropped, and past the limit the least recently seen.
+    ///
+    /// "Expired" counts back from the newest sighting of any of the hub's routes, not from
+    /// today: a phone left unused for a month keeps its routes.
     static func merge(_ saved: [SavedRoute], _ incoming: [String], now: Double) -> [SavedRoute] {
         var routes: [SavedRoute] = []
         var known = Set<String>()
@@ -301,14 +303,33 @@ enum RouteBook {
                 routes.append(SavedRoute(route: route, seen: now))
             }
         }
-        routes.removeAll { now - $0.seen > lifetime }
-        if routes.count > limit {
-            let keep = Set(routes.indices.sorted { a, b in
-                routes[a].seen != routes[b].seen ? routes[a].seen > routes[b].seen : a < b
-            }.prefix(limit))
-            routes = routes.indices.filter { keep.contains($0) }.map { routes[$0] }
+        if let newest = routes.map(\.seen).max() {
+            routes.removeAll { newest - $0.seen > lifetime }
         }
-        return routes
+        return trimmed(routes)
+    }
+
+    /// `winner` connected `now`: it is seen now, and the others age from the newest sighting
+    /// before this one. A connection after a month away keeps the other routes; the routes
+    /// the gateway's hello reports then refresh the ones it still has.
+    static func connected(_ saved: [SavedRoute], _ winner: String, now: Double) -> [SavedRoute] {
+        var routes = merge(saved, [], now: now)
+        guard let route = PairingRoute(winner)?.text else { return routes }
+        if let index = routes.firstIndex(where: { $0.route == route }) {
+            routes[index].seen = max(routes[index].seen, now)
+        } else {
+            routes.append(SavedRoute(route: route, seen: now))
+        }
+        return trimmed(routes)
+    }
+
+    /// Past the limit, the least recently seen go; among equals, the one listed last.
+    private static func trimmed(_ routes: [SavedRoute]) -> [SavedRoute] {
+        guard routes.count > limit else { return routes }
+        let keep = Set(routes.indices.sorted { a, b in
+            routes[a].seen != routes[b].seen ? routes[a].seen > routes[b].seen : a < b
+        }.prefix(limit))
+        return routes.indices.filter { keep.contains($0) }.map { routes[$0] }
     }
 
     struct RaceEntry: Equatable {

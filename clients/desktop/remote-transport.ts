@@ -19,6 +19,7 @@ import {
   parseAddress,
   raceRoutes,
   racePlan,
+  rememberRoute,
   routeUrl,
   type NetworkType,
   type SeenRoute,
@@ -570,15 +571,10 @@ export class DesktopTransport {
       const all = await this.all();
       const hub = all[id];
       if (!hub?.pin) return;
-      const routes = mergeRoutes(hub.routes || [], []).map((entry) =>
-        entry.route === route ? { ...entry, seen: Date.now() } : entry,
-      );
       all[id] = {
         ...hub,
         url: routeUrl(route),
-        routes: routes.some((entry) => entry.route === route)
-          ? routes
-          : mergeRoutes(routes, [route]),
+        routes: rememberRoute(hub.routes || [], route),
         last: { ...hub.last, [this.lastKey()]: route },
       };
       await this.vault.write("remote-hubs", JSON.stringify(all));

@@ -138,6 +138,24 @@ final class PairingLogicTests: XCTestCase {
         XCTAssertEqual(RouteBook.decode(RouteBook.encode(capped)), capped)
     }
 
+    func testRouteExpiryCountsFromTheNewestSighting() {
+        let day = 24 * 60 * 60 * 1000.0
+        let now = 100 * day
+        let away = now - 40 * day
+        let saved = [SavedRoute(route: "tls:a.example:1", seen: away),
+                     SavedRoute(route: "tls:b.example:1", seen: away - 30 * day),
+                     SavedRoute(route: "tls:c.example:1", seen: away - 30 * day - 1)]
+        XCTAssertEqual(RouteBook.merge(saved, [], now: now).map(\.route), ["tls:a.example:1", "tls:b.example:1"],
+                       "a phone left unused for 40 days keeps what it knew")
+        XCTAssertEqual(RouteBook.connected(saved, "tls:B.example:1", now: now),
+                       [SavedRoute(route: "tls:a.example:1", seen: away), SavedRoute(route: "tls:b.example:1", seen: now)],
+                       "a connection refreshes the winner and ages nothing else")
+        XCTAssertEqual(RouteBook.connected(saved, "tls:new.example:1", now: now).map(\.route),
+                       ["tls:a.example:1", "tls:b.example:1", "tls:new.example:1"])
+        XCTAssertEqual(RouteBook.merge(saved, ["tls:a.example:1"], now: now).map(\.route), ["tls:a.example:1"],
+                       "what the gateway reports now is the newest sighting")
+    }
+
     func testRacePlanStartsTheRememberedRouteFirst() {
         let routes = ["tls:192.168.1.20:47321", "tls:[2001:db8::5]:47321", "tls:box.tail1234.ts.net:47321", "relay:x", "tls:box.local:47321"]
         let plan = RouteBook.racePlan(routes, remembered: "tls:box.tail1234.ts.net:47321", cellular: false)

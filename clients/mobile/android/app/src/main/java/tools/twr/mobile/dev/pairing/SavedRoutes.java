@@ -75,12 +75,17 @@ public final class SavedRoutes {
         lastRoute = route;
     }
 
-    /** {@code winner} connected on {@code network}: it becomes {@code last} there and is seen now. */
+    /**
+     * {@code winner} connected on {@code network}: it becomes {@code last} there and is seen now.
+     * The others age from the newest sighting before this one, so a connection after a month
+     * away keeps them; the routes the gateway's hello reports then refresh the ones it still has.
+     */
     public void connected(Route winner, NetworkType network, long now) {
+        long before = entries.isEmpty() ? now : newest();
         see(winner.toString(), now);
         last.put(network.lastKey(), winner.toString());
         lastRoute = winner.toString();
-        prune();
+        prune(before);
     }
 
     private void see(String canonical, long now) {
@@ -100,8 +105,17 @@ public final class SavedRoutes {
      * the hub, so a phone that stayed away for a month still knows where to look.
      */
     public void prune() {
+        prune(entries.isEmpty() ? 0 : newest());
+    }
+
+    private long newest() {
         long newest = Long.MIN_VALUE;
         for (Entry entry : entries) newest = Math.max(newest, entry.seen);
+        return newest;
+    }
+
+    /** Drops routes seen more than 30 days before {@code newest}, then applies the limit. */
+    private void prune(long newest) {
         for (Iterator<Entry> it = entries.iterator(); it.hasNext(); ) {
             if (it.next().seen < newest - EXPIRY_MILLIS) it.remove();
         }

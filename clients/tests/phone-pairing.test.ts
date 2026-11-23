@@ -20,6 +20,7 @@ import {
   parseRoute,
   racePlan,
   raceRoutes,
+  rememberRoute,
   type InvitationV2,
 } from "../shared/phone-pairing";
 import { invitationText, parseInvitation } from "../shared/connections";
@@ -435,11 +436,12 @@ describe("saved routes", () => {
         [
           { route: "tls:stale.example:1", seen: now - ROUTE_TTL - 1 },
           { route: "tls:fresh.example:1", seen: now - ROUTE_TTL },
+          { route: "tls:recent.example:1", seen: now },
         ],
         [],
         now,
       ).map((entry) => entry.route),
-    ).toEqual(["tls:fresh.example:1"]);
+    ).toEqual(["tls:recent.example:1", "tls:fresh.example:1"]);
     const saved = Array.from({ length: 12 }, (_, i) => ({
       route: `tls:saved${i}.example:1`,
       seen: now - i * 1000,
@@ -453,6 +455,32 @@ describe("saved routes", () => {
     expect(merged.slice(0, 8).map((entry) => entry.route)).toEqual(reported);
     // The oldest saved ones go first.
     expect(merged.at(-1)?.route).toBe("tls:saved7.example:1");
+  });
+  it("counts 30 days back from the newest sighting, not from today", () => {
+    const month = now - 40 * 86400_000;
+    const saved = [
+      { route: "tls:a.example:1", seen: month },
+      { route: "tls:b.example:1", seen: month - ROUTE_TTL },
+      { route: "tls:c.example:1", seen: month - ROUTE_TTL - 1 },
+    ];
+    // A phone left unused for 40 days keeps what it knew.
+    expect(mergeRoutes(saved, [], now).map((entry) => entry.route)).toEqual([
+      "tls:a.example:1",
+      "tls:b.example:1",
+    ]);
+    // A connection refreshes the winner and ages nothing else.
+    expect(rememberRoute(saved, "tls:b.example:1", now)).toEqual([
+      { route: "tls:b.example:1", seen: now },
+      { route: "tls:a.example:1", seen: month },
+    ]);
+    expect(
+      rememberRoute(saved, "tls:New.example:1", now).map((e) => e.route),
+    ).toEqual(["tls:new.example:1", "tls:a.example:1", "tls:b.example:1"]);
+    // What the gateway reports now is the newest sighting: the routes it no longer
+    // has, unseen for 30 days before that, go.
+    expect(
+      mergeRoutes(saved, ["tls:a.example:1"], now).map((entry) => entry.route),
+    ).toEqual(["tls:a.example:1"]);
   });
   it("keeps unknown route kinds", () => {
     expect(mergeRoutes([], ["relay:x"], now)).toEqual([

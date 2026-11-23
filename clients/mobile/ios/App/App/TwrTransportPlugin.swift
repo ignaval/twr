@@ -399,7 +399,7 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
                 guard isCurrent(generation: generation) else { call.reject("Connection was superseded"); return }
                 try? updateHub(id) { saved in
                     let now = Date().timeIntervalSince1970 * 1000
-                    saved["routes"] = RouteBook.encode(RouteBook.merge(RouteBook.decode(saved["routes"]), [found.route.text], now: now))
+                    saved["routes"] = RouteBook.encode(RouteBook.connected(RouteBook.decode(saved["routes"]), found.route.text, now: now))
                     var last = (saved["last"] as? [String: String]) ?? [:]
                     last[slot] = found.route.text
                     saved["last"] = last
