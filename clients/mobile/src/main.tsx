@@ -29,7 +29,22 @@ import {
 import { mobileVoice } from "./voice";
 import { observeLayout } from "./layout";
 import { observeTextScale, secureDelete } from "./offline";
-import { parseInvitation } from "../../shared/connections";
+import { parseInvitation, type Invitation } from "../../shared/connections";
+import {
+  invitationAddresses,
+  invitationCode,
+  invitationHubName,
+  pairErrorText,
+  requestFromAddress,
+  requestFromInvitation,
+} from "../../shared/pair-form";
+import {
+  LINK_PREFIX,
+  displayCode,
+  displayRoute,
+  looksLikeInvitation,
+} from "../../shared/phone-pairing";
+import { HubKeyDetails } from "../../shared/HubKey";
 import {
   notificationListeners,
   clearDeliveredNotifications,
@@ -54,16 +69,30 @@ function Mobile() {
   const [error, setError] = useState("");
   const [pairing, setPairing] = useState(false);
   const [pairName, setPairName] = useState("");
-  const [scanned, setScanned] = useState<{
-    url: string;
-    code: string;
-    expiresAt?: number;
-  }>();
+  // A scanned, pasted or opened invitation. Version 2 pairs by its key; version 1 fills
+  // the address and code fields like typing them.
+  const [scanned, setScanned] = useState<Invitation>();
+  const [pairAddress, setPairAddress] = useState("");
+  const [pairCode, setPairCode] = useState("");
+  // An invitation a twr://pair# link opened, waiting for the pairing form.
+  const [incoming, setIncoming] = useState<Invitation>();
+  const [sheetHub, setSheetHub] = useState<Hub>();
   const [pairingNow, setPairingNow] = useState(Date.now());
+  /** Takes in an invitation: the form shows it and pairs with it. */
+  function loadInvitation(value: Invitation) {
+    setScanned(value);
+    setPairName((name) => name || invitationHubName(value));
+    if (value.version !== 2) {
+      setPairAddress(value.url);
+      setPairCode(value.code);
+    }
+  }
   useEffect(() => {
     if (!pairing) {
       setScanned(undefined);
       setPairName("");
+      setPairAddress("");
+      setPairCode("");
       return;
     }
     if (!scanned?.expiresAt) return;
@@ -239,6 +268,45 @@ function Mobile() {
       void listener.then((handle) => handle.remove());
     };
   }, []);
+  useEffect(() => {
+    // A twr://pair# link (the system camera, a tapped link) opens the pairing form with
+    // its invitation. The secret is in the fragment; nothing is sent until Pair.
+    const open = (url: string | undefined) => {
+      if (!url?.startsWith(LINK_PREFIX)) return;
+      try {
+        setIncoming(parseInvitation(url));
+      } catch (error) {
+        setError(pairErrorText(error));
+      }
+    };
+    void NativeApp.getLaunchUrl()
+      .then((launch) => open(launch?.url))
+      .catch(() => {});
+    const listener = NativeApp.addListener("appUrlOpen", ({ url }) =>
+      open(url),
+    );
+    return () => {
+      void listener.then((handle) => handle.remove());
+    };
+  }, []);
+  useEffect(() => {
+    if (!incoming) return;
+    const value = incoming;
+    setIncoming(undefined);
+    void (async () => {
+      const current = activeHub.current;
+      if (current) {
+        const { value: leave } = await NativeDialog.confirm({
+          title: `Pair with ${invitationHubName(value)}?`,
+          message: `This leaves ${current.name}. You can switch back from the hub list.`,
+        });
+        if (!leave) return;
+        await disconnect();
+      }
+      setPairing(true);
+      loadInvitation(value);
+    })().catch((error) => setError(errorMessage(error)));
+  }, [incoming]);
   /** An explicit disconnect (Switch hub): the next launch opens the hub list. */
   async function disconnect() {
     rememberLastHub(undefined);
@@ -380,23 +448,37 @@ function Mobile() {
   async function pair(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
+    const names = {
+      name: String(data.get("name")),
+      hubName: String(data.get("hubName")),
+    };
     setBusy(true);
     setError("");
     try {
-      const hub = await Transport.pair({
-        url: String(data.get("url")),
-        code: String(data.get("code")).trim(),
-        name: String(data.get("name")),
-        hubName: String(data.get("hubName")),
-      });
+      // A version 2 invitation pairs by its key; typed details by the address: an
+      // https:// URL in certificate mode, a host or IP address by the pairing proof.
+      const hub = await Transport.pair(
+        scanned?.version === 2
+          ? requestFromInvitation(scanned, names)
+          : requestFromAddress(pairAddress, pairCode, names),
+      );
       await load();
       setPairing(false);
       await connect(hub);
     } catch (e) {
-      setError(errorMessage(e));
+      setError(pairErrorText(e));
     } finally {
       setBusy(false);
     }
+  }
+  /** The hub sheet shows the saved hub as it is now: the route in use changes. */
+  function openHubSheet() {
+    setSheetHub(undefined);
+    setHubSheet(true);
+    const id = activeHub.current?.id;
+    void Transport.listHubs()
+      .then(({ hubs }) => setSheetHub(hubs.find((hub) => hub.id === id)))
+      .catch(() => {});
   }
   return active ? (
     <>
@@ -417,7 +499,7 @@ function Mobile() {
         headerAccessory={
           <button
             className="mobile-hub-switch"
-            onClick={() => setHubSheet(true)}
+            onClick={openHubSheet}
             aria-label={`Remote hub settings: ${active.name}${link === "online" ? "" : ` (${link})`}`}
           >
             <span className={`status-dot ${link}`} aria-hidden="true" />
@@ -430,13 +512,18 @@ function Mobile() {
       {hubSheet && (
         <Dialog
           title={active.name}
-          subtitle={active.url}
+          subtitle={
+            (sheetHub ?? active).pin && (sheetHub ?? active).route
+              ? displayRoute((sheetHub ?? active).route!)
+              : active.url
+          }
           onClose={() => setHubSheet(false)}
         >
           <div className="mobile-hub-sheet">
             <p className="form-note">
               Device access: {active.scopes.join(" · ")}
             </p>
+            <HubKeyDetails hub={sheetHub ?? active} />
             <section className="mobile-appearance">
               <h3 id="hub-appearance-title">Appearance</h3>
               <AppearanceOptions labelledBy="hub-appearance-title" />
@@ -617,12 +704,15 @@ function Mobile() {
             onClick={() => void connect(hub)}
           >
             <b>{hub.name}</b>
-            <small>{hub.url}</small>
+            <small>
+              {hub.pin && hub.route ? displayRoute(hub.route) : hub.url}
+            </small>
             <span>Connect →</span>
           </button>
           <details>
             <summary>Device access</summary>
             <p>{hub.scopes.join(" · ")}</p>
+            <HubKeyDetails hub={hub} />
             <button disabled={busy} onClick={() => void forget(hub)}>
               Forget this hub
             </button>
@@ -644,8 +734,8 @@ function Mobile() {
         <form className="pair-form" onSubmit={pair}>
           <h2>Connect to your hub</h2>
           <p>
-            Start pairing from your computer, then enter its address and one-use
-            code.
+            Start pairing on your computer, then scan its QR code, or enter its
+            address and one-use code.
           </p>
           <button
             type="button"
@@ -654,13 +744,11 @@ function Mobile() {
               setBusy(true);
               setError("");
               void Transport.scanInvitation()
-                .then(({ invitation }) => {
-                  const value = parseInvitation(invitation);
-                  setScanned(value);
-                  setPairName((name) => name || new URL(value.url).hostname);
-                })
+                .then(({ invitation }) =>
+                  loadInvitation(parseInvitation(invitation)),
+                )
                 .catch((e) => {
-                  if (e?.code !== "SCAN_CANCELLED") setError(errorMessage(e));
+                  if (e?.code !== "SCAN_CANCELLED") setError(pairErrorText(e));
                 })
                 .finally(() => setBusy(false));
             }}
@@ -678,43 +766,75 @@ function Mobile() {
               placeholder="My workstation"
             />
           </label>
-          <label>
-            Hub URL
-            <input
-              name="url"
-              value={scanned?.url ?? ""}
-              onChange={(e) =>
-                setScanned((old) => ({
-                  ...old,
-                  url: e.target.value,
-                  code: old?.code || "",
-                }))
-              }
-              required
-              type="url"
-              autoCapitalize="none"
-              autoCorrect="off"
-              placeholder="https://workstation.example:47321"
-            />
-          </label>
-          <label>
-            Pairing code
-            <input
-              name="code"
-              value={scanned?.code ?? ""}
-              onChange={(e) =>
-                setScanned((old) => ({
-                  url: old?.url || "",
-                  code: e.target.value,
-                }))
-              }
-              required
-              autoCapitalize="none"
-              autoCorrect="off"
-              autoComplete="off"
-              spellCheck={false}
-            />
-          </label>
+          {scanned?.version === 2 ? (
+            <div className="pair-scanned" role="group" aria-label="Invitation">
+              <p>
+                Invitation from <b>{scanned.name || pairName}</b> · code{" "}
+                <code>{invitationCode(scanned)}</code>
+              </p>
+              <p className="form-note">
+                Tries{" "}
+                {invitationAddresses(scanned).map(displayRoute).join(", ")}, and
+                checks the hub's key on each.
+              </p>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => setScanned(undefined)}
+              >
+                Enter an address instead
+              </button>
+            </div>
+          ) : (
+            <>
+              <label>
+                Hub address
+                <input
+                  name="address"
+                  value={pairAddress}
+                  onChange={(e) => {
+                    const text = e.target.value;
+                    // A pasted invitation link or JSON is taken in whole.
+                    if (looksLikeInvitation(text)) {
+                      try {
+                        loadInvitation(parseInvitation(text));
+                        return;
+                      } catch (error) {
+                        setError(pairErrorText(error));
+                      }
+                    }
+                    setScanned(undefined);
+                    setPairAddress(text);
+                  }}
+                  required
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  inputMode="url"
+                  placeholder="192.168.1.20 or workstation.local"
+                />
+                <small className="form-note">
+                  A name or IP address, with :port if it isn't 47321. For a hub
+                  with its own certificate, its https:// address.
+                </small>
+              </label>
+              <label>
+                Pairing code
+                <input
+                  name="code"
+                  value={pairCode}
+                  onChange={(e) => setPairCode(e.target.value)}
+                  onBlur={() => setPairCode((code) => displayCode(code.trim()))}
+                  required
+                  autoCapitalize="characters"
+                  autoCorrect="off"
+                  autoComplete="off"
+                  spellCheck={false}
+                  placeholder="ABCD-EFGH-JK23"
+                />
+              </label>
+            </>
+          )}
           {scanned?.expiresAt && (
             <p role="status">
               {scanned.expiresAt > pairingNow

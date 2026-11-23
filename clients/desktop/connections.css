@@ -177,3 +177,24 @@
   max-height: 30vh;
   overflow: auto;
 }
+.connection-form label.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.connection-form label.checkbox-row input {
+  width: auto;
+  min-height: 0;
+}
+.gateway-key {
+  overflow-wrap: anywhere;
+}
+.gateway-key code {
+  user-select: all;
+}
+.gateway-key ul,
+.invitation-routes {
+  margin: 4px 0;
+  padding-left: 20px;
+  text-align: left;
+}

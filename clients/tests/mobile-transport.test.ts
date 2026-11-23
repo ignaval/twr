@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 const fake = vi.hoisted(() => ({
   listener: undefined as any,
+  network: undefined as any,
+  updateRoutes: vi.fn(async () => {}),
   connect: vi.fn(),
   send: vi.fn(),
   disconnect: vi.fn(async () => {}),
@@ -25,8 +27,9 @@ function reply(id: string, result: any) {
 beforeEach(() => {
   vi.clearAllMocks();
   fake.connect.mockResolvedValue(undefined);
-  fake.addListener.mockImplementation(async (_name, listener) => {
-    fake.listener = listener;
+  fake.addListener.mockImplementation(async (name, listener) => {
+    if (name === "network") fake.network = listener;
+    else fake.listener = listener;
     return { remove: async () => {} };
   });
   fake.send.mockImplementation(async ({ message }) => {
