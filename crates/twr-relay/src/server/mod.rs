@@ -36,11 +36,17 @@ struct Deny {
     hubs: HashSet<String>,
     endpoints: HashSet<[u8; 32]>,
     prefixes: Vec<Prefix>,
+    /// `limits.exempt_addresses`.
+    exempt: Vec<Prefix>,
 }
 
 impl Deny {
     fn ip(&self, ip: IpAddr) -> bool {
         self.prefixes.iter().any(|p| p.contains(ip))
+    }
+
+    fn exempt(&self, ip: IpAddr) -> bool {
+        self.exempt.iter().any(|p| p.contains(ip))
     }
 }
 
@@ -135,12 +141,21 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    /// Whether a per-address limit allows `ip` one more event.
+    fn allow(&self, limiter: &PerIp, ip: IpAddr) -> bool {
+        self.deny.exempt(ip) || limiter.allow(ip)
+    }
+
     fn hub(&self, name: &str) -> Option<Arc<Hub>> {
         self.hubs.lock().unwrap().get(name).cloned()
     }
 
     fn base_url(&self) -> String {
-        let host = if self.public_host.contains(':') { format!("[{}]", self.public_host) } else { self.public_host.clone() };
+        let host = if self.public_host.contains(':') {
+            format!("[{}]", self.public_host)
+        } else {
+            self.public_host.clone()
+        };
         match self.public_port {
             443 => format!("https://{host}"),
             p => format!("https://{host}:{p}"),
@@ -184,10 +199,19 @@ pub struct Running {
 impl Running {
     /// The URL hubs use for this relay (§3.4).
     pub fn relay_url(&self) -> crate::RelayUrl {
-        let host = self.shared.own_host.clone().unwrap_or_else(|| self.shared.public_host.clone());
-        let host_text = if host.contains(':') { format!("[{host}]") } else { host };
-        let mut url = crate::RelayUrl::parse(&format!("relay://{host_text}:{}", self.shared.public_port))
-            .expect("the relay's own address parses");
+        let host = self
+            .shared
+            .own_host
+            .clone()
+            .unwrap_or_else(|| self.shared.public_host.clone());
+        let host_text = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host
+        };
+        let mut url =
+            crate::RelayUrl::parse(&format!("relay://{host_text}:{}", self.shared.public_port))
+                .expect("the relay's own address parses");
         url.pin = self.self_pin;
         url
     }
@@ -216,11 +240,20 @@ impl Running {
         let sessions: Vec<_> = {
             let hubs = self.shared.hubs.lock().unwrap();
             hubs.values()
-                .filter_map(|h| h.session.lock().unwrap().as_ref().map(|s| (s.out.clone(), s.cancel.clone())))
+                .filter_map(|h| {
+                    h.session
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|s| (s.out.clone(), s.cancel.clone()))
+                })
                 .collect()
         };
         for (out, _) in &sessions {
-            let _ = out.try_send(proto::Msg::Drain { reason: "restart".into(), retry_after_seconds: 30 });
+            let _ = out.try_send(proto::Msg::Drain {
+                reason: "restart".into(),
+                retry_after_seconds: 30,
+            });
         }
         if !sessions.is_empty() {
             // Give hubs a moment to move; they reconnect elsewhere on drain.
@@ -230,7 +263,10 @@ impl Running {
         if let Some(i) = &self.shared.iroh {
             i.shutdown().await;
         }
-        let _ = tokio::time::timeout(Duration::from_secs(10), async { while self.tasks.join_next().await.is_some() {} }).await;
+        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+            while self.tasks.join_next().await.is_some() {}
+        })
+        .await;
         self.tasks.abort_all();
         if let Err(e) = self.shared.state.save() {
             tracing::warn!("saving state: {e:#}");
@@ -250,15 +286,34 @@ pub async fn start(cfg: Config, version: &str) -> Result<Running> {
     let state = Arc::new(State::load(&cfg.relay.state_dir)?);
     let deny = Arc::new(Deny {
         hubs: cfg.deny.hubs.iter().cloned().collect(),
-        endpoints: cfg.deny.endpoints.iter().filter_map(|e| crate::admit::parse_endpoint(e)).collect(),
-        prefixes: cfg.deny.addresses.iter().map(|a| Prefix::parse(a)).collect::<Result<_>>()?,
+        endpoints: cfg
+            .deny
+            .endpoints
+            .iter()
+            .filter_map(|e| crate::admit::parse_endpoint(e))
+            .collect(),
+        prefixes: cfg
+            .deny
+            .addresses
+            .iter()
+            .map(|a| Prefix::parse(a))
+            .collect::<Result<_>>()?,
+        exempt: cfg
+            .limits
+            .exempt_addresses
+            .iter()
+            .map(|a| Prefix::parse(a))
+            .collect::<Result<_>>()?,
     });
 
     let mut main = Vec::new();
     for addr in &cfg.relay.listen {
         main.push(bind(*addr).await?);
     }
-    let addrs: Vec<SocketAddr> = main.iter().map(|l| l.local_addr()).collect::<std::io::Result<_>>()?;
+    let addrs: Vec<SocketAddr> = main
+        .iter()
+        .map(|l| l.local_addr())
+        .collect::<std::io::Result<_>>()?;
     let public_port = cfg.relay.public_port.unwrap_or(addrs[0].port());
     let public_host = cfg.public_host();
 
@@ -288,7 +343,11 @@ pub async fn start(cfg: Config, version: &str) -> Result<Running> {
         })
     } else {
         iroh_addr.map(|a| {
-            let host = if public_host.contains(':') { format!("[{public_host}]") } else { public_host.clone() };
+            let host = if public_host.contains(':') {
+                format!("[{public_host}]")
+            } else {
+                public_host.clone()
+            };
             format!("https://{host}:{}/", a.port())
         })
     };
@@ -300,17 +359,32 @@ pub async fn start(cfg: Config, version: &str) -> Result<Running> {
     let quic_addr = iroh.as_ref().and_then(|i| i.quic_addr());
 
     let limits = Limiters {
-        phone_attempts: PerIp::new(cfg.limits.phone_attempts_per_ip_per_minute, Duration::from_secs(60)),
-        record_puts: PerIp::new(cfg.limits.record_puts_per_ip_per_minute, Duration::from_secs(60)),
-        pairing_admits: PerIp::new(cfg.limits.pairing_admissions_per_ip_per_hour, Duration::from_secs(3600)),
-        pair_admits: PerIp::new(cfg.limits.pair_admissions_per_ip_per_hour, Duration::from_secs(3600)),
+        phone_attempts: PerIp::new(
+            cfg.limits.phone_attempts_per_ip_per_minute,
+            Duration::from_secs(60),
+        ),
+        record_puts: PerIp::new(
+            cfg.limits.record_puts_per_ip_per_minute,
+            Duration::from_secs(60),
+        ),
+        pairing_admits: PerIp::new(
+            cfg.limits.pairing_admissions_per_ip_per_hour,
+            Duration::from_secs(3600),
+        ),
+        pair_admits: PerIp::new(
+            cfg.limits.pair_admissions_per_ip_per_hour,
+            Duration::from_secs(3600),
+        ),
         hub_names: Mutex::default(),
     };
     let metrics_listener = match cfg.relay.metrics_listen {
         Some(a) => Some(bind(a).await?),
         None => None,
     };
-    let metrics_addr = metrics_listener.as_ref().map(|l| l.local_addr()).transpose()?;
+    let metrics_addr = metrics_listener
+        .as_ref()
+        .map(|l| l.local_addr())
+        .transpose()?;
 
     let shared = Arc::new(Shared {
         suffixes: cfg.phone_suffixes(),
@@ -353,14 +427,29 @@ pub async fn start(cfg: Config, version: &str) -> Result<Running> {
     }
     tasks.spawn(housekeeping(shared.clone()));
 
-    Ok(Running { addrs, port_addrs, iroh_addr, quic_addr, metrics_addr, self_pin, shared, tasks })
+    Ok(Running {
+        addrs,
+        port_addrs,
+        iroh_addr,
+        quic_addr,
+        metrics_addr,
+        self_pin,
+        shared,
+        tasks,
+    })
 }
 
 async fn bind(addr: SocketAddr) -> Result<TcpListener> {
-    let socket = if addr.is_ipv6() { tokio::net::TcpSocket::new_v6()? } else { tokio::net::TcpSocket::new_v4()? };
+    let socket = if addr.is_ipv6() {
+        tokio::net::TcpSocket::new_v6()?
+    } else {
+        tokio::net::TcpSocket::new_v4()?
+    };
     socket.set_reuseaddr(true)?;
     // `[::]` also takes IPv4 under Linux's default `net.ipv6.bindv6only = 0`.
-    socket.bind(addr).with_context(|| format!("binding {addr}"))?;
+    socket
+        .bind(addr)
+        .with_context(|| format!("binding {addr}"))?;
     Ok(socket.listen(1024)?)
 }
 
@@ -376,11 +465,18 @@ async fn housekeeping(shared: Arc<Shared>) {
             _ = tick.tick() => {}
         }
         let t = now();
-        let n = shared.records.sweep(t, shared.cfg.limits.record_ttl_seconds);
+        let n = shared
+            .records
+            .sweep(t, shared.cfg.limits.record_ttl_seconds);
         shared.counters.records_stored.store(n as i64, Relaxed);
         let a = shared.state.sweep(t);
         shared.counters.iroh_admitted.store(a as i64, Relaxed);
-        for l in [&shared.limits.phone_attempts, &shared.limits.record_puts, &shared.limits.pairing_admits, &shared.limits.pair_admits] {
+        for l in [
+            &shared.limits.phone_attempts,
+            &shared.limits.record_puts,
+            &shared.limits.pairing_admits,
+            &shared.limits.pair_admits,
+        ] {
             l.sweep();
         }
         {
@@ -415,7 +511,14 @@ async fn metrics_loop(shared: Arc<Shared>, listener: TcpListener) {
                 let s = s.clone();
                 async move {
                     let (status, body) = if req.uri().path() == "/metrics" {
-                        (200, s.counters.render(&s.version, s.started.elapsed().as_secs(), now() as i64))
+                        (
+                            200,
+                            s.counters.render(
+                                &s.version,
+                                s.started.elapsed().as_secs(),
+                                now() as i64,
+                            ),
+                        )
                     } else {
                         (404, "not found\n".to_string())
                     };

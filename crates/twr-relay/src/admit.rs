@@ -19,8 +19,20 @@ pub const MAX_BODY: usize = 4096;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Admission {
-    Pairing { v: u32, endpoint: String, issued: u64, sig: String },
-    Pair { v: u32, a: String, b: String, expires: u64, sig_a: String, sig_b: String },
+    Pairing {
+        v: u32,
+        endpoint: String,
+        issued: u64,
+        sig: String,
+    },
+    Pair {
+        v: u32,
+        a: String,
+        b: String,
+        expires: u64,
+        sig_a: String,
+        sig_b: String,
+    },
 }
 
 /// The bytes an endpoint signs for a pairing admission.
@@ -51,12 +63,22 @@ fn endpoint_of(key: &IdentityKey) -> Result<[u8; 32]> {
 pub fn sign_pairing(key: &IdentityKey, issued: u64) -> Result<Admission> {
     let ep = endpoint_of(key)?;
     let sig = key.sign(&pairing_message(&ep, issued))?;
-    Ok(Admission::Pairing { v: 1, endpoint: hex::encode(ep), issued, sig: names::b64(&sig) })
+    Ok(Admission::Pairing {
+        v: 1,
+        endpoint: hex::encode(ep),
+        issued,
+        sig: names::b64(&sig),
+    })
 }
 
 /// One side's signature for a pair admission of endpoints `a` and `b`. Each side signs with
 /// its own key; [`pair_admission`] puts the two together.
-pub fn sign_pair_half(key: &IdentityKey, a: &[u8; 32], b: &[u8; 32], expires: u64) -> Result<String> {
+pub fn sign_pair_half(
+    key: &IdentityKey,
+    a: &[u8; 32],
+    b: &[u8; 32],
+    expires: u64,
+) -> Result<String> {
     let me = endpoint_of(key)?;
     if &me != a && &me != b {
         bail!("this key is neither endpoint of the pair");
@@ -64,8 +86,21 @@ pub fn sign_pair_half(key: &IdentityKey, a: &[u8; 32], b: &[u8; 32], expires: u6
     Ok(names::b64(&key.sign(&pair_message(a, b, expires))?))
 }
 
-pub fn pair_admission(a: &[u8; 32], b: &[u8; 32], expires: u64, sig_a: String, sig_b: String) -> Admission {
-    Admission::Pair { v: 1, a: hex::encode(a), b: hex::encode(b), expires, sig_a, sig_b }
+pub fn pair_admission(
+    a: &[u8; 32],
+    b: &[u8; 32],
+    expires: u64,
+    sig_a: String,
+    sig_b: String,
+) -> Admission {
+    Admission::Pair {
+        v: 1,
+        a: hex::encode(a),
+        b: hex::encode(b),
+        expires,
+        sig_a,
+        sig_b,
+    }
 }
 
 /// What a verified admission admits: endpoints and the time they're admitted until.
@@ -101,7 +136,12 @@ pub fn verify(body: &[u8], now: u64) -> std::result::Result<Admitted, Refused> {
     let adm: Admission = serde_json::from_slice(body).map_err(|_| Refused::BadRequest)?;
     let sig = |s: &str| names::unb64(s).ok_or(Refused::BadRequest);
     match adm {
-        Admission::Pairing { v, endpoint, issued, sig: s } => {
+        Admission::Pairing {
+            v,
+            endpoint,
+            issued,
+            sig: s,
+        } => {
             if v != 1 {
                 return Err(Refused::BadRequest);
             }
@@ -112,9 +152,20 @@ pub fn verify(body: &[u8], now: u64) -> std::result::Result<Admitted, Refused> {
             if !keys::verify_ed25519(&ep, &pairing_message(&ep, issued), &sig(&s)?) {
                 return Err(Refused::BadSignature);
             }
-            Ok(Admitted { endpoints: vec![ep], until: now + PAIRING_SECS, pairing: true })
+            Ok(Admitted {
+                endpoints: vec![ep],
+                until: now + PAIRING_SECS,
+                pairing: true,
+            })
         }
-        Admission::Pair { v, a, b, expires, sig_a, sig_b } => {
+        Admission::Pair {
+            v,
+            a,
+            b,
+            expires,
+            sig_a,
+            sig_b,
+        } => {
             if v != 1 {
                 return Err(Refused::BadRequest);
             }
@@ -127,10 +178,16 @@ pub fn verify(body: &[u8], now: u64) -> std::result::Result<Admitted, Refused> {
                 return Err(Refused::Stale);
             }
             let msg = pair_message(&a, &b, expires);
-            if !keys::verify_ed25519(&a, &msg, &sig(&sig_a)?) || !keys::verify_ed25519(&b, &msg, &sig(&sig_b)?) {
+            if !keys::verify_ed25519(&a, &msg, &sig(&sig_a)?)
+                || !keys::verify_ed25519(&b, &msg, &sig(&sig_b)?)
+            {
                 return Err(Refused::BadSignature);
             }
-            Ok(Admitted { endpoints: vec![a, b], until: expires.min(now + PAIR_MAX_SECS), pairing: false })
+            Ok(Admitted {
+                endpoints: vec![a, b],
+                until: expires.min(now + PAIR_MAX_SECS),
+                pairing: false,
+            })
         }
     }
 }
@@ -182,7 +239,10 @@ mod tests {
             sign_pair_half(&a, &ea, &eb, exp).unwrap(),
             sign_pair_half(&a, &ea, &eb, exp).unwrap(),
         );
-        assert_eq!(verify(&serde_json::to_vec(&bad).unwrap(), now), Err(Refused::BadSignature));
+        assert_eq!(
+            verify(&serde_json::to_vec(&bad).unwrap(), now),
+            Err(Refused::BadSignature)
+        );
         assert_eq!(verify(b"{}", now), Err(Refused::BadRequest));
     }
 }

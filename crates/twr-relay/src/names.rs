@@ -19,7 +19,9 @@ pub fn b64(bytes: &[u8]) -> String {
 }
 
 pub fn unb64(text: &str) -> Option<Vec<u8>> {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(text).ok()
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(text)
+        .ok()
 }
 
 /// SHA-256 of a DER SubjectPublicKeyInfo (§3.1).
@@ -131,7 +133,10 @@ mod tests {
         assert_eq!(l.len(), 53);
         assert_eq!(parse_label(&l), Some((name.as_str(), t.as_str())));
         let sni = phone_sni(&name, &t, "eu.relay.twr.tools");
-        assert_eq!(split_phone_sni(&sni), Some((name.as_str(), t.as_str(), "eu.relay.twr.tools")));
+        assert_eq!(
+            split_phone_sni(&sni),
+            Some((name.as_str(), t.as_str(), "eu.relay.twr.tools"))
+        );
     }
 
     #[test]

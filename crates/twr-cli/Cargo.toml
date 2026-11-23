@@ -22,6 +22,8 @@ neural = ["dep:twr-neural", "twr-speech/neural"]
 twr-adapters.workspace = true
 twr-core.workspace = true
 twr-link.workspace = true
+# `twr relay`: the relay server (docs/relay.md).
+twr-relay = { workspace = true, features = ["server"] }
 twr-hub.workspace = true
 twr-mcp.workspace = true
 twr-runner.workspace = true

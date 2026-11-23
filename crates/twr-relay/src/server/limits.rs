@@ -36,7 +36,12 @@ pub struct Bucket {
 
 impl Bucket {
     pub fn new(rate_per_sec: f64, burst: f64) -> Self {
-        Self { rate: rate_per_sec, burst, tokens: burst, last: Instant::now() }
+        Self {
+            rate: rate_per_sec,
+            burst,
+            tokens: burst,
+            last: Instant::now(),
+        }
     }
 
     fn refill(&mut self, now: Instant) {
@@ -85,12 +90,18 @@ pub struct PerIp {
 impl PerIp {
     pub fn new(count: u32, period: Duration) -> Self {
         let count = f64::from(count.max(1));
-        Self { rate: count / period.as_secs_f64(), burst: count, buckets: Mutex::default() }
+        Self {
+            rate: count / period.as_secs_f64(),
+            burst: count,
+            buckets: Mutex::default(),
+        }
     }
 
     pub fn allow(&self, ip: IpAddr) -> bool {
         let mut b = self.buckets.lock().unwrap();
-        b.entry(IpKey::of(ip)).or_insert_with(|| Bucket::new(self.rate, self.burst)).try_take(1.0)
+        b.entry(IpKey::of(ip))
+            .or_insert_with(|| Bucket::new(self.rate, self.burst))
+            .try_take(1.0)
     }
 
     /// Drops buckets that have filled up again, which hold no state worth keeping.
@@ -120,7 +131,10 @@ impl Concurrent {
             return None;
         }
         *n += 1;
-        Some(ConcurrentGuard { owner: self.clone(), key })
+        Some(ConcurrentGuard {
+            owner: self.clone(),
+            key,
+        })
     }
 }
 
@@ -159,8 +173,11 @@ impl Prefix {
         if len > max {
             bail!("prefix length over {max}");
         }
-        let total = if v4 { len } else { len };
-        Ok(Self { addr: mask(addr, total), len: total, v4 })
+        Ok(Self {
+            addr: mask(addr, len),
+            len,
+            v4,
+        })
     }
 
     pub fn contains(&self, ip: IpAddr) -> bool {
@@ -223,9 +240,15 @@ mod tests {
         assert!(q.contains("2001:db8:ffff::1".parse().unwrap()));
         assert!(!q.contains("2001:db9::1".parse().unwrap()));
         assert!(Prefix::parse("1.2.3.4/33").is_err());
-        assert!(Prefix::parse("1.2.3.4").unwrap().contains("1.2.3.4".parse().unwrap()));
-        assert!(Prefix::parse("0.0.0.0/0").unwrap().contains("8.8.8.8".parse().unwrap()));
-        assert!(!Prefix::parse("0.0.0.0/0").unwrap().contains("2001:db8::1".parse().unwrap()));
+        assert!(Prefix::parse("1.2.3.4")
+            .unwrap()
+            .contains("1.2.3.4".parse().unwrap()));
+        assert!(Prefix::parse("0.0.0.0/0")
+            .unwrap()
+            .contains("8.8.8.8".parse().unwrap()));
+        assert!(!Prefix::parse("0.0.0.0/0")
+            .unwrap()
+            .contains("2001:db8::1".parse().unwrap()));
     }
 
     #[test]
@@ -233,6 +256,9 @@ mod tests {
         let mut b = Bucket::new(1000.0, 1000.0);
         assert_eq!(b.take(1000.0), Duration::ZERO);
         let w = b.take(500.0);
-        assert!(w > Duration::from_millis(400) && w <= Duration::from_millis(500), "{w:?}");
+        assert!(
+            w > Duration::from_millis(400) && w <= Duration::from_millis(500),
+            "{w:?}"
+        );
     }
 }

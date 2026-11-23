@@ -45,7 +45,9 @@ impl AccessControl for Admission {
         } else {
             self.counters.iroh_denied.fetch_add(1, Relaxed);
             self.counters.refuse(Refusal::IrohDenied);
-            Access::Deny { reason: Some("not admitted; see /v1/iroh/admit".into()) }
+            Access::Deny {
+                reason: Some("not admitted; see /v1/iroh/admit".into()),
+            }
         }
     }
 }
@@ -56,7 +58,10 @@ pub struct Iroh {
     quic: Option<iroh_relay::server::Server>,
 }
 
-fn empty(status: StatusCode, response: http::response::Builder) -> HyperResult<http::Response<BytesBody>> {
+fn empty(
+    status: StatusCode,
+    response: http::response::Builder,
+) -> HyperResult<http::Response<BytesBody>> {
     response
         .status(status)
         .body(Box::new(http_body_util::Full::new(Bytes::new())) as BytesBody)
@@ -64,22 +69,36 @@ fn empty(status: StatusCode, response: http::response::Builder) -> HyperResult<h
 }
 
 impl Iroh {
-    pub async fn start(cfg: &Config, certs: &Certs, state: Arc<State>, deny: Arc<Deny>, counters: Arc<Counters>) -> Result<Self> {
+    pub async fn start(
+        cfg: &Config,
+        certs: &Certs,
+        state: Arc<State>,
+        deny: Arc<Deny>,
+        counters: Arc<Counters>,
+    ) -> Result<Self> {
         let mut handlers = Handlers::default();
         handlers.insert(
             (http::Method::GET, iroh_relay::http::RELAY_PROBE_PATH),
             Box::new(|_r: Request<hyper::body::Incoming>, b| empty(StatusCode::OK, b)),
         );
-        handlers.insert((http::Method::GET, "/healthz"), Box::new(|_r: Request<hyper::body::Incoming>, b| empty(StatusCode::OK, b)));
+        handlers.insert(
+            (http::Method::GET, "/healthz"),
+            Box::new(|_r: Request<hyper::body::Incoming>, b| empty(StatusCode::OK, b)),
+        );
         handlers.insert(
             (http::Method::GET, "/generate_204"),
             Box::new(|_r: Request<hyper::body::Incoming>, b| empty(StatusCode::NO_CONTENT, b)),
         );
-        let rate = NonZeroU32::new(u32::try_from(cfg.limits.bytes_per_second).unwrap_or(u32::MAX)).ok_or_else(|| anyhow!("zero rate"))?;
+        let rate = NonZeroU32::new(u32::try_from(cfg.limits.bytes_per_second).unwrap_or(u32::MAX))
+            .ok_or_else(|| anyhow!("zero rate"))?;
         let burst = NonZeroU32::new(u32::try_from(cfg.limits.burst_bytes).unwrap_or(u32::MAX));
         let mut limit = ClientRateLimit::new(rate);
         limit.max_burst_bytes = burst;
-        let access = Arc::new(Admission { state, deny, counters });
+        let access = Arc::new(Admission {
+            state,
+            deny,
+            counters,
+        });
         let service = RelayService::new(
             handlers,
             http::HeaderMap::new(),
@@ -113,7 +132,14 @@ impl Iroh {
     }
 
     pub async fn serve(&self, tcp: TcpStream) {
-        self.service.clone().handle_connection(tcp, Some(TlsConfig::new(self.tls.clone())), Duration::from_secs(30)).await;
+        self.service
+            .clone()
+            .handle_connection(
+                tcp,
+                Some(TlsConfig::new(self.tls.clone())),
+                Duration::from_secs(30),
+            )
+            .await;
     }
 
     pub async fn shutdown(&self) {

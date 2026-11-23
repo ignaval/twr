@@ -31,6 +31,55 @@ pub struct ProbeOptions {
     pub target: Target,
     pub client: String,
     pub timeout: Duration,
+    /// Keys kept between runs, so a probe every minute is one hub and one admitted pair to
+    /// the relay, not a new one each time (which the per-address limits would refuse).
+    pub state: Option<std::path::PathBuf>,
+}
+
+/// The probe's keys: kept in `state` when given, otherwise new for this run.
+struct Keys {
+    hub: IdentityKey,
+    /// iroh endpoint seeds; with `state`, two that post a pair admission.
+    a: [u8; 32],
+    b: Option<[u8; 32]>,
+}
+
+fn load_or_make(
+    dir: &std::path::Path,
+    name: &str,
+    make: impl FnOnce() -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let path = dir.join(name);
+    match std::fs::read(&path) {
+        Ok(b) => Ok(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let b = make()?;
+            super::certs::write_private(&path, &b)?;
+            Ok(b)
+        }
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn keys(state: Option<&std::path::Path>) -> Result<Keys> {
+    let Some(dir) = state else {
+        return Ok(Keys {
+            hub: IdentityKey::generate_p256()?,
+            a: rand_bytes(),
+            b: None,
+        });
+    };
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let hub = load_or_make(dir, "probe-hub.pk8", || {
+        Ok(IdentityKey::generate_p256()?.pkcs8().unwrap().to_vec())
+    })?;
+    let a = load_or_make(dir, "probe-iroh-a.seed", || Ok(rand_bytes::<32>().to_vec()))?;
+    let b = load_or_make(dir, "probe-iroh-b.seed", || Ok(rand_bytes::<32>().to_vec()))?;
+    Ok(Keys {
+        hub: IdentityKey::from_pkcs8(&hub)?,
+        a: a.try_into().map_err(|_| anyhow!("bad probe-iroh-a.seed"))?,
+        b: Some(b.try_into().map_err(|_| anyhow!("bad probe-iroh-b.seed"))?),
+    })
 }
 
 /// A TLS server configuration presenting `key`, as the phone gateway does: a self-signed
@@ -44,12 +93,20 @@ pub fn identity_tls(key: &IdentityKey, alpn: &[&[u8]]) -> Result<rustls::ServerC
     let mut cfg = rustls::ServerConfig::builder_with_provider(crate::tls::provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
-        .with_single_cert(vec![cert.der().clone()], rustls::pki_types::PrivateKeyDer::Pkcs8(pkcs8))?;
+        .with_single_cert(
+            vec![cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(pkcs8),
+        )?;
     cfg.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
     Ok(cfg)
 }
 
-async fn timed<F, T>(checks: &mut Vec<Check>, name: &'static str, limit: Duration, f: F) -> Option<T>
+async fn timed<F, T>(
+    checks: &mut Vec<Check>,
+    name: &'static str,
+    limit: Duration,
+    f: F,
+) -> Option<T>
 where
     F: std::future::Future<Output = Result<T>>,
 {
@@ -61,11 +118,21 @@ where
     let ms = start.elapsed().as_millis() as u64;
     match r {
         Ok(v) => {
-            checks.push(Check { name, ok: true, ms, error: None });
+            checks.push(Check {
+                name,
+                ok: true,
+                ms,
+                error: None,
+            });
             Some(v)
         }
         Err(e) => {
-            checks.push(Check { name, ok: false, ms, error: Some(format!("{e:#}")) });
+            checks.push(Check {
+                name,
+                ok: false,
+                ms,
+                error: Some(format!("{e:#}")),
+            });
             None
         }
     }
@@ -83,21 +150,52 @@ pub async fn probe(o: &ProbeOptions) -> Report {
     })
     .await;
 
+    let keys = match keys(o.state.as_deref()) {
+        Ok(k) => k,
+        Err(e) => {
+            checks.push(Check {
+                name: "probe_state",
+                ok: false,
+                ms: 0,
+                error: Some(format!("{e:#}")),
+            });
+            return Report {
+                ok: false,
+                relay: t.url.to_string(),
+                checks,
+            };
+        }
+    };
     // A test hub with one phone, and a round trip through the relay.
-    let hub_key = Arc::new(IdentityKey::generate_p256().expect("a key"));
+    let hub_key = Arc::new(keys.hub);
     let pin = hub_key.pin();
     let cfg = HubConfig::new(t.clone(), o.client.clone());
-    let session = timed(&mut checks, "hub_session", o.timeout, HubSession::connect(&cfg, &hub_key)).await;
+    let session = timed(
+        &mut checks,
+        "hub_session",
+        o.timeout,
+        HubSession::connect(&cfg, &hub_key),
+    )
+    .await;
     if let Some(mut session) = session {
         let (cred, relay_key) = client::new_phone_credential().expect("randomness");
-        let set = timed(&mut checks, "phone_credentials", o.timeout, session.set_phones(vec![cred])).await;
+        let set = timed(
+            &mut checks,
+            "phone_credentials",
+            o.timeout,
+            session.set_phones(vec![cred]),
+        )
+        .await;
         if set.is_some() {
             if let Some(route) = session.welcome.phone_routes.first().cloned() {
                 let tls = identity_tls(&hub_key, &[b"twr-probe"]).expect("a TLS config");
                 timed(&mut checks, "phone_round_trip", o.timeout, async {
                     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
                     let hub_side = async {
-                        let s = session.accept().await.context("the relay passed no phone stream")?;
+                        let s = session
+                            .accept()
+                            .await
+                            .context("the relay passed no phone stream")?;
                         let mut t = acceptor.accept(s.io).await.context("hub-side TLS")?;
                         let mut buf = [0u8; 32];
                         t.read_exact(&mut buf).await?;
@@ -108,7 +206,9 @@ pub async fn probe(o: &ProbeOptions) -> Report {
                         Ok::<_, anyhow::Error>(())
                     };
                     let phone_side = async {
-                        let mut t = client::phone_connect(&route, &pin, &relay_key, &[b"twr-probe"]).await?;
+                        let mut t =
+                            client::phone_connect(&route, &pin, &relay_key, &[b"twr-probe"])
+                                .await?;
                         let nonce: [u8; 32] = rand_bytes();
                         t.write_all(&nonce).await?;
                         t.flush().await?;
@@ -132,7 +232,12 @@ pub async fn probe(o: &ProbeOptions) -> Report {
                 })
                 .await;
             } else {
-                checks.push(Check { name: "phone_round_trip", ok: false, ms: 0, error: Some("no phone route".into()) });
+                checks.push(Check {
+                    name: "phone_round_trip",
+                    ok: false,
+                    ms: 0,
+                    error: Some("no phone route".into()),
+                });
             }
         }
         session.close();
@@ -161,23 +266,57 @@ pub async fn probe(o: &ProbeOptions) -> Report {
     .await;
 
     // iroh: admit a fresh endpoint, then complete a relay handshake with it.
-    let iroh_url = info.as_ref().and_then(|v| v.get("iroh_url")).and_then(|u| u.as_str()).map(String::from);
-    let seed: [u8; 32] = rand_bytes();
+    let iroh_url = info
+        .as_ref()
+        .and_then(|v| v.get("iroh_url"))
+        .and_then(|u| u.as_str())
+        .map(String::from);
+    let seed = keys.a;
     let admitted = timed(&mut checks, "iroh_admission", o.timeout, async {
         let key = IdentityKey::ed25519_from_seed(&seed)?;
-        let a = admit::sign_pairing(&key, crate::now_unix())?;
+        let a = match keys.b {
+            None => admit::sign_pairing(&key, crate::now_unix())?,
+            Some(b) => {
+                let other = IdentityKey::ed25519_from_seed(&b)?;
+                let (ea, eb): ([u8; 32], [u8; 32]) =
+                    (key.public_raw().try_into()?, other.public_raw().try_into()?);
+                let exp = crate::now_unix() + 2 * 86400;
+                admit::pair_admission(
+                    &ea,
+                    &eb,
+                    exp,
+                    admit::sign_pair_half(&key, &ea, &eb, exp)?,
+                    admit::sign_pair_half(&other, &ea, &eb, exp)?,
+                )
+            }
+        };
         client::post_admission(t, &a).await
     })
     .await;
     if let (Some(url), Some(_)) = (iroh_url, admitted) {
-        timed(&mut checks, "iroh_relay", o.timeout, iroh_handshake(url, seed, t.url.pin, t.extra_roots.clone())).await;
+        timed(
+            &mut checks,
+            "iroh_relay",
+            o.timeout,
+            iroh_handshake(url, seed, t.url.pin, t.extra_roots.clone()),
+        )
+        .await;
     }
 
     let ok = checks.iter().all(|c| c.ok);
-    Report { ok, relay: t.url.to_string(), checks }
+    Report {
+        ok,
+        relay: t.url.to_string(),
+        checks,
+    }
 }
 
-async fn iroh_handshake(url: String, seed: [u8; 32], pin: Option<[u8; 32]>, roots: Vec<CertificateDer<'static>>) -> Result<()> {
+async fn iroh_handshake(
+    url: String,
+    seed: [u8; 32],
+    pin: Option<[u8; 32]>,
+    roots: Vec<CertificateDer<'static>>,
+) -> Result<()> {
     let relay_url: iroh_base::RelayUrl = url.parse().context("the relay's iroh_url")?;
     let secret = iroh_base::SecretKey::from_bytes(&seed);
     let tls = if pin.is_none() && !roots.is_empty() {
@@ -186,11 +325,15 @@ async fn iroh_handshake(url: String, seed: [u8; 32], pin: Option<[u8; 32]>, root
         crate::tls::client_config(pin, &[])
     };
     // iroh's relay client speaks TLS 1.2 or 1.3; our helper allows 1.3, which the relay serves.
-    let client = iroh_relay::client::ClientBuilder::new(relay_url, secret, iroh_dns::dns::DnsResolver::new())
-        .tls_client_config(tls)
-        .connect()
-        .await
-        .map_err(|e| anyhow!("{e}"))?;
+    let client = iroh_relay::client::ClientBuilder::new(
+        relay_url,
+        secret,
+        iroh_dns::dns::DnsResolver::new(),
+    )
+    .tls_client_config(tls)
+    .connect()
+    .await
+    .map_err(|e| anyhow!("{e}"))?;
     drop(client);
     Ok(())
 }
@@ -198,7 +341,9 @@ async fn iroh_handshake(url: String, seed: [u8; 32], pin: Option<[u8; 32]>, root
 fn rand_bytes<const N: usize>() -> [u8; N] {
     use ring::rand::SecureRandom;
     let mut b = [0u8; N];
-    ring::rand::SystemRandom::new().fill(&mut b).expect("randomness");
+    ring::rand::SystemRandom::new()
+        .fill(&mut b)
+        .expect("randomness");
     b
 }
 
@@ -213,7 +358,15 @@ pub fn print(report: &Report, json: bool) -> i32 {
                 Some(e) => println!("FAIL  {:<18} {:>6} ms  {e}", c.name, c.ms),
             }
         }
-        println!("{}: {}", report.relay, if report.ok { "all checks passed" } else { "FAILED" });
+        println!(
+            "{}: {}",
+            report.relay,
+            if report.ok {
+                "all checks passed"
+            } else {
+                "FAILED"
+            }
+        );
     }
     if report.ok {
         0

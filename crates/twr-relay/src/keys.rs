@@ -6,12 +6,13 @@ use ring::signature::{self, EcdsaKeyPair, Ed25519KeyPair, KeyPair as _};
 
 /// DER prefix of a P-256 SubjectPublicKeyInfo, before its 65-byte uncompressed point.
 const P256_SPKI_PREFIX: [u8; 26] = [
-    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08,
-    0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
+    0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
 ];
 /// DER prefix of an Ed25519 SubjectPublicKeyInfo, before its 32-byte key.
-const ED25519_SPKI_PREFIX: [u8; 12] =
-    [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
+const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyKind {
@@ -48,23 +49,38 @@ pub fn verify(spki_der: &[u8], msg: &[u8], sig: &[u8]) -> bool {
         KeyKind::P256 => &signature::ECDSA_P256_SHA256_ASN1,
         KeyKind::Ed25519 => &signature::ED25519,
     };
-    signature::UnparsedPublicKey::new(alg, raw).verify(msg, sig).is_ok()
+    signature::UnparsedPublicKey::new(alg, raw)
+        .verify(msg, sig)
+        .is_ok()
 }
 
 /// Whether `sig` is the raw Ed25519 key's signature over `msg`.
 pub fn verify_ed25519(raw: &[u8; 32], msg: &[u8], sig: &[u8]) -> bool {
-    signature::UnparsedPublicKey::new(&signature::ED25519, raw).verify(msg, sig).is_ok()
+    signature::UnparsedPublicKey::new(&signature::ED25519, raw)
+        .verify(msg, sig)
+        .is_ok()
 }
 
 /// A signing key: a hub's identity key, or an iroh endpoint key for admission.
 pub enum IdentityKey {
-    P256 { pair: EcdsaKeyPair, pkcs8: Vec<u8> },
-    Ed25519 { pair: Ed25519KeyPair, pkcs8: Option<Vec<u8>> },
+    P256 {
+        pair: EcdsaKeyPair,
+        pkcs8: Vec<u8>,
+    },
+    Ed25519 {
+        pair: Ed25519KeyPair,
+        pkcs8: Option<Vec<u8>>,
+    },
 }
 
 impl std::fmt::Debug for IdentityKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "IdentityKey({:?}, pin {})", self.kind(), crate::names::pin_text(&self.pin()))
+        write!(
+            f,
+            "IdentityKey({:?}, pin {})",
+            self.kind(),
+            crate::names::pin_text(&self.pin())
+        )
     }
 }
 
@@ -87,8 +103,8 @@ impl IdentityKey {
 
     /// An Ed25519 key from its 32-byte seed, as iroh stores endpoint secret keys.
     pub fn ed25519_from_seed(seed: &[u8; 32]) -> Result<Self> {
-        let pair = Ed25519KeyPair::from_seed_unchecked(seed)
-            .map_err(|_| anyhow!("bad Ed25519 seed"))?;
+        let pair =
+            Ed25519KeyPair::from_seed_unchecked(seed).map_err(|_| anyhow!("bad Ed25519 seed"))?;
         Ok(Self::Ed25519 { pair, pkcs8: None })
     }
 
@@ -98,10 +114,16 @@ impl IdentityKey {
         if let Ok(pair) =
             EcdsaKeyPair::from_pkcs8(&signature::ECDSA_P256_SHA256_ASN1_SIGNING, der, &rng)
         {
-            return Ok(Self::P256 { pair, pkcs8: der.to_vec() });
+            return Ok(Self::P256 {
+                pair,
+                pkcs8: der.to_vec(),
+            });
         }
         if let Ok(pair) = Ed25519KeyPair::from_pkcs8_maybe_unchecked(der) {
-            return Ok(Self::Ed25519 { pair, pkcs8: Some(der.to_vec()) });
+            return Ok(Self::Ed25519 {
+                pair,
+                pkcs8: Some(der.to_vec()),
+            });
         }
         bail!("not a P-256 or Ed25519 PKCS#8 key")
     }
@@ -163,7 +185,10 @@ mod tests {
 
     #[test]
     fn sign_and_verify_both_kinds() {
-        for key in [IdentityKey::generate_p256().unwrap(), IdentityKey::generate_ed25519().unwrap()] {
+        for key in [
+            IdentityKey::generate_p256().unwrap(),
+            IdentityKey::generate_ed25519().unwrap(),
+        ] {
             let spki = key.spki();
             assert_eq!(parse_spki(&spki).unwrap().0, key.kind());
             let sig = key.sign(b"hello").unwrap();
@@ -190,6 +215,10 @@ mod tests {
         let k = IdentityKey::ed25519_from_seed(&[5u8; 32]).unwrap();
         assert_eq!(k.public_raw().len(), 32);
         let sig = k.sign(b"m").unwrap();
-        assert!(verify_ed25519(k.public_raw().try_into().unwrap(), b"m", &sig));
+        assert!(verify_ed25519(
+            k.public_raw().try_into().unwrap(),
+            b"m",
+            &sig
+        ));
     }
 }

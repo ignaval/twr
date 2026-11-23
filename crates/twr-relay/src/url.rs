@@ -34,10 +34,13 @@ pub const TWR_RELAYS: &[&str] = &["relay://eu.relay.twr.tools", "relay://us.rela
 
 impl RelayUrl {
     pub fn parse(text: &str) -> Result<Self> {
-        let rest = text.strip_prefix("relay://").context("a relay URL starts with relay://")?;
+        let rest = text
+            .strip_prefix("relay://")
+            .context("a relay URL starts with relay://")?;
         let (authority, pin) = match rest.split_once('#') {
             Some((a, p)) => {
-                let pin = names::parse_pin(p).context("the pin after # must be 43 base64url characters")?;
+                let pin = names::parse_pin(p)
+                    .context("the pin after # must be 43 base64url characters")?;
                 (a, Some(pin))
             }
             None => (rest, None),
@@ -53,7 +56,11 @@ impl RelayUrl {
             }
             let port = match after {
                 "" => 443,
-                p => p.strip_prefix(':').context("expected :port")?.parse().context("bad port")?,
+                p => p
+                    .strip_prefix(':')
+                    .context("expected :port")?
+                    .parse()
+                    .context("bad port")?,
             };
             (Host::Ip(ip), port)
         } else {
@@ -131,7 +138,10 @@ mod tests {
     fn parses_the_forms() {
         let pin = names::pin_text(&[0xab; 32]);
         let u = RelayUrl::parse("relay://eu.relay.twr.tools").unwrap();
-        assert_eq!((u.host.clone(), u.port, u.pin), (Host::Name("eu.relay.twr.tools".into()), 443, None));
+        assert_eq!(
+            (u.host.clone(), u.port, u.pin),
+            (Host::Name("eu.relay.twr.tools".into()), 443, None)
+        );
         assert_eq!(u.to_string(), "relay://eu.relay.twr.tools");
         let u = RelayUrl::parse(&format!("relay://203.0.113.9:8443#{pin}")).unwrap();
         assert_eq!(u.server_name(), None);

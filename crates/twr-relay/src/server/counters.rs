@@ -124,18 +124,66 @@ impl Counters {
         let g = |o: &mut String, name: &str, help: &str, kind: &str, v: String| {
             let _ = writeln!(o, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {v}");
         };
-        g(&mut o, "twr_relay_up", "1 while the relay runs.", "gauge", "1".into());
+        g(
+            &mut o,
+            "twr_relay_up",
+            "1 while the relay runs.",
+            "gauge",
+            "1".into(),
+        );
         let _ = writeln!(
             o,
             "# HELP twr_relay_build_info The twr version.\n# TYPE twr_relay_build_info gauge\ntwr_relay_build_info{{version=\"{version}\"}} 1"
         );
-        g(&mut o, "twr_relay_uptime_seconds", "Seconds since start.", "gauge", uptime_secs.to_string());
-        g(&mut o, "twr_relay_connections_open", "TCP connections open.", "gauge", self.connections_open.load(Relaxed).to_string());
-        g(&mut o, "twr_relay_connections_total", "TCP connections accepted.", "counter", self.connections_total.load(Relaxed).to_string());
-        g(&mut o, "twr_relay_hubs_connected", "Hub sessions open.", "gauge", self.hubs_connected.load(Relaxed).to_string());
-        g(&mut o, "twr_relay_hub_sessions_total", "Hub sessions authenticated.", "counter", self.hub_sessions_total.load(Relaxed).to_string());
-        g(&mut o, "twr_relay_phone_connections_active", "Phone connections passed through now.", "gauge", self.phone_active.load(Relaxed).to_string());
-        g(&mut o, "twr_relay_phone_connections_total", "Phone connections passed through.", "counter", self.phone_total.load(Relaxed).to_string());
+        g(
+            &mut o,
+            "twr_relay_uptime_seconds",
+            "Seconds since start.",
+            "gauge",
+            uptime_secs.to_string(),
+        );
+        g(
+            &mut o,
+            "twr_relay_connections_open",
+            "TCP connections open.",
+            "gauge",
+            self.connections_open.load(Relaxed).to_string(),
+        );
+        g(
+            &mut o,
+            "twr_relay_connections_total",
+            "TCP connections accepted.",
+            "counter",
+            self.connections_total.load(Relaxed).to_string(),
+        );
+        g(
+            &mut o,
+            "twr_relay_hubs_connected",
+            "Hub sessions open.",
+            "gauge",
+            self.hubs_connected.load(Relaxed).to_string(),
+        );
+        g(
+            &mut o,
+            "twr_relay_hub_sessions_total",
+            "Hub sessions authenticated.",
+            "counter",
+            self.hub_sessions_total.load(Relaxed).to_string(),
+        );
+        g(
+            &mut o,
+            "twr_relay_phone_connections_active",
+            "Phone connections passed through now.",
+            "gauge",
+            self.phone_active.load(Relaxed).to_string(),
+        );
+        g(
+            &mut o,
+            "twr_relay_phone_connections_total",
+            "Phone connections passed through.",
+            "counter",
+            self.phone_total.load(Relaxed).to_string(),
+        );
         let _ = writeln!(
             o,
             "# HELP twr_relay_bytes_total Bytes passed through for phones.\n# TYPE twr_relay_bytes_total counter\ntwr_relay_bytes_total{{direction=\"to_hub\"}} {}\ntwr_relay_bytes_total{{direction=\"to_phone\"}} {}",
@@ -144,18 +192,71 @@ impl Counters {
         );
         let _ = writeln!(o, "# HELP twr_relay_refusals_total Refusals by reason.\n# TYPE twr_relay_refusals_total counter");
         for (i, r) in Refusal::ALL.iter().enumerate() {
-            let _ = writeln!(o, "twr_relay_refusals_total{{reason=\"{}\"}} {}", r.name(), self.refusals[i].load(Relaxed));
+            let _ = writeln!(
+                o,
+                "twr_relay_refusals_total{{reason=\"{}\"}} {}",
+                r.name(),
+                self.refusals[i].load(Relaxed)
+            );
         }
-        g(&mut o, "twr_relay_records_stored", "Signed records held.", "gauge", self.records_stored.load(Relaxed).to_string());
-        g(&mut o, "twr_relay_record_puts_total", "Records stored.", "counter", self.record_puts.load(Relaxed).to_string());
-        g(&mut o, "twr_relay_iroh_admitted", "Admitted iroh endpoints.", "gauge", self.iroh_admitted.load(Relaxed).to_string());
-        g(&mut o, "twr_relay_iroh_denied_total", "iroh connections refused.", "counter", self.iroh_denied.load(Relaxed).to_string());
-        g(&mut o, "twr_relay_iroh_connections_total", "iroh connections routed.", "counter", self.iroh_connections.load(Relaxed).to_string());
-        g(&mut o, "twr_relay_api_requests_total", "HTTPS API requests.", "counter", self.api_requests.load(Relaxed).to_string());
-        g(&mut o, "twr_relay_acme_challenges_total", "ACME tls-alpn-01 validations answered.", "counter", self.acme_challenges.load(Relaxed).to_string());
+        g(
+            &mut o,
+            "twr_relay_records_stored",
+            "Signed records held.",
+            "gauge",
+            self.records_stored.load(Relaxed).to_string(),
+        );
+        g(
+            &mut o,
+            "twr_relay_record_puts_total",
+            "Records stored.",
+            "counter",
+            self.record_puts.load(Relaxed).to_string(),
+        );
+        g(
+            &mut o,
+            "twr_relay_iroh_admitted",
+            "Admitted iroh endpoints.",
+            "gauge",
+            self.iroh_admitted.load(Relaxed).to_string(),
+        );
+        g(
+            &mut o,
+            "twr_relay_iroh_denied_total",
+            "iroh connections refused.",
+            "counter",
+            self.iroh_denied.load(Relaxed).to_string(),
+        );
+        g(
+            &mut o,
+            "twr_relay_iroh_connections_total",
+            "iroh connections routed.",
+            "counter",
+            self.iroh_connections.load(Relaxed).to_string(),
+        );
+        g(
+            &mut o,
+            "twr_relay_api_requests_total",
+            "HTTPS API requests.",
+            "counter",
+            self.api_requests.load(Relaxed).to_string(),
+        );
+        g(
+            &mut o,
+            "twr_relay_acme_challenges_total",
+            "ACME tls-alpn-01 validations answered.",
+            "counter",
+            self.acme_challenges.load(Relaxed).to_string(),
+        );
         let na = self.cert_not_after.load(Relaxed);
         let expiry = if na == 0 { -1 } else { na - now_unix };
-        g(&mut o, "twr_relay_cert_expiry_seconds", "Seconds until the relay's own certificate expires; -1 if none yet.", "gauge", expiry.to_string());
+        g(
+            &mut o,
+            "twr_relay_cert_expiry_seconds",
+            "Seconds until the relay's own certificate expires; -1 if none yet.",
+            "gauge",
+            expiry.to_string(),
+        );
         o
     }
 }

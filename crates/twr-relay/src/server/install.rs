@@ -32,7 +32,10 @@ pub fn config_text(o: &InstallOptions) -> Result<String> {
     if let Some(p) = &o.public_host {
         t += &format!("public_host = {}\n", toml_str(p));
     }
-    t += &format!("region = {}\n", toml_str(o.region.as_deref().unwrap_or("default")));
+    t += &format!(
+        "region = {}\n",
+        toml_str(o.region.as_deref().unwrap_or("default"))
+    );
     t += "listen = [\"[::]:443\"]\n";
     t += &format!("state_dir = {}\n\n[tls]\n", toml_str(STATE_DIR));
     let self_signed = o.self_signed || o.hostname.is_none();
@@ -135,12 +138,28 @@ pub fn install(o: &InstallOptions) -> Result<String> {
             exe.display()
         );
     }
-    let config = o.config_path.clone().unwrap_or_else(|| PathBuf::from(CONFIG_PATH));
+    let config = o
+        .config_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(CONFIG_PATH));
 
     // The user.
-    let exists = Command::new("id").arg("-u").arg(USER).output().map(|o| o.status.success()).unwrap_or(false);
+    let exists = Command::new("id")
+        .arg("-u")
+        .arg(USER)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
     if !exists {
-        run(Command::new("useradd").args(["--system", "--no-create-home", "--home-dir", STATE_DIR, "--shell", "/usr/sbin/nologin", USER]))?;
+        run(Command::new("useradd").args([
+            "--system",
+            "--no-create-home",
+            "--home-dir",
+            STATE_DIR,
+            "--shell",
+            "/usr/sbin/nologin",
+            USER,
+        ]))?;
     }
 
     // The config, if there is none.
@@ -158,14 +177,18 @@ pub fn install(o: &InstallOptions) -> Result<String> {
 
     // The state directory, owned by the service user.
     std::fs::create_dir_all(&cfg.relay.state_dir)?;
-    run(Command::new("chown").arg(format!("{USER}:{USER}")).arg(&cfg.relay.state_dir))?;
+    run(Command::new("chown")
+        .arg(format!("{USER}:{USER}"))
+        .arg(&cfg.relay.state_dir))?;
     run(Command::new("chmod").arg("0700").arg(&cfg.relay.state_dir))?;
 
     // A self-signed key now, so the URL with its pin can be printed.
     let mut pin = None;
     if cfg.tls.mode == TlsMode::SelfSigned {
         let (_, p) = super::certs::self_signed_key(&cfg.relay.state_dir)?;
-        run(Command::new("chown").arg(format!("{USER}:{USER}")).arg(cfg.relay.state_dir.join(super::certs::SELF_KEY)))?;
+        run(Command::new("chown")
+            .arg(format!("{USER}:{USER}"))
+            .arg(cfg.relay.state_dir.join(super::certs::SELF_KEY)))?;
         pin = Some(p);
     }
 
@@ -183,8 +206,16 @@ pub fn install(o: &InstallOptions) -> Result<String> {
 
 /// The URL hubs use for a relay with this configuration.
 pub fn relay_url_for(cfg: &Config, pin: Option<[u8; 32]>) -> String {
-    let host = cfg.relay.hostname.clone().unwrap_or_else(|| cfg.public_host());
-    let host = if host.contains(':') { format!("[{host}]") } else { host };
+    let host = cfg
+        .relay
+        .hostname
+        .clone()
+        .unwrap_or_else(|| cfg.public_host());
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host
+    };
     let port = cfg.public_port();
     let mut url = match port {
         443 => format!("relay://{host}"),
@@ -211,11 +242,21 @@ mod tests {
         })
         .unwrap();
         assert!(named.contains("mode = \"acme\""));
-        let bare = config_text(&InstallOptions { public_host: Some("203.0.113.9".into()), ..Default::default() }).unwrap();
+        let bare = config_text(&InstallOptions {
+            public_host: Some("203.0.113.9".into()),
+            ..Default::default()
+        })
+        .unwrap();
         assert!(bare.contains("self-signed"));
         let cfg: Config = toml::from_str(&bare).unwrap();
-        assert_eq!(relay_url_for(&cfg, Some([0; 32])), format!("relay://203.0.113.9#{}", crate::names::pin_text(&[0; 32])));
-        assert!(config_text(&InstallOptions::default()).is_err(), "needs a hostname or a public host");
+        assert_eq!(
+            relay_url_for(&cfg, Some([0; 32])),
+            format!("relay://203.0.113.9#{}", crate::names::pin_text(&[0; 32]))
+        );
+        assert!(
+            config_text(&InstallOptions::default()).is_err(),
+            "needs a hostname or a public host"
+        );
     }
 
     #[test]
@@ -223,6 +264,8 @@ mod tests {
         let u = unit_text(Path::new(CONFIG_PATH));
         assert!(u.contains("User=twr-relay"));
         assert!(u.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE"));
-        assert!(u.contains("ExecStart=/usr/local/bin/twr relay serve --config /etc/twr-relay/relay.toml"));
+        assert!(u.contains(
+            "ExecStart=/usr/local/bin/twr relay serve --config /etc/twr-relay/relay.toml"
+        ));
     }
 }

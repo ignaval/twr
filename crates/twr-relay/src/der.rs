@@ -33,7 +33,14 @@ fn read_tlv(input: &[u8]) -> Option<(Tlv<'_>, &[u8])> {
     if end > input.len() {
         return None;
     }
-    Some((Tlv { tag, whole: &input[..end], body: &input[header..end] }, &input[end..]))
+    Some((
+        Tlv {
+            tag,
+            whole: &input[..end],
+            body: &input[header..end],
+        },
+        &input[end..],
+    ))
 }
 
 /// The DER SubjectPublicKeyInfo of an X.509 certificate, or `None` if it doesn't parse.
@@ -96,7 +103,12 @@ pub fn cert_not_after(cert: &[u8]) -> Option<i64> {
     };
     let n = |i: usize| -> i64 { rest[i..i + 2].parse().unwrap_or(-1) };
     let (mo, d, h, mi, s) = (n(0), n(2), n(4), n(6), n(8));
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || !(0..24).contains(&h) || !(0..60).contains(&mi) || !(0..61).contains(&s) {
+    if !(1..=12).contains(&mo)
+        || !(1..=31).contains(&d)
+        || !(0..24).contains(&h)
+        || !(0..60).contains(&mi)
+        || !(0..61).contains(&s)
+    {
         return None;
     }
     Some(days_from_civil(year, mo, d) * 86400 + h * 3600 + mi * 60 + s)

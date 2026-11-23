@@ -101,7 +101,12 @@ async fn peek_hello(tcp: &TcpStream, deadline: Instant) -> Result<Hello, Refusal
 
 async fn handle(shared: Arc<Shared>, tcp: TcpStream, peer: SocketAddr, kind: &Kind) {
     let hello = {
-        let Some(_pending) = shared.pending.enter(peer.ip(), shared.cfg.limits.pending_per_ip) else {
+        let cap = if shared.deny.exempt(peer.ip()) {
+            u32::MAX
+        } else {
+            shared.cfg.limits.pending_per_ip
+        };
+        let Some(_pending) = shared.pending.enter(peer.ip(), cap) else {
             shared.counters.refuse(Refusal::Pending);
             return;
         };
@@ -137,9 +142,19 @@ async fn handle(shared: Arc<Shared>, tcp: TcpStream, peer: SocketAddr, kind: &Ki
             if shared.suffixes.iter().any(|s| s == rest) {
                 match names::parse_label(first) {
                     Some((hub, tag)) => {
-                        phone::serve(shared, tcp, peer, hub.to_string(), Some(tag.to_string()), "sni").await;
+                        phone::serve(
+                            shared,
+                            tcp,
+                            peer,
+                            hub.to_string(),
+                            Some(tag.to_string()),
+                            "sni",
+                        )
+                        .await;
                     }
-                    None if Some(sni) == shared.own_host.as_ref() || Some(sni) == shared.iroh_host.as_ref() => {
+                    None if Some(sni) == shared.own_host.as_ref()
+                        || Some(sni) == shared.iroh_host.as_ref() =>
+                    {
                         own(shared, tcp, peer, sni.clone(), &hello).await;
                     }
                     None => shared.counters.refuse(Refusal::BadLabel),
@@ -166,7 +181,9 @@ async fn handle(shared: Arc<Shared>, tcp: TcpStream, peer: SocketAddr, kind: &Ki
                 i.serve(tcp).await;
             }
         }
-        (_, Some(sni)) if Some(sni) == shared.own_host.as_ref() => own(shared, tcp, peer, sni.clone(), &hello).await,
+        (_, Some(sni)) if Some(sni) == shared.own_host.as_ref() => {
+            own(shared, tcp, peer, sni.clone(), &hello).await
+        }
         (_, None) => own(shared, tcp, peer, String::new(), &hello).await,
         (_, Some(_)) => shared.counters.refuse(Refusal::UnknownName),
     }

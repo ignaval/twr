@@ -34,7 +34,11 @@ pub struct Target {
 
 impl Target {
     pub fn new(url: RelayUrl) -> Self {
-        Self { url, connect: None, extra_roots: Vec::new() }
+        Self {
+            url,
+            connect: None,
+            extra_roots: Vec::new(),
+        }
     }
 
     pub fn connect_to(mut self, addr: std::net::SocketAddr) -> Self {
@@ -59,7 +63,10 @@ pub struct HubConfig {
 
 impl HubConfig {
     pub fn new(target: impl Into<Target>, client: impl Into<String>) -> Self {
-        Self { target: target.into(), client: client.into() }
+        Self {
+            target: target.into(),
+            client: client.into(),
+        }
     }
 }
 
@@ -74,7 +81,10 @@ pub struct PhoneStream {
 
 impl std::fmt::Debug for PhoneStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PhoneStream").field("phone", &self.phone).field("mode", &self.mode).finish()
+        f.debug_struct("PhoneStream")
+            .field("phone", &self.phone)
+            .field("mode", &self.mode)
+            .finish()
     }
 }
 
@@ -135,7 +145,11 @@ async fn dial(target: &Target, alpn: &[&[u8]]) -> Result<TlsStream<TcpStream>> {
     Ok(tls)
 }
 
-fn relay_tls(url: &RelayUrl, extra_roots: &[CertificateDer<'static>], alpn: &[&[u8]]) -> rustls::ClientConfig {
+fn relay_tls(
+    url: &RelayUrl,
+    extra_roots: &[CertificateDer<'static>],
+    alpn: &[&[u8]],
+) -> rustls::ClientConfig {
     if url.pin.is_none() && !extra_roots.is_empty() {
         return tls::client_config_with_roots(extra_roots.to_vec(), alpn);
     }
@@ -164,7 +178,15 @@ impl HubSession {
         let closed_tx = Arc::new(closed_tx);
         let ctx = closed_tx.clone();
         tokio::spawn(async move {
-            let r = mux::drive(tls, mux::hub_config(), yamux::Mode::Client, open_rx, in_tx, driver_cancel).await;
+            let r = mux::drive(
+                tls,
+                mux::hub_config(),
+                yamux::Mode::Client,
+                open_rx,
+                in_tx,
+                driver_cancel,
+            )
+            .await;
             let why = match r {
                 Ok(()) => Closed::Lost("the relay closed the connection".into()),
                 Err(e) => Closed::Lost(format!("connection error: {e}")),
@@ -183,7 +205,10 @@ impl HubSession {
         });
 
         let (tx, rx) = oneshot::channel();
-        open_tx.send(tx).await.map_err(|_| anyhow!("connection closed"))?;
+        open_tx
+            .send(tx)
+            .await
+            .map_err(|_| anyhow!("connection closed"))?;
         let mut control = rx.await.map_err(|_| anyhow!("connection closed"))??;
         proto::write_frame(
             &mut control,
@@ -195,18 +220,22 @@ impl HubSession {
             },
         )
         .await?;
-        let welcome = match tokio::time::timeout(CONNECT_TIMEOUT, proto::read_frame(&mut control)).await {
-            Err(_) => bail!("the relay sent no welcome"),
-            Ok(r) => match r? {
-                Some(Incoming::Msg(Msg::Welcome(w))) => w,
-                Some(Incoming::Msg(Msg::Error { code, message, .. })) => {
-                    bail!("the relay refused the hub: {code} ({message})")
-                }
-                other => bail!("unexpected answer to hello: {other:?}"),
-            },
-        };
+        let welcome =
+            match tokio::time::timeout(CONNECT_TIMEOUT, proto::read_frame(&mut control)).await {
+                Err(_) => bail!("the relay sent no welcome"),
+                Ok(r) => match r? {
+                    Some(Incoming::Msg(Msg::Welcome(w))) => w,
+                    Some(Incoming::Msg(Msg::Error { code, message, .. })) => {
+                        bail!("the relay refused the hub: {code} ({message})")
+                    }
+                    other => bail!("unexpected answer to hello: {other:?}"),
+                },
+            };
         if welcome.hub != names::hub_name(&key.pin()) {
-            bail!("the relay named this hub {} instead of its own name", welcome.hub);
+            bail!(
+                "the relay named this hub {} instead of its own name",
+                welcome.hub
+            );
         }
 
         // Control stream: one writer task, one reader task.
@@ -243,10 +272,17 @@ impl HubSession {
                 let msg = match frame {
                     Err(_) => break Closed::Lost("the relay went silent".into()),
                     Ok(Err(e)) => break Closed::Lost(format!("control stream: {e}")),
-                    Ok(Ok(None)) => break Closed::Lost("the relay closed the control stream".into()),
+                    Ok(Ok(None)) => {
+                        break Closed::Lost("the relay closed the control stream".into())
+                    }
                     Ok(Ok(Some(Incoming::Unknown(t)))) => {
                         let _ = rout
-                            .send(Msg::Error { code: "unsupported".into(), message: String::new(), fatal: false, ref_: Some(t) })
+                            .send(Msg::Error {
+                                code: "unsupported".into(),
+                                message: String::new(),
+                                fatal: false,
+                                ref_: Some(t),
+                            })
                             .await;
                         continue;
                     }
@@ -257,16 +293,27 @@ impl HubSession {
                         let _ = rout.send(Msg::Pong { n }).await;
                     }
                     Msg::Pong { .. } => {}
-                    Msg::Drain { retry_after_seconds, .. } => break Closed::Drain(retry_after_seconds),
-                    Msg::Error { code, fatal: true, .. } => break Closed::Refused(code),
+                    Msg::Drain {
+                        retry_after_seconds,
+                        ..
+                    } => break Closed::Drain(retry_after_seconds),
+                    Msg::Error {
+                        code, fatal: true, ..
+                    } => break Closed::Refused(code),
                     m @ (Msg::PhonesOk { .. } | Msg::MovedOk {}) => {
                         if let Some((_, tx)) = rpending.lock().unwrap().pop_front() {
                             let _ = tx.send(Ok(m));
                         }
                     }
-                    Msg::Error { code, message, ref_, .. } => {
+                    Msg::Error {
+                        code,
+                        message,
+                        ref_,
+                        ..
+                    } => {
                         let mut p = rpending.lock().unwrap();
-                        let answers = matches!(p.front(), Some((kind, _)) if ref_.as_deref() == Some(*kind));
+                        let answers =
+                            matches!(p.front(), Some((kind, _)) if ref_.as_deref() == Some(*kind));
                         if answers {
                             let (_, tx) = p.pop_front().unwrap();
                             let _ = tx.send(Err(anyhow!("{code}: {message}")));
@@ -301,22 +348,45 @@ impl HubSession {
                 };
                 let tx = phone_tx.clone();
                 tokio::spawn(async move {
-                    let header = tokio::time::timeout(CONNECT_TIMEOUT, proto::read_frame(&mut s)).await;
-                    if let Ok(Ok(Some(Incoming::Msg(Msg::Phone { phone, mode, remote })))) = header {
-                        let _ = tx.send(PhoneStream { phone, mode, remote, io: s }).await;
+                    let header =
+                        tokio::time::timeout(CONNECT_TIMEOUT, proto::read_frame(&mut s)).await;
+                    if let Ok(Ok(Some(Incoming::Msg(Msg::Phone {
+                        phone,
+                        mode,
+                        remote,
+                    })))) = header
+                    {
+                        let _ = tx
+                            .send(PhoneStream {
+                                phone,
+                                mode,
+                                remote,
+                                io: s,
+                            })
+                            .await;
                     }
                 });
             }
         });
 
-        Ok(Self { welcome, out: out_tx, pending, phones: phone_rx, closed: closed_rx, cancel })
+        Ok(Self {
+            welcome,
+            out: out_tx,
+            pending,
+            phones: phone_rx,
+            closed: closed_rx,
+            cancel,
+        })
     }
 
     async fn request(&self, kind: &'static str, msg: Msg) -> Result<Msg> {
         let (tx, rx) = oneshot::channel();
         // Queue the answer slot before the request can be answered.
         self.pending.lock().unwrap().push_back((kind, tx));
-        self.out.send(msg).await.map_err(|_| anyhow!("the relay session ended"))?;
+        self.out
+            .send(msg)
+            .await
+            .map_err(|_| anyhow!("the relay session ended"))?;
         tokio::time::timeout(CONNECT_TIMEOUT, rx)
             .await
             .context("the relay didn't answer")?
@@ -358,14 +428,14 @@ impl HubSession {
 }
 
 async fn wait_closed(mut rx: watch::Receiver<Option<Closed>>) -> Closed {
-        loop {
-            if let Some(c) = rx.borrow().clone() {
-                return c;
-            }
-            if rx.changed().await.is_err() {
-                return Closed::Local;
-            }
+    loop {
+        if let Some(c) = rx.borrow().clone() {
+            return c;
         }
+        if rx.changed().await.is_err() {
+            return Closed::Local;
+        }
+    }
 }
 
 /// A random phone credential (§3.3).
@@ -376,12 +446,22 @@ pub fn new_phone_credential() -> Result<(PhoneCred, [u8; 32])> {
     let mut key = [0u8; 32];
     rng.fill(&mut id).map_err(|_| anyhow!("no randomness"))?;
     rng.fill(&mut key).map_err(|_| anyhow!("no randomness"))?;
-    Ok((PhoneCred { id: hex::encode(id), key: names::b64(&key) }, key))
+    Ok((
+        PhoneCred {
+            id: hex::encode(id),
+            key: names::b64(&key),
+        },
+        key,
+    ))
 }
 
 /// A moved note's body and signature for `key`'s hub (§5.7). `routes` is the invitation's
 /// route list, which the relay doesn't read.
-pub fn sign_moved(key: &IdentityKey, issued: u64, routes: serde_json::Value) -> Result<(String, String)> {
+pub fn sign_moved(
+    key: &IdentityKey,
+    issued: u64,
+    routes: serde_json::Value,
+) -> Result<(String, String)> {
     let body = serde_json::to_vec(&serde_json::json!({
         "hub": names::hub_name(&key.pin()),
         "issued": issued,
@@ -396,7 +476,12 @@ pub fn sign_moved(key: &IdentityKey, issued: u64, routes: serde_json::Value) -> 
 
 /// A phone's check of a moved note fetched from `/v1/hubs/<hub>/moved` (§5.7, §8.3): the SPKI
 /// must have `pin`, the signature must verify, and the body must name the hub. Returns the body.
-pub fn verify_moved(pin: &[u8; 32], spki_b64: &str, body_b64: &str, sig_b64: &str) -> Option<serde_json::Value> {
+pub fn verify_moved(
+    pin: &[u8; 32],
+    spki_b64: &str,
+    body_b64: &str,
+    sig_b64: &str,
+) -> Option<serde_json::Value> {
     let spki = names::unb64(spki_b64)?;
     if &names::pin(&spki) != pin {
         return None;
@@ -450,7 +535,11 @@ pub fn backoff(failures: u32) -> Duration {
 
 impl HubClient {
     /// Starts the client. Phone streams arrive on the returned receiver.
-    pub fn spawn(cfg: HubConfig, key: Arc<IdentityKey>, phones: Vec<PhoneCred>) -> (Self, mpsc::Receiver<PhoneStream>) {
+    pub fn spawn(
+        cfg: HubConfig,
+        key: Arc<IdentityKey>,
+        phones: Vec<PhoneCred>,
+    ) -> (Self, mpsc::Receiver<PhoneStream>) {
         let (phones_tx, phones_rx) = watch::channel(phones);
         let (status_tx, status_rx) = watch::channel(HubStatus::default());
         let (stream_tx, stream_rx) = mpsc::channel(16);
@@ -459,30 +548,40 @@ impl HubClient {
         tokio::spawn(async move {
             let mut failures = 0u32;
             loop {
-                let wait = match Self::run_once(&cfg, &key, phones_rx.clone(), &status_tx, &stream_tx, &c).await {
-                    Ok(Closed::Local) => return,
-                    Ok(Closed::Drain(secs)) => {
-                        failures = 0;
-                        Duration::from_secs(secs.clamp(1, 3600))
-                    }
-                    Ok(Closed::Refused(code)) if code == "denied" => Duration::from_secs(3600),
-                    Ok(Closed::Refused(code)) if code == "replaced" => {
-                        // Another process holds this hub's key and took over: don't fight it.
-                        failures = failures.saturating_add(1);
-                        backoff(failures.max(6))
-                    }
-                    Ok(_) | Err(_) => {
-                        failures = failures.saturating_add(1);
-                        backoff(failures - 1)
-                    }
-                };
+                let wait =
+                    match Self::run_once(&cfg, &key, phones_rx.clone(), &status_tx, &stream_tx, &c)
+                        .await
+                    {
+                        Ok(Closed::Local) => return,
+                        Ok(Closed::Drain(secs)) => {
+                            failures = 0;
+                            Duration::from_secs(secs.clamp(1, 3600))
+                        }
+                        Ok(Closed::Refused(code)) if code == "denied" => Duration::from_secs(3600),
+                        Ok(Closed::Refused(code)) if code == "replaced" => {
+                            // Another process holds this hub's key and took over: don't fight it.
+                            failures = failures.saturating_add(1);
+                            backoff(failures.max(6))
+                        }
+                        Ok(_) | Err(_) => {
+                            failures = failures.saturating_add(1);
+                            backoff(failures - 1)
+                        }
+                    };
                 tokio::select! {
                     _ = c.cancelled() => return,
                     _ = tokio::time::sleep(wait) => {}
                 }
             }
         });
-        (Self { phones: phones_tx, status: status_rx, cancel }, stream_rx)
+        (
+            Self {
+                phones: phones_tx,
+                status: status_rx,
+                cancel,
+            },
+            stream_rx,
+        )
     }
 
     async fn run_once(
@@ -568,18 +667,24 @@ pub async fn https(
     use http_body_util::{BodyExt, Full};
     let url = &target.url;
     let tls = dial(target, &[b"http/1.1"]).await?;
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls)).await?;
+    let (mut sender, conn) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls)).await?;
     tokio::spawn(conn);
     let host = match url.port {
         443 => url.host.to_string(),
         p => format!("{}:{p}", url.host),
     };
-    let mut req = hyper::Request::builder().method(method).uri(path).header("host", host);
+    let mut req = hyper::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", host);
     if body.is_some() {
         req = req.header("content-type", "application/json");
     }
     let req = req.body(Full::new(bytes::Bytes::from(body.unwrap_or_default())))?;
-    let resp = tokio::time::timeout(CONNECT_TIMEOUT, sender.send_request(req)).await.context("the relay didn't answer")??;
+    let resp = tokio::time::timeout(CONNECT_TIMEOUT, sender.send_request(req))
+        .await
+        .context("the relay didn't answer")??;
     let status = resp.status().as_u16();
     let body = tokio::time::timeout(CONNECT_TIMEOUT, resp.into_body().collect())
         .await
@@ -601,8 +706,17 @@ pub async fn info(target: &Target) -> Result<serde_json::Value> {
 }
 
 /// Posts an admission (§10.2) and returns what the relay admitted.
-pub async fn post_admission(target: &Target, admission: &admit::Admission) -> Result<admit::AdmitAnswer> {
-    let (status, body) = https(target, "POST", "/v1/iroh/admit", Some(serde_json::to_vec(admission)?)).await?;
+pub async fn post_admission(
+    target: &Target,
+    admission: &admit::Admission,
+) -> Result<admit::AdmitAnswer> {
+    let (status, body) = https(
+        target,
+        "POST",
+        "/v1/iroh/admit",
+        Some(serde_json::to_vec(admission)?),
+    )
+    .await?;
     if status != 200 {
         let err = serde_json::from_slice::<serde_json::Value>(&body)
             .ok()
@@ -624,7 +738,9 @@ pub async fn hub_status(
     let path = format!("/v1/hubs/{}", names::label(hub_name, &tag));
     let (status, body) = https(target, "GET", &path, None).await?;
     match status {
-        200 => Ok(serde_json::from_slice::<serde_json::Value>(&body)?.get("connected").and_then(|c| c.as_bool())),
+        200 => Ok(serde_json::from_slice::<serde_json::Value>(&body)?
+            .get("connected")
+            .and_then(|c| c.as_bool())),
         404 => Ok(None),
         s => bail!("status page answered {s}"),
     }
@@ -648,14 +764,20 @@ pub async fn phone_connect(
     } else {
         route.host.clone()
     };
-    let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(format!("{host}:{}", route.port)))
-        .await
-        .context("connecting to the relay timed out")??;
+    let tcp = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        TcpStream::connect(format!("{host}:{}", route.port)),
+    )
+    .await
+    .context("connecting to the relay timed out")??;
     let _ = tcp.set_nodelay(true);
     let cfg = tls::client_config(Some(*hub_pin), alpn);
     let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
-    let tls = tokio::time::timeout(CONNECT_TIMEOUT, connector.connect(ServerName::try_from(sni)?, tcp))
-        .await
-        .context("the hub's TLS handshake timed out")??;
+    let tls = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        connector.connect(ServerName::try_from(sni)?, tcp),
+    )
+    .await
+    .context("the hub's TLS handshake timed out")??;
     Ok(tls)
 }

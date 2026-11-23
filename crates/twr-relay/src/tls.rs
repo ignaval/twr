@@ -2,7 +2,9 @@
 
 use crate::{der, names};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::{ring as provider, verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+use rustls::crypto::{
+    ring as provider, verify_tls12_signature, verify_tls13_signature, CryptoProvider,
+};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use std::sync::Arc;
@@ -22,7 +24,10 @@ pub struct PinVerifier {
 
 impl PinVerifier {
     pub fn new(pin: [u8; 32]) -> Self {
-        Self { pin, algs: provider::default_provider().signature_verification_algorithms }
+        Self {
+            pin,
+            algs: provider::default_provider().signature_verification_algorithms,
+        }
     }
 }
 
@@ -35,13 +40,16 @@ impl ServerCertVerifier for PinVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let spki = der::cert_spki(end_entity.as_ref())
-            .ok_or(rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
+        let spki = der::cert_spki(end_entity.as_ref()).ok_or(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::BadEncoding,
+        ))?;
         let got = names::pin(spki);
         if names::ct_eq(&got, &self.pin) {
             Ok(ServerCertVerified::assertion())
         } else {
-            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::ApplicationVerificationFailure))
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ))
         }
     }
 
@@ -80,7 +88,9 @@ pub fn client_config(pin: Option<[u8; 32]>, alpn: &[&[u8]]) -> ClientConfig {
             .with_custom_certificate_verifier(Arc::new(PinVerifier::new(pin)))
             .with_no_client_auth(),
         None => {
-            let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+            let roots = rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            };
             builder.with_root_certificates(roots).with_no_client_auth()
         }
     };
@@ -89,7 +99,10 @@ pub fn client_config(pin: Option<[u8; 32]>, alpn: &[&[u8]]) -> ClientConfig {
 }
 
 /// The same with extra trusted roots, for tests and for a relay under a private CA.
-pub fn client_config_with_roots(roots: Vec<CertificateDer<'static>>, alpn: &[&[u8]]) -> ClientConfig {
+pub fn client_config_with_roots(
+    roots: Vec<CertificateDer<'static>>,
+    alpn: &[&[u8]],
+) -> ClientConfig {
     let mut store = rustls::RootCertStore::empty();
     for r in roots {
         let _ = store.add(r);

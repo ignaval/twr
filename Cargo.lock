@@ -5644,6 +5644,7 @@ dependencies = [
  "twr-link",
  "twr-mcp",
  "twr-neural",
+ "twr-relay",
  "twr-runner",
  "twr-source",
  "twr-speech",

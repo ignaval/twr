@@ -31,7 +31,8 @@ fn error(status: StatusCode, code: &str) -> Resp {
 
 fn rate_limited() -> Resp {
     let mut r = error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
-    r.headers_mut().insert(header::RETRY_AFTER, header::HeaderValue::from_static("60"));
+    r.headers_mut()
+        .insert(header::RETRY_AFTER, header::HeaderValue::from_static("60"));
     r
 }
 
@@ -42,15 +43,23 @@ pub async fn serve(shared: Arc<Shared>, tls: TlsStream<TcpStream>, peer: SocketA
         let s = s.clone();
         async move { Ok::<_, std::convert::Infallible>(route(&s, req, peer).await) }
     });
-    let mut builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-    builder.http1().timer(hyper_util::rt::TokioTimer::new()).header_read_timeout(std::time::Duration::from_secs(10));
+    let mut builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    builder
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(std::time::Duration::from_secs(10));
     builder.http2().max_concurrent_streams(16);
     let conn = builder.serve_connection(hyper_util::rt::TokioIo::new(tls), svc);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(60), conn).await;
 }
 
 async fn body(req: Request<Incoming>, max: usize) -> Option<Bytes> {
-    Limited::new(req.into_body(), max).collect().await.ok().map(|c| c.to_bytes())
+    Limited::new(req.into_body(), max)
+        .collect()
+        .await
+        .ok()
+        .map(|c| c.to_bytes())
 }
 
 async fn route(s: &Shared, req: Request<Incoming>, peer: SocketAddr) -> Resp {
@@ -69,39 +78,59 @@ async fn route(s: &Shared, req: Request<Incoming>, peer: SocketAddr) -> Resp {
             admission(s, &b, peer)
         }
         (Method::PUT, ["pkarr", key]) => {
-            if !s.limits.record_puts.allow(peer.ip()) {
+            if !s.allow(&s.limits.record_puts, peer.ip()) {
                 s.counters.refuse(Refusal::RecordRate);
                 return rate_limited();
             }
-            let Some(key) = parse_pkarr_key(key) else { return error(StatusCode::BAD_REQUEST, "bad_request") };
+            let Some(key) = parse_pkarr_key(key) else {
+                return error(StatusCode::BAD_REQUEST, "bad_request");
+            };
             let Some(b) = body(req, 72 + super::stores::MAX_PACKET).await else {
                 return error(StatusCode::PAYLOAD_TOO_LARGE, "too_large");
             };
-            match s.records.put(&key, &b, now(), s.cfg.limits.max_records as usize) {
+            match s
+                .records
+                .put(&key, &b, now(), s.cfg.limits.max_records as usize)
+            {
                 Ok(()) => {
                     s.counters.record_puts.fetch_add(1, Relaxed);
-                    Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap()
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::new()))
+                        .unwrap()
                 }
                 Err(e) => {
                     s.counters.refuse(Refusal::RecordRejected);
                     match e {
                         PutError::Bad => error(StatusCode::BAD_REQUEST, "bad_request"),
                         PutError::Older => error(StatusCode::CONFLICT, "not_most_recent"),
-                        PutError::SameTimestamp => error(StatusCode::PRECONDITION_REQUIRED, "not_most_recent"),
+                        PutError::SameTimestamp => {
+                            error(StatusCode::PRECONDITION_REQUIRED, "not_most_recent")
+                        }
                         PutError::Full => error(StatusCode::SERVICE_UNAVAILABLE, "capacity"),
                     }
                 }
             }
         }
         (Method::GET, ["pkarr", key]) => {
-            let Some(key) = parse_pkarr_key(key) else { return error(StatusCode::BAD_REQUEST, "bad_request") };
+            let Some(key) = parse_pkarr_key(key) else {
+                return error(StatusCode::BAD_REQUEST, "bad_request");
+            };
             let Some(rec) = s.records.get(&key, now(), s.cfg.limits.record_ttl_seconds) else {
                 return error(StatusCode::NOT_FOUND, "not_found");
             };
             let stored = httpdate(rec.stored_unix);
-            if let Some(since) = req.headers().get(header::IF_MODIFIED_SINCE).and_then(|v| v.to_str().ok()).and_then(parse_httpdate) {
+            if let Some(since) = req
+                .headers()
+                .get(header::IF_MODIFIED_SINCE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_httpdate)
+            {
                 if since >= rec.stored_unix {
-                    return Response::builder().status(StatusCode::NOT_MODIFIED).body(Full::new(Bytes::new())).unwrap();
+                    return Response::builder()
+                        .status(StatusCode::NOT_MODIFIED)
+                        .body(Full::new(Bytes::new()))
+                        .unwrap();
                 }
             }
             Response::builder()
@@ -134,18 +163,28 @@ fn info(s: &Shared) -> Resp {
             "relay_pin": s.relay_pin_text(),
         }),
     );
-    r.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("public, max-age=300"));
+    r.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("public, max-age=300"),
+    );
     r
 }
 
 fn hub_status(s: &Shared, label: &str) -> Resp {
     let unknown = || error(StatusCode::NOT_FOUND, "unknown");
-    let Some((hub_name, tag)) = names::parse_label(label) else { return unknown() };
-    let Some(hub) = s.hub(hub_name) else { return unknown() };
+    let Some((hub_name, tag)) = names::parse_label(label) else {
+        return unknown();
+    };
+    let Some(hub) = s.hub(hub_name) else {
+        return unknown();
+    };
     if hub.match_tag(tag, now()).is_none() {
         return unknown();
     }
-    json(StatusCode::OK, serde_json::json!({ "hub": hub_name, "connected": hub.connected() }))
+    json(
+        StatusCode::OK,
+        serde_json::json!({ "hub": hub_name, "connected": hub.connected() }),
+    )
 }
 
 fn moved(s: &Shared, hub: &str) -> Resp {
@@ -153,7 +192,10 @@ fn moved(s: &Shared, hub: &str) -> Resp {
         return error(StatusCode::NOT_FOUND, "none");
     }
     match s.state.moved(hub, now()) {
-        Some(n) => json(StatusCode::OK, serde_json::json!({ "spki": n.spki, "body": n.body, "sig": n.sig })),
+        Some(n) => json(
+            StatusCode::OK,
+            serde_json::json!({ "spki": n.spki, "body": n.body, "sig": n.sig }),
+        ),
         None => error(StatusCode::NOT_FOUND, "none"),
     }
 }
@@ -162,10 +204,18 @@ fn admission(s: &Shared, b: &[u8], peer: SocketAddr) -> Resp {
     // Rate-limit by kind before checking signatures, which cost more.
     let pairing = serde_json::from_slice::<serde_json::Value>(b)
         .ok()
-        .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(|k| k == "pairing"))
+        .and_then(|v| {
+            v.get("kind")
+                .and_then(|k| k.as_str())
+                .map(|k| k == "pairing")
+        })
         .unwrap_or(true);
-    let limiter = if pairing { &s.limits.pairing_admits } else { &s.limits.pair_admits };
-    if !limiter.allow(peer.ip()) {
+    let limiter = if pairing {
+        &s.limits.pairing_admits
+    } else {
+        &s.limits.pair_admits
+    };
+    if !s.allow(limiter, peer.ip()) {
         s.counters.refuse(Refusal::AdmitRate);
         return rate_limited();
     }
@@ -180,10 +230,15 @@ fn admission(s: &Shared, b: &[u8], peer: SocketAddr) -> Resp {
                 s.counters.refuse(Refusal::Denied);
                 return error(StatusCode::FORBIDDEN, "denied");
             }
-            if s.state.admit(&a.endpoints, a.until, s.cfg.limits.max_admitted as usize).is_err() {
+            if s.state
+                .admit(&a.endpoints, a.until, s.cfg.limits.max_admitted as usize)
+                .is_err()
+            {
                 return error(StatusCode::SERVICE_UNAVAILABLE, "capacity");
             }
-            s.counters.iroh_admitted.store(s.state.admitted_count() as i64, Relaxed);
+            s.counters
+                .iroh_admitted
+                .store(s.state.admitted_count() as i64, Relaxed);
             json(
                 StatusCode::OK,
                 serde_json::json!({
@@ -198,7 +253,9 @@ fn admission(s: &Shared, b: &[u8], peer: SocketAddr) -> Resp {
 // HTTP dates (RFC 9110 IMF-fixdate), for the record store's Last-Modified.
 
 const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
-const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
 fn civil(days: i64) -> (i64, u32, u32) {
     let z = days + 719468;
@@ -236,7 +293,11 @@ pub fn parse_httpdate(text: &str) -> Option<u64> {
     let month = it.next()?;
     let m = MONTHS.iter().position(|x| *x == month)? as u32 + 1;
     let y: i64 = it.next()?.parse().ok()?;
-    let hms: Vec<u64> = it.next()?.split(':').map(|x| x.parse().ok()).collect::<Option<_>>()?;
+    let hms: Vec<u64> = it
+        .next()?
+        .split(':')
+        .map(|x| x.parse().ok())
+        .collect::<Option<_>>()?;
     if it.next()? != "GMT" || hms.len() != 3 || y < 1970 {
         return None;
     }
@@ -258,7 +319,10 @@ mod tests {
     #[test]
     fn http_dates() {
         assert_eq!(httpdate(784111777), "Sun, 06 Nov 1994 08:49:37 GMT");
-        assert_eq!(parse_httpdate("Sun, 06 Nov 1994 08:49:37 GMT"), Some(784111777));
+        assert_eq!(
+            parse_httpdate("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784111777)
+        );
         for t in [0u64, 951782400, 1_800_000_000, 4_102_444_800] {
             assert_eq!(parse_httpdate(&httpdate(t)), Some(t));
         }

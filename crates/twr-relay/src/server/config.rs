@@ -133,6 +133,10 @@ pub struct LimitsSection {
     pub max_admitted: u32,
     #[serde(default = "d_record_ttl")]
     pub record_ttl_seconds: u64,
+    /// Addresses or prefixes the per-address limits don't apply to, such as the monitoring
+    /// hosts that probe the relay every minute. The deny list still does.
+    #[serde(default)]
+    pub exempt_addresses: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -258,8 +262,10 @@ impl Default for Config {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let cfg: Config = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let cfg: Config =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -269,7 +275,8 @@ impl Config {
             bail!("relay.listen is empty");
         }
         if let Some(h) = &self.relay.hostname {
-            crate::RelayUrl::parse(&format!("relay://{h}")).with_context(|| format!("relay.hostname {h:?}"))?;
+            crate::RelayUrl::parse(&format!("relay://{h}"))
+                .with_context(|| format!("relay.hostname {h:?}"))?;
             if h.parse::<IpAddr>().is_ok() {
                 bail!("relay.hostname is a DNS name; put an IP address in relay.public_host");
             }
@@ -300,7 +307,12 @@ impl Config {
                 bail!("port_hub.hub {:?} is not a hub name", p.hub);
             }
         }
-        for a in &self.deny.addresses {
+        for a in self
+            .deny
+            .addresses
+            .iter()
+            .chain(&self.limits.exempt_addresses)
+        {
             super::limits::Prefix::parse(a).with_context(|| format!("deny.addresses {a:?}"))?;
         }
         if self.limits.bytes_per_second == 0 || self.limits.burst_bytes < 65536 {
@@ -311,9 +323,18 @@ impl Config {
 
     pub fn phone_suffixes(&self) -> Vec<String> {
         if !self.relay.phone_suffixes.is_empty() {
-            return self.relay.phone_suffixes.iter().map(|s| s.to_ascii_lowercase()).collect();
+            return self
+                .relay
+                .phone_suffixes
+                .iter()
+                .map(|s| s.to_ascii_lowercase())
+                .collect();
         }
-        vec![self.relay.hostname.clone().unwrap_or_else(|| "relay.invalid".into())]
+        vec![self
+            .relay
+            .hostname
+            .clone()
+            .unwrap_or_else(|| "relay.invalid".into())]
     }
 
     pub fn iroh_hostname(&self) -> Option<String> {
@@ -336,7 +357,9 @@ impl Config {
     }
 
     pub fn public_port(&self) -> u16 {
-        self.relay.public_port.unwrap_or_else(|| self.relay.listen[0].port())
+        self.relay
+            .public_port
+            .unwrap_or_else(|| self.relay.listen[0].port())
     }
 }
 

@@ -12,7 +12,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 
-struct ActiveGuard<'a>(&'a std::sync::atomic::AtomicU32, &'a super::counters::Counters);
+struct ActiveGuard<'a>(
+    &'a std::sync::atomic::AtomicU32,
+    &'a super::counters::Counters,
+);
 impl Drop for ActiveGuard<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Relaxed);
@@ -20,8 +23,15 @@ impl Drop for ActiveGuard<'_> {
     }
 }
 
-pub async fn serve(shared: Arc<Shared>, tcp: TcpStream, peer: SocketAddr, hub_name: String, tag: Option<String>, mode: &str) {
-    if !shared.limits.phone_attempts.allow(peer.ip()) {
+pub async fn serve(
+    shared: Arc<Shared>,
+    tcp: TcpStream,
+    peer: SocketAddr,
+    hub_name: String,
+    tag: Option<String>,
+    mode: &str,
+) {
+    if !shared.allow(&shared.limits.phone_attempts, peer.ip()) {
         shared.counters.refuse(Refusal::PhoneRate);
         return;
     }
@@ -40,7 +50,13 @@ pub async fn serve(shared: Arc<Shared>, tcp: TcpStream, peer: SocketAddr, hub_na
         },
         None => None,
     };
-    let Some((open, session_cancel)) = hub.session.lock().unwrap().as_ref().map(|s| (s.open.clone(), s.cancel.clone())) else {
+    let Some((open, session_cancel)) = hub
+        .session
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| (s.open.clone(), s.cancel.clone()))
+    else {
         shared.counters.refuse(Refusal::HubOffline);
         return;
     };
@@ -76,7 +92,11 @@ pub async fn serve(shared: Arc<Shared>, tcp: TcpStream, peer: SocketAddr, hub_na
             return;
         }
     };
-    let header = Msg::Phone { phone: phone_id, mode: mode.into(), remote: peer.to_string() };
+    let header = Msg::Phone {
+        phone: phone_id,
+        mode: mode.into(),
+        remote: peer.to_string(),
+    };
     if proto::write_frame(&mut stream, &header).await.is_err() {
         return;
     }
@@ -91,8 +111,22 @@ pub async fn serve(shared: Arc<Shared>, tcp: TcpStream, peer: SocketAddr, hub_na
     let start = Instant::now();
     let (pr, pw) = tcp.into_split();
     let (hr, hw) = tokio::io::split(stream);
-    let up = pump(pr, hw, Bucket::new(rate, burst), to_hub.clone(), last.clone(), start);
-    let down = pump(hr, pw, Bucket::new(rate, burst), to_phone.clone(), last.clone(), start);
+    let up = pump(
+        pr,
+        hw,
+        Bucket::new(rate, burst),
+        to_hub.clone(),
+        last.clone(),
+        start,
+    );
+    let down = pump(
+        hr,
+        pw,
+        Bucket::new(rate, burst),
+        to_phone.clone(),
+        last.clone(),
+        start,
+    );
     let both = async { tokio::try_join!(up, down) };
     tokio::pin!(both);
     let mut flushed = (0u64, 0u64);
@@ -115,7 +149,13 @@ pub async fn serve(shared: Arc<Shared>, tcp: TcpStream, peer: SocketAddr, hub_na
     flush(&shared, &hub_name, &to_hub, &to_phone, &mut flushed);
 }
 
-fn flush(shared: &Shared, hub: &str, to_hub: &AtomicU64, to_phone: &AtomicU64, done: &mut (u64, u64)) {
+fn flush(
+    shared: &Shared,
+    hub: &str,
+    to_hub: &AtomicU64,
+    to_phone: &AtomicU64,
+    done: &mut (u64, u64),
+) {
     let (a, b) = (to_hub.load(Relaxed), to_phone.load(Relaxed));
     let (da, db) = (a - done.0, b - done.1);
     shared.counters.bytes_to_hub.fetch_add(da, Relaxed);
@@ -125,7 +165,14 @@ fn flush(shared: &Shared, hub: &str, to_hub: &AtomicU64, to_phone: &AtomicU64, d
 }
 
 /// Copies one direction, at most `bucket`'s rate, recording activity for the idle timeout.
-async fn pump<R, W>(mut r: R, mut w: W, mut bucket: Bucket, count: Arc<AtomicU64>, last: Arc<AtomicU64>, start: Instant) -> std::io::Result<()>
+async fn pump<R, W>(
+    mut r: R,
+    mut w: W,
+    mut bucket: Bucket,
+    count: Arc<AtomicU64>,
+    last: Arc<AtomicU64>,
+    start: Instant,
+) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,

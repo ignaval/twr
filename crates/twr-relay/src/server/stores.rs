@@ -71,7 +71,14 @@ impl Records {
         } else if map.len() >= max {
             return Err(PutError::Full);
         }
-        map.insert(*key, Record { payload: Bytes::copy_from_slice(body), timestamp_us: ts, stored_unix: now });
+        map.insert(
+            *key,
+            Record {
+                payload: Bytes::copy_from_slice(body),
+                timestamp_us: ts,
+                stored_unix: now,
+            },
+        );
         Ok(())
     }
 
@@ -87,6 +94,10 @@ impl Records {
         map.len()
     }
 }
+
+/// The admission table is full.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Full;
 
 // ---- Persisted state --------------------------------------------------------------------------
 
@@ -127,7 +138,10 @@ impl State {
         let path = state_dir.join(STATE_FILE);
         let saved: Saved = match std::fs::read(&path) {
             Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
-                tracing::warn!("{} is unreadable ({e}); starting with empty state", path.display());
+                tracing::warn!(
+                    "{} is unreadable ({e}); starting with empty state",
+                    path.display()
+                );
                 Saved::default()
             }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Saved::default(),
@@ -157,7 +171,13 @@ impl State {
             return Ok(());
         }
         let saved = Saved {
-            admissions: self.admissions.lock().unwrap().iter().map(|(k, v)| (hex::encode(k), *v)).collect(),
+            admissions: self
+                .admissions
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (hex::encode(k), *v))
+                .collect(),
             moved: self.moved.lock().unwrap().clone().into_iter().collect(),
             usage: self.usage.lock().unwrap().clone().into_iter().collect(),
         };
@@ -203,11 +223,11 @@ impl State {
     // Admissions.
 
     /// Admits `endpoints` until `until`, never shortening an admission. `Err` if the table is full.
-    pub fn admit(&self, endpoints: &[[u8; 32]], until: u64, max: usize) -> Result<(), ()> {
+    pub fn admit(&self, endpoints: &[[u8; 32]], until: u64, max: usize) -> Result<(), Full> {
         let mut a = self.admissions.lock().unwrap();
         let new = endpoints.iter().filter(|e| !a.contains_key(*e)).count();
         if a.len() + new > max {
-            return Err(());
+            return Err(Full);
         }
         for e in endpoints {
             let slot = a.entry(*e).or_insert(0);
@@ -219,7 +239,11 @@ impl State {
     }
 
     pub fn is_admitted(&self, endpoint: &[u8; 32], now: u64) -> bool {
-        self.admissions.lock().unwrap().get(endpoint).is_some_and(|u| *u > now)
+        self.admissions
+            .lock()
+            .unwrap()
+            .get(endpoint)
+            .is_some_and(|u| *u > now)
     }
 
     pub fn admitted_count(&self) -> usize {
@@ -234,7 +258,12 @@ impl State {
     }
 
     pub fn moved(&self, hub: &str, now: u64) -> Option<MovedNote> {
-        self.moved.lock().unwrap().get(hub).filter(|n| n.stored + MOVED_DAYS * 86400 > now).cloned()
+        self.moved
+            .lock()
+            .unwrap()
+            .get(hub)
+            .filter(|n| n.stored + MOVED_DAYS * 86400 > now)
+            .cloned()
     }
 
     // Usage.
@@ -244,7 +273,10 @@ impl State {
             return;
         }
         let mut u = self.usage.lock().unwrap();
-        *u.entry(hub.to_string()).or_default().entry(now / 86400).or_insert(0) += bytes;
+        *u.entry(hub.to_string())
+            .or_default()
+            .entry(now / 86400)
+            .or_insert(0) += bytes;
         drop(u);
         self.mark();
     }
@@ -256,7 +288,12 @@ impl State {
             .lock()
             .unwrap()
             .get(hub)
-            .map(|d| d.iter().filter(|(day, _)| *day + USAGE_DAYS > today).map(|(_, b)| *b).sum())
+            .map(|d| {
+                d.iter()
+                    .filter(|(day, _)| *day + USAGE_DAYS > today)
+                    .map(|(_, b)| *b)
+                    .sum()
+            })
             .unwrap_or(0)
     }
 }
@@ -279,19 +316,35 @@ mod tests {
         let a = record(&k, 10, b"\0\0\0\0\0\0\0\0\0\0\0\0");
         assert_eq!(r.put(&pk, &a, 100, 10), Ok(()));
         assert_eq!(r.put(&pk, &a, 100, 10), Ok(()), "same record again is fine");
-        assert_eq!(r.put(&pk, &record(&k, 9, b"x"), 100, 10), Err(PutError::Older));
-        assert_eq!(r.put(&pk, &record(&k, 10, b"y"), 100, 10), Err(PutError::SameTimestamp));
+        assert_eq!(
+            r.put(&pk, &record(&k, 9, b"x"), 100, 10),
+            Err(PutError::Older)
+        );
+        assert_eq!(
+            r.put(&pk, &record(&k, 10, b"y"), 100, 10),
+            Err(PutError::SameTimestamp)
+        );
         let mut bad = record(&k, 11, b"z");
         bad[0] ^= 1;
         assert_eq!(r.put(&pk, &bad, 100, 10), Err(PutError::Bad));
-        assert_eq!(r.put(&pk, &record(&k, 11, &[0; 1001]), 100, 10), Err(PutError::Bad));
+        assert_eq!(
+            r.put(&pk, &record(&k, 11, &[0; 1001]), 100, 10),
+            Err(PutError::Bad)
+        );
         assert!(r.get(&pk, 150, 100).is_some());
         assert!(r.get(&pk, 200, 100).is_none());
         assert_eq!(r.sweep(200, 100), 0);
-        let other: [u8; 32] = IdentityKey::ed25519_from_seed(&[4; 32]).unwrap().public_raw().try_into().unwrap();
+        let other: [u8; 32] = IdentityKey::ed25519_from_seed(&[4; 32])
+            .unwrap()
+            .public_raw()
+            .try_into()
+            .unwrap();
         assert_eq!(r.put(&pk, &a, 100, 1), Ok(()));
         let k2 = IdentityKey::ed25519_from_seed(&[4; 32]).unwrap();
-        assert_eq!(r.put(&other, &record(&k2, 1, b""), 100, 1), Err(PutError::Full));
+        assert_eq!(
+            r.put(&other, &record(&k2, 1, b""), 100, 1),
+            Err(PutError::Full)
+        );
     }
 
     #[test]
@@ -301,7 +354,15 @@ mod tests {
         s.admit(&[[1; 32]], 1000, 10).unwrap();
         s.admit(&[[1; 32]], 500, 10).unwrap();
         s.add_usage("h", 86400 * 5, 7);
-        s.set_moved("h", MovedNote { spki: "s".into(), body: "b".into(), sig: "g".into(), stored: 100 });
+        s.set_moved(
+            "h",
+            MovedNote {
+                spki: "s".into(),
+                body: "b".into(),
+                sig: "g".into(),
+                stored: 100,
+            },
+        );
         s.save().unwrap();
         let t = State::load(dir.path()).unwrap();
         assert!(t.is_admitted(&[1; 32], 999));

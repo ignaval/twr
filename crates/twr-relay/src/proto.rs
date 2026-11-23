@@ -128,12 +128,22 @@ pub enum Msg {
 }
 
 const KNOWN: &[&str] = &[
-    "hello", "welcome", "phones", "phones_ok", "moved", "moved_ok", "ping", "pong", "drain",
-    "error", "phone",
+    "hello",
+    "welcome",
+    "phones",
+    "phones_ok",
+    "moved",
+    "moved_ok",
+    "ping",
+    "pong",
+    "drain",
+    "error",
+    "phone",
 ];
 
 /// A frame as read: a known message, or an object with a type this build doesn't know.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // one per frame read, moved straight into a match
 pub enum Incoming {
     Msg(Msg),
     Unknown(String),
@@ -141,14 +151,21 @@ pub enum Incoming {
 
 impl Msg {
     pub fn error(code: &str, message: &str, fatal: bool) -> Self {
-        Msg::Error { code: code.into(), message: message.into(), fatal, ref_: None }
+        Msg::Error {
+            code: code.into(),
+            message: message.into(),
+            fatal,
+            ref_: None,
+        }
     }
 }
 
 /// Decodes one frame body (§2): one JSON object with a string `type`.
 pub fn decode(body: &[u8]) -> Result<Incoming> {
     let value: serde_json::Value = serde_json::from_slice(body)?;
-    let Some(obj) = value.as_object() else { bail!("a frame must be a JSON object") };
+    let Some(obj) = value.as_object() else {
+        bail!("a frame must be a JSON object")
+    };
     let Some(kind) = obj.get("type").and_then(|t| t.as_str()) else {
         bail!("a frame needs a string type")
     };
@@ -212,7 +229,12 @@ mod tests {
         assert!(decode(b"[]").is_err());
         assert!(decode(br#"{"type":3}"#).is_err());
         assert!(decode(br#"{"type":"ping"}"#).is_err());
-        let e = Msg::Error { code: "x".into(), message: "m".into(), fatal: true, ref_: Some("t".into()) };
+        let e = Msg::Error {
+            code: "x".into(),
+            message: "m".into(),
+            fatal: true,
+            ref_: Some("t".into()),
+        };
         let text = String::from_utf8(encode(&e)).unwrap();
         assert!(text.contains(r#""ref":"t""#), "{text}");
     }
@@ -222,7 +244,10 @@ mod tests {
         let mut buf = Vec::new();
         write_frame(&mut buf, &Msg::Ping { n: 1 }).await.unwrap();
         let mut r = buf.as_slice();
-        assert_eq!(read_frame(&mut r).await.unwrap(), Some(Incoming::Msg(Msg::Ping { n: 1 })));
+        assert_eq!(
+            read_frame(&mut r).await.unwrap(),
+            Some(Incoming::Msg(Msg::Ping { n: 1 }))
+        );
         assert_eq!(read_frame(&mut r).await.unwrap(), None);
         let mut big = (MAX_FRAME as u32 + 1).to_be_bytes().to_vec();
         big.extend_from_slice(b"{}");

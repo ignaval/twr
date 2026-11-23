@@ -59,7 +59,8 @@ pub fn parse(buf: &[u8]) -> Parse {
             if handshake[0] != 1 {
                 return Parse::Invalid;
             }
-            let body_len = u32::from_be_bytes([0, handshake[1], handshake[2], handshake[3]]) as usize;
+            let body_len =
+                u32::from_be_bytes([0, handshake[1], handshake[2], handshake[3]]) as usize;
             if body_len > MAX_HELLO {
                 return Parse::TooLarge;
             }
@@ -213,10 +214,13 @@ fn normalize(raw: &[u8]) -> Option<String> {
     if raw.is_empty() || raw.len() > 253 {
         return None;
     }
-    if !raw.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'-' || c == b'.' || c == b'_') {
+    if !raw
+        .iter()
+        .all(|&c| c.is_ascii_alphanumeric() || c == b'-' || c == b'.' || c == b'_')
+    {
         return None;
     }
-    Some(String::from_utf8(raw.to_ascii_lowercase()).ok()?)
+    String::from_utf8(raw.to_ascii_lowercase()).ok()
 }
 
 #[cfg(test)]
@@ -232,7 +236,9 @@ pub(crate) mod tests {
         .with_safe_default_protocol_versions()
         .unwrap()
         .dangerous()
-        .with_custom_certificate_verifier(std::sync::Arc::new(crate::tls::PinVerifier::new([0; 32])))
+        .with_custom_certificate_verifier(std::sync::Arc::new(crate::tls::PinVerifier::new(
+            [0; 32],
+        )))
         .with_no_client_auth();
         cfg.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
         let name = match sni {
@@ -248,7 +254,9 @@ pub(crate) mod tests {
     #[test]
     fn reads_rustls_hellos() {
         let h = rustls_hello(Some("Hub-Tag.EU.relay.twr.tools"), &[b"twr-relay/1", b"h2"]);
-        let Parse::Done(hello) = parse(&h) else { panic!("{:?}", parse(&h)) };
+        let Parse::Done(hello) = parse(&h) else {
+            panic!("{:?}", parse(&h))
+        };
         assert_eq!(hello.sni.as_deref(), Some("hub-tag.eu.relay.twr.tools"));
         assert_eq!(hello.alpn, vec![b"twr-relay/1".to_vec(), b"h2".to_vec()]);
         let ip = rustls_hello(None, &[]);
@@ -274,7 +282,9 @@ pub(crate) mod tests {
         split.extend_from_slice(&[22, 3, 1]);
         split.extend_from_slice(&(b.len() as u16).to_be_bytes());
         split.extend_from_slice(b);
-        let Parse::Done(hello) = parse(&split) else { panic!() };
+        let Parse::Done(hello) = parse(&split) else {
+            panic!()
+        };
         assert_eq!(hello.sni.as_deref(), Some("split.example"));
     }
 
@@ -285,6 +295,9 @@ pub(crate) mod tests {
         // A ServerHello (type 2).
         assert_eq!(parse(&[22, 3, 3, 0, 4, 2, 0, 0, 0]), Parse::Invalid);
         // A ClientHello that claims to be huge.
-        assert_eq!(parse(&[22, 3, 1, 0, 4, 1, 0xff, 0xff, 0xff]), Parse::TooLarge);
+        assert_eq!(
+            parse(&[22, 3, 1, 0, 4, 1, 0xff, 0xff, 0xff]),
+            Parse::TooLarge
+        );
     }
 }

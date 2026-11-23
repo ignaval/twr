@@ -44,9 +44,15 @@ pub struct Certs {
     pub self_pin: Option<[u8; 32]>,
 }
 
-fn certified(chain: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Result<Arc<CertifiedKey>> {
+fn certified(
+    chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<Arc<CertifiedKey>> {
     let provider = rustls::crypto::ring::default_provider();
-    let signer = provider.key_provider.load_private_key(key).map_err(|e| anyhow!("loading the key: {e}"))?;
+    let signer = provider
+        .key_provider
+        .load_private_key(key)
+        .map_err(|e| anyhow!("loading the key: {e}"))?;
     Ok(Arc::new(CertifiedKey::new(chain, signer)))
 }
 
@@ -62,7 +68,11 @@ pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let tmp = path.with_extension("tmp");
     let _ = std::fs::remove_file(&tmp);
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
     f.write_all(data)?;
     f.sync_all()?;
     std::fs::rename(&tmp, path)?;
@@ -100,7 +110,9 @@ fn self_signed(cfg: &Config) -> Result<(Arc<CertifiedKey>, [u8; 32])> {
         sans.push("relay.invalid".into());
     }
     let mut params = rcgen::CertificateParams::new(sans)?;
-    params.distinguished_name.push(rcgen::DnType::CommonName, "twr relay");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "twr relay");
     params.not_before = rcgen::date_time_ymd(2026, 1, 1);
     params.not_after = rcgen::date_time_ymd(2125, 1, 1);
     let cert = params.self_signed(&pair)?;
@@ -116,7 +128,8 @@ fn load_files(cert: &Path, key: &Path) -> Result<Arc<CertifiedKey>> {
     if chain.is_empty() {
         bail!("{} holds no certificate", cert.display());
     }
-    let key = PrivateKeyDer::from_pem_file(key).map_err(|e| anyhow!("reading {}: {e}", key.display()))?;
+    let key =
+        PrivateKeyDer::from_pem_file(key).map_err(|e| anyhow!("reading {}: {e}", key.display()))?;
     certified(chain, key)
 }
 
@@ -127,20 +140,32 @@ struct Cache {
 }
 
 fn first_cert(pem: &[u8]) -> Option<Vec<u8>> {
-    CertificateDer::pem_slice_iter(pem).next()?.ok().map(|c| c.to_vec())
+    CertificateDer::pem_slice_iter(pem)
+        .next()?
+        .ok()
+        .map(|c| c.to_vec())
 }
 
 #[async_trait::async_trait]
 impl tokio_rustls_acme::CertCache for Cache {
     type EC = std::io::Error;
-    async fn load_cert(&self, domains: &[String], directory_url: &str) -> Result<Option<Vec<u8>>, Self::EC> {
+    async fn load_cert(
+        &self,
+        domains: &[String],
+        directory_url: &str,
+    ) -> Result<Option<Vec<u8>>, Self::EC> {
         let r = self.dir.load_cert(domains, directory_url).await?;
         if let Some(c) = r.as_deref().and_then(first_cert) {
             note_expiry(&self.counters, &c);
         }
         Ok(r)
     }
-    async fn store_cert(&self, domains: &[String], directory_url: &str, cert: &[u8]) -> Result<(), Self::EC> {
+    async fn store_cert(
+        &self,
+        domains: &[String],
+        directory_url: &str,
+        cert: &[u8],
+    ) -> Result<(), Self::EC> {
         if let Some(c) = first_cert(cert) {
             note_expiry(&self.counters, &c);
         }
@@ -151,11 +176,22 @@ impl tokio_rustls_acme::CertCache for Cache {
 #[async_trait::async_trait]
 impl tokio_rustls_acme::AccountCache for Cache {
     type EA = std::io::Error;
-    async fn load_account(&self, contact: &[String], directory_url: &str) -> Result<Option<Vec<u8>>, Self::EA> {
+    async fn load_account(
+        &self,
+        contact: &[String],
+        directory_url: &str,
+    ) -> Result<Option<Vec<u8>>, Self::EA> {
         self.dir.load_account(contact, directory_url).await
     }
-    async fn store_account(&self, contact: &[String], directory_url: &str, account: &[u8]) -> Result<(), Self::EA> {
-        self.dir.store_account(contact, directory_url, account).await
+    async fn store_account(
+        &self,
+        contact: &[String],
+        directory_url: &str,
+        account: &[u8],
+    ) -> Result<(), Self::EA> {
+        self.dir
+            .store_account(contact, directory_url, account)
+            .await
     }
 }
 
@@ -165,7 +201,10 @@ impl Certs {
             TlsMode::SelfSigned => {
                 let (key, pin) = self_signed(cfg)?;
                 note_expiry(&counters, key.cert[0].as_ref());
-                Ok(Self { resolver: Arc::new(Resolver(Inner::Static(RwLock::new(key)))), self_pin: Some(pin) })
+                Ok(Self {
+                    resolver: Arc::new(Resolver(Inner::Static(RwLock::new(key)))),
+                    self_pin: Some(pin),
+                })
             }
             TlsMode::Files => {
                 let (cp, kp) = (cfg.tls.cert.clone().unwrap(), cfg.tls.key.clone().unwrap());
@@ -189,21 +228,27 @@ impl Certs {
                                     *lock.write().unwrap() = k;
                                 }
                             }
-                            Err(e) => tracing::warn!("reloading the certificate files failed: {e:#}"),
+                            Err(e) => {
+                                tracing::warn!("reloading the certificate files failed: {e:#}")
+                            }
                         }
                     }
                 });
-                Ok(Self { resolver, self_pin: None })
+                Ok(Self {
+                    resolver,
+                    self_pin: None,
+                })
             }
             TlsMode::Acme => {
                 let mut domains: Vec<String> = cfg.relay.hostname.iter().cloned().collect();
                 domains.extend(cfg.iroh_hostname());
                 let client_tls = match &cfg.tls.acme_ca_roots {
                     Some(path) => {
-                        let roots: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
-                            .with_context(|| format!("reading {}", path.display()))?
-                            .collect::<Result<_, _>>()
-                            .map_err(|e| anyhow!("{e}"))?;
+                        let roots: Vec<CertificateDer<'static>> =
+                            CertificateDer::pem_file_iter(path)
+                                .with_context(|| format!("reading {}", path.display()))?
+                                .collect::<Result<_, _>>()
+                                .map_err(|e| anyhow!("{e}"))?;
                         let mut store = rustls::RootCertStore::empty();
                         for r in roots {
                             store.add(r)?;
@@ -222,9 +267,15 @@ impl Certs {
                 };
                 let dir = cfg.relay.state_dir.join(ACME_DIR);
                 std::fs::create_dir_all(&dir)?;
-                let mut acme = tokio_rustls_acme::AcmeConfig::new_with_client_tls_config(domains, Arc::new(client_tls))
-                    .directory(&cfg.tls.acme_directory)
-                    .cache(Cache { dir: tokio_rustls_acme::caches::DirCache::new(dir), counters });
+                let mut acme = tokio_rustls_acme::AcmeConfig::new_with_client_tls_config(
+                    domains,
+                    Arc::new(client_tls),
+                )
+                .directory(&cfg.tls.acme_directory)
+                .cache(Cache {
+                    dir: tokio_rustls_acme::caches::DirCache::new(dir),
+                    counters,
+                });
                 if let Some(c) = &cfg.tls.acme_contact {
                     acme = acme.contact_push(c);
                 }
@@ -243,7 +294,10 @@ impl Certs {
                         }
                     }
                 });
-                Ok(Self { resolver: Arc::new(Resolver(Inner::Acme(resolver))), self_pin: None })
+                Ok(Self {
+                    resolver: Arc::new(Resolver(Inner::Acme(resolver))),
+                    self_pin: None,
+                })
             }
         }
     }
@@ -256,7 +310,11 @@ impl Certs {
             .with_no_client_auth()
             .with_cert_resolver(self.resolver.clone());
         c.alpn_protocols = proto::HUB_ALPNS.iter().map(|a| a.to_vec()).collect();
-        c.alpn_protocols.extend([b"h2".to_vec(), b"http/1.1".to_vec(), proto::ACME_ALPN.to_vec()]);
+        c.alpn_protocols.extend([
+            b"h2".to_vec(),
+            b"http/1.1".to_vec(),
+            proto::ACME_ALPN.to_vec(),
+        ]);
         Arc::new(c)
     }
 
