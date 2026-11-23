@@ -926,8 +926,9 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
     ),
     (
         "/phone",
-        "/phone [read-only|operate|terminal|admin]",
-        "pair a phone: shows a private QR code and one-use code",
+        "/phone [access]",
+        "pair a phone: shows a private QR code and one-use code; access: read-only, operate (the \
+         default), terminal or admin",
         &[],
     ),
     (

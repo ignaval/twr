@@ -15872,7 +15872,7 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(
             items,
-            ["/help", "/orch", "/trash", "/attach"],
+            ["/help", "/phone", "/orch", "/trash", "/attach"],
             "/orch: its alias has an h"
         );
         // Enter on a partial command without arguments completes and runs it.
