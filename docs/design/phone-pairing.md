@@ -198,3 +198,16 @@ Every case returns a `Hub`; pinned ones carry `pin`, `routes` and `route`. The `
 **The `network` event** fires when the device's default network changes. When it fires, the TypeScript layer reconnects at once if it was connected, or was trying to be, without waiting for a timeout or backoff.
 
 **Errors.** `pair` and `connect` reject with messages that name the route and the reason: unreachable, timed out, another device's key, or bad code. A pin mismatch carries `PIN_MISMATCH` in the message.
+
+## Gateway command-line output (for `twr phone`, the TUI and the desktop wizard)
+
+In pinned mode, `--pair --pair-json`, and `twr gateway --pair --pair-json` once the gateway is folded into `twr`, prints one JSON line. It is a superset of today's:
+
+```json
+{"code":"ABCDEFGHJK23","expires_at":1763900000,"scopes":["read","operate"],"gateway_id":"<uuid>",
+ "invitation":{ …the version 2 invitation object… },"link":"twr://pair#…"}
+```
+
+`expires_at` is seconds, as today; the invitation's `expiresAt` is milliseconds. In certificate mode the output is unchanged, with no `invitation` and no `link`.
+
+`--gateway-info` adds `"pin"` (absent in certificate mode) and `"routes"`, the list the gateway would put in an invitation now.
