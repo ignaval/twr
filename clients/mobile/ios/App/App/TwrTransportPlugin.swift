@@ -131,8 +131,9 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
         var errorDescription: String? { message }
     }
     private func reject(_ call: CAPPluginCall, _ error: Error) {
-        if let failure = error as? RaceFailure { call.reject(failure.localizedDescription, failure.pinMismatch ? "PIN_MISMATCH" : nil) }
+        if let failure = error as? RaceFailure { call.reject(failure.localizedDescription, failure.code) }
         else if let failure = error as? Failure { call.reject(failure.message, failure.code) }
+        else if let failure = error as? URLError { call.reject(failure.localizedDescription, failure.code == .timedOut ? "TIMEOUT" : "UNREACHABLE") }
         else { call.reject(error.localizedDescription) }
     }
     private var invitationScanner: InvitationScanner?
@@ -150,7 +151,7 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
                         self?.invitationScanner = nil; self?.scanningInvitation = false
                         switch result {
                         case .success(let value):
-                            if value.utf8.count <= 2048 { call.resolve(["invitation": value]) } else { call.reject("Scan a twr pairing invitation") }
+                            if value.utf8.count <= 4096 { call.resolve(["invitation": value]) } else { call.reject("Scan a twr pairing invitation") }
                         case .failure(.cancelled): call.reject("QR scan cancelled", "SCAN_CANCELLED")
                         case .failure(.unavailable): call.reject("This device has no available QR camera. Enter the code manually.", "CAMERA_UNAVAILABLE")
                         }
@@ -181,20 +182,23 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
                 let url = try endpoint(call.getString("url") ?? "")
                 let (healthData, healthResponse) = try await network.data(from:url.appendingPathComponent("health"))
                 guard (healthResponse as? HTTPURLResponse)?.statusCode == 200,
-                      let health=try JSONSerialization.jsonObject(with:healthData) as? [String:Any] else {throw Failure("Could not identify the hub")}
+                      let health=try JSONSerialization.jsonObject(with:healthData) as? [String:Any] else {throw Failure("Could not identify the hub", code: "UNREACHABLE")}
                 if let gateway=health["gateway_id"] as? String { try ensureNotPaired(gateway) }
                 var request = URLRequest(url: url.appendingPathComponent("v1/pair")); request.httpMethod = "POST"; request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 request.httpBody = try JSONSerialization.data(withJSONObject: ["code": call.getString("code") ?? "", "name": call.getString("name") ?? ""])
                 let (data, response) = try await network.data(for: request)
-                if (response as? HTTPURLResponse)?.statusCode != 200 {
+                if let status = (response as? HTTPURLResponse)?.statusCode, status != 200 {
                     let detail=(try? JSONSerialization.jsonObject(with:data) as? [String:Any])?["error"] as? String
-                    throw Failure(String((detail ?? "Pairing failed. Check the code and hub URL.").prefix(240)))
+                    throw Failure(String((detail ?? "Pairing failed. Check the code and hub URL.").prefix(240)), code: status == 429 ? "RATE_LIMITED" : "PAIR_REFUSED")
                 }
                 guard (response as? HTTPURLResponse)?.statusCode == 200, var record = try JSONSerialization.jsonObject(with: data) as? [String: Any], let token = record["token"] as? String, token.count == 64 else { throw Failure("Pairing failed. Check the code and hub URL.") }
+                // The mode is how it was paired: a field in the answer never makes this a pinned
+                // hub, so a credential never crosses modes.
+                for pinned in ["pin", "iroh", "routes", "last", "route"] { record.removeValue(forKey: pinned) }
                 let id = UUID().uuidString; record["url"] = url.absoluteString; record["name"] = call.getString("hubName") ?? "My hub"
                 try insertHub(id, record)
                 call.resolve(metadata(id, record))
-            } catch { call.reject(error.localizedDescription) }
+            } catch { reject(call, error) }
         }
     }
     /// Races the invitation's routes with its pin, then pairs on the winner.
@@ -202,8 +206,8 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
         Task {
             do {
                 let hubName = call.getString("hubName") ?? "My hub"
-                guard let pin = Pairing.decodePin(pinText) else { throw Failure("This invitation's hub key is malformed. Scan it again.") }
-                guard let code = Pairing.normalizeCode(call.getString("code") ?? "") else { throw Failure("This invitation's code is malformed. Scan it again.") }
+                guard let pin = Pairing.decodePin(pinText) else { throw Failure("This invitation's hub key is malformed. Scan it again.", code: "BAD_INVITATION") }
+                guard let code = Pairing.normalizeCode(call.getString("code") ?? "") else { throw Failure("This invitation's code is malformed. Scan it again.", code: "BAD_CODE") }
                 let gatewayID = call.getString("gatewayId") ?? ""
                 let routes = (call.getArray("routes", String.self) ?? []).compactMap { PairingRoute($0)?.text }
                 try ensureNotPaired(gatewayID)
@@ -222,7 +226,7 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
         Task {
             do {
                 let hubName = call.getString("hubName") ?? "My hub"
-                guard let route = Pairing.typedAddress(address) else { throw Failure("Enter the hub's address as host or host:port") }
+                guard let route = Pairing.typedAddress(address) else { throw Failure("Enter the hub's address as host or host:port", code: "BAD_ADDRESS") }
                 guard let code = Pairing.normalizeCode(call.getString("code") ?? "") else { throw Failure("Enter the 12-character pairing code the hub shows", code: "BAD_CODE") }
                 // Argon2id (64 MiB) runs on a background queue while the network steps go on.
                 async let stretched = TwrTransportPlugin.stretch(code)
@@ -232,7 +236,7 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
                 catch let error as RouteError { throw RaceFailure(failures: [(route: route.text, error: error)], hubName: hubName) }
                 guard let presented = capture.presented else { throw RaceFailure(failures: [(route: route.text, error: .unsupportedKey)], hubName: hubName) }
                 guard found.advertisedPin != nil else {
-                    throw Failure("\(route.text): this hub uses its own certificate. Pair it with its https:// address instead.")
+                    throw Failure("\(route.text): this hub uses its own certificate. Pair it with its https:// address instead.", code: "CERTIFICATE_MODE")
                 }
                 try ensureNotPaired(found.gatewayID)
                 var nonce = [UInt8](repeating: 0, count: Pairing.nonceLength)
@@ -242,14 +246,14 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
                 catch let error as RouteError { throw RaceFailure(failures: [(route: route.text, error: error)], hubName: hubName) }
                 switch response.status {
                 case 200: break
-                case 404: throw Failure("\(route.text): no pairing code is open on that hub. Start pairing on the hub again.")
-                case 429: throw Failure("\(route.text): too many pairing attempts. Wait a minute and try again.")
-                default: throw Failure("\(route.text): the hub refused the proof request (\(response.status))")
+                case 404: throw Failure("\(route.text): no pairing code is open on that hub. Start pairing on the hub again.", code: "NO_INVITATION")
+                case 429: throw Failure("\(route.text): too many pairing attempts. Wait a minute and try again.", code: "RATE_LIMITED")
+                default: throw Failure("\(route.text): the hub refused the proof request (\(response.status))", code: "UNREACHABLE")
                 }
                 guard let proofText = PinnedHTTP.json(response)?["proof"] as? String, let proof = Pairing.base64URLDecode(proofText), proof.count == 32 else {
-                    throw Failure("\(route.text): the hub's answer is not a pairing proof")
+                    throw Failure("\(route.text): the hub's answer is not a pairing proof. Check the code; if it is right, another device is answering at this address.", code: "BAD_CODE")
                 }
-                guard let stretchedCode = await stretched else { throw Failure("Could not derive the pairing key") }
+                guard let stretchedCode = await stretched else { throw Failure("Couldn't check the code on this phone. Scan the QR code instead.", code: "KDF_FAILED") }
                 guard Pairing.verifyProof(proof, key: Pairing.proofKey(stretched: stretchedCode), pin: presented, nonce: Data(nonce), gatewayID: found.gatewayID) else {
                     throw Failure("\(route.text): the code doesn't match the hub there. Check the code; if it is right, another device is answering at this address.", code: "BAD_CODE")
                 }
@@ -273,7 +277,7 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
         let json = PinnedHTTP.json(response)
         guard response.status == 200 else {
             let detail = (json?["error"] as? String) ?? "Pairing failed (\(response.status)). Check the code."
-            throw Failure("\(route.text): \(detail.prefix(240))")
+            throw Failure("\(route.text): \(detail.prefix(240))", code: response.status == 429 ? "RATE_LIMITED" : "PAIR_REFUSED")
         }
         guard let record = json, let token = record["token"] as? String, token.count == 64 else { throw Failure("\(route.text): pairing failed. Check the code.") }
         return record
@@ -297,7 +301,7 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
     @objc public func updateRoutes(_ call: CAPPluginCall) {
         let id = call.getString("id") ?? ""
         let routes = call.getArray("routes", String.self) ?? []
-        guard routes.count <= 64 else { call.reject("Too many routes"); return }
+        guard routes.count <= 64 else { call.reject("Too many routes", "BAD_ROUTES"); return }
         do {
             let found = try updateHub(id) { hub in
                 guard hub["pin"] != nil else { return }
@@ -306,7 +310,7 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
                 let kept = Set(merged.map(\.route))
                 hub["last"] = ((hub["last"] as? [String: String]) ?? [:]).filter { kept.contains($0.value) }
             }
-            if found { call.resolve() } else { call.reject("Paired hub not found") }
+            if found { call.resolve() } else { call.reject("Paired hub not found", "UNKNOWN_HUB") }
         } catch { call.reject(error.localizedDescription) }
     }
 
@@ -347,9 +351,9 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
     @objc public func connect(_ call: CAPPluginCall) {
         do {
             let id = call.getString("id") ?? ""
-            guard let hub = try vault()[id], let token = hub["token"] as? String else { throw Failure("Paired hub not found") }
+            guard let hub = try vault()[id], let token = hub["token"] as? String else { throw Failure("Paired hub not found", code: "UNKNOWN_HUB") }
             if hub["pin"] != nil { connectPinned(call, id: id, hub: hub, token: token); return }
-            guard let rawURL = hub["url"] as? String else { throw Failure("Paired hub not found") }
+            guard let rawURL = hub["url"] as? String else { throw Failure("Paired hub not found", code: "UNKNOWN_HUB") }
             let base = try endpoint(rawURL)
             var components = URLComponents(url: base.appendingPathComponent("v1/socket"), resolvingAgainstBaseURL: false)!
             components.scheme = base.scheme == "https" ? "wss" : "ws"
@@ -379,7 +383,7 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
                     if self.isCurrent(task) { self.notifyListeners("message", data: ["message": ["type": "transport-closed", "connected": false, "error": message]]) }
                 }
             }
-        } catch { call.reject(error.localizedDescription) }
+        } catch { reject(call, error) }
     }
     /// Races the saved routes (the one remembered for this network type first), then opens
     /// the socket on the winner and remembers it.
@@ -399,7 +403,7 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
                 guard isCurrent(generation: generation) else { call.reject("Connection was superseded"); return }
                 try? updateHub(id) { saved in
                     let now = Date().timeIntervalSince1970 * 1000
-                    saved["routes"] = RouteBook.encode(RouteBook.merge(RouteBook.decode(saved["routes"]), [found.route.text], now: now))
+                    saved["routes"] = RouteBook.encode(RouteBook.connected(RouteBook.decode(saved["routes"]), found.route.text, now: now))
                     var last = (saved["last"] as? [String: String]) ?? [:]
                     last[slot] = found.route.text
                     saved["last"] = last

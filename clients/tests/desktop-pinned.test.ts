@@ -486,6 +486,33 @@ describe("connecting to a pinned hub", () => {
       expect((Object.values(saved())[0] as any).last.wifi).toBe(gateway.route),
     );
   });
+  it("keeps the other routes when it connects after a month unused", async () => {
+    const gateway = await fakeGateway();
+    const { native, data, saved } = transport();
+    const hub = await native.pair(invitationRequest([gateway.route]));
+    const all = saved();
+    const away = Date.now() - 40 * 86400_000;
+    all[hub.id].routes = [
+      { route: gateway.route, seen: away },
+      { route: "tls:192.168.1.20:47321", seen: away },
+      { route: "tls:box.tail1234.ts.net:47321", seen: away - 1000 },
+    ];
+    data.set("remote-hubs", JSON.stringify(all));
+    // The hello's routes would be merged by the shared RemoteHost, not here.
+    await native.connect({ id: hub.id });
+    await vi.waitFor(() =>
+      expect((Object.values(saved())[0] as any).routes[0].seen).toBeGreaterThan(
+        away,
+      ),
+    );
+    expect(
+      (Object.values(saved())[0] as any).routes.map((e: any) => e.route),
+    ).toEqual([
+      gateway.route,
+      "tls:192.168.1.20:47321",
+      "tls:box.tail1234.ts.net:47321",
+    ]);
+  });
   it("never moves certificate-mode credentials to a route", async () => {
     const { native, data } = transport();
     const id = "22222222-2222-4222-8222-222222222222";

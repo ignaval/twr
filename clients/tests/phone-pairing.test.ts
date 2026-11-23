@@ -8,6 +8,7 @@ import {
   RouteError,
   base64UrlDecode,
   base64UrlEncode,
+  canonicalRoute,
   displayCode,
   displayPin,
   encodeInvitationJson,
@@ -20,6 +21,7 @@ import {
   parseRoute,
   racePlan,
   raceRoutes,
+  rememberRoute,
   type InvitationV2,
 } from "../shared/phone-pairing";
 import { invitationText, parseInvitation } from "../shared/connections";
@@ -65,6 +67,31 @@ describe("phone pairing vectors: routes", () => {
   it("refuses the invalid ones", () => {
     for (const input of vectors.routes.invalid)
       expect(() => parseRoute(input), input).toThrow();
+  });
+  // What Rust's Ipv6Addr prints for each (checked with rustc); Android's RoutesTest and
+  // iOS's PairingLogicTests carry the same list.
+  it.each([
+    ["2001:DB8::5", "2001:db8::5"],
+    ["2001:0db8:0000:0000:0000:0000:0000:0005", "2001:db8::5"],
+    ["2001:db8:0:0:1:0:0:1", "2001:db8::1:0:0:1"],
+    ["2001:db8:0:1:1:1:1:1", "2001:db8:0:1:1:1:1:1"],
+    ["0:0:0:0:0:0:0:0", "::"],
+    ["0:0:0:0:0:0:0:1", "::1"],
+    ["::FFFF:192.168.1.20", "::ffff:192.168.1.20"],
+    ["::ffff:c0a8:114", "::ffff:192.168.1.20"],
+    ["::1.2.3.4", "::102:304"],
+    ["fe80:0:0:0:0:0:0:1", "fe80::1"],
+    ["1:0:0:2:0:0:0:3", "1:0:0:2::3"],
+    ["::ffff:0:0", "::ffff:0.0.0.0"],
+    ["0:0:0:0:ffff::", "::ffff:0:0:0"],
+  ])("spells [%s] as the hub does, [%s]", (input, expected) => {
+    expect(parseRoute(`tls:[${input}]:1`)).toEqual({
+      kind: "tls",
+      host: expected,
+      port: 1,
+    });
+    expect(canonicalRoute(`tls:[${input}]:1`)).toBe(`tls:[${expected}]:1`);
+    expect(parseAddress(input)?.route).toBe(`tls:[${expected}]:47321`);
   });
   it("reads typed addresses with the default port, brackets and bare IPv6", () => {
     expect(parseAddress("192.168.1.20")).toMatchObject({
@@ -435,11 +462,12 @@ describe("saved routes", () => {
         [
           { route: "tls:stale.example:1", seen: now - ROUTE_TTL - 1 },
           { route: "tls:fresh.example:1", seen: now - ROUTE_TTL },
+          { route: "tls:recent.example:1", seen: now },
         ],
         [],
         now,
       ).map((entry) => entry.route),
-    ).toEqual(["tls:fresh.example:1"]);
+    ).toEqual(["tls:recent.example:1", "tls:fresh.example:1"]);
     const saved = Array.from({ length: 12 }, (_, i) => ({
       route: `tls:saved${i}.example:1`,
       seen: now - i * 1000,
@@ -453,6 +481,32 @@ describe("saved routes", () => {
     expect(merged.slice(0, 8).map((entry) => entry.route)).toEqual(reported);
     // The oldest saved ones go first.
     expect(merged.at(-1)?.route).toBe("tls:saved7.example:1");
+  });
+  it("counts 30 days back from the newest sighting, not from today", () => {
+    const month = now - 40 * 86400_000;
+    const saved = [
+      { route: "tls:a.example:1", seen: month },
+      { route: "tls:b.example:1", seen: month - ROUTE_TTL },
+      { route: "tls:c.example:1", seen: month - ROUTE_TTL - 1 },
+    ];
+    // A phone left unused for 40 days keeps what it knew.
+    expect(mergeRoutes(saved, [], now).map((entry) => entry.route)).toEqual([
+      "tls:a.example:1",
+      "tls:b.example:1",
+    ]);
+    // A connection refreshes the winner and ages nothing else.
+    expect(rememberRoute(saved, "tls:b.example:1", now)).toEqual([
+      { route: "tls:b.example:1", seen: now },
+      { route: "tls:a.example:1", seen: month },
+    ]);
+    expect(
+      rememberRoute(saved, "tls:New.example:1", now).map((e) => e.route),
+    ).toEqual(["tls:new.example:1", "tls:a.example:1", "tls:b.example:1"]);
+    // What the gateway reports now is the newest sighting: the routes it no longer
+    // has, unseen for 30 days before that, go.
+    expect(
+      mergeRoutes(saved, ["tls:a.example:1"], now).map((entry) => entry.route),
+    ).toEqual(["tls:a.example:1"]);
   });
   it("keeps unknown route kinds", () => {
     expect(mergeRoutes([], ["relay:x"], now)).toEqual([
@@ -489,6 +543,27 @@ describe("racing routes", () => {
     expect(
       racePlan(routes, "tls:gone.example:1", "other").first,
     ).toBeUndefined();
+  });
+  it("tries private addresses on cellular when they are all there is", () => {
+    // A VPN over cellular reports as cellular and may reach the LAN.
+    const lan = [
+      "tls:192.168.1.20:47321",
+      "tls:[fd00::7]:47321",
+      "tls:box.local:47321",
+      "relay:phase-2",
+    ];
+    expect(racePlan(lan, undefined, "cellular")).toEqual({
+      first: undefined,
+      rest: [
+        "tls:192.168.1.20:47321",
+        "tls:[fd00::7]:47321",
+        "tls:box.local:47321",
+      ],
+    });
+    expect(racePlan(lan, "tls:box.local:47321", "cellular")).toEqual({
+      first: "tls:box.local:47321",
+      rest: ["tls:192.168.1.20:47321", "tls:[fd00::7]:47321"],
+    });
   });
   it("starts the remembered route at once and the others 250 ms later", async () => {
     vi.useFakeTimers();

@@ -112,6 +112,31 @@ final class PairingLogicTests: XCTestCase {
         }
     }
 
+    /// What Rust's Ipv6Addr prints for each (checked with rustc); the TypeScript and Android
+    /// tests carry the same list.
+    func testIPv6HostsAreSpelledAsTheHubSpellsThem() {
+        let spellings = [
+            ("2001:DB8::5", "2001:db8::5"),
+            ("2001:0db8:0000:0000:0000:0000:0000:0005", "2001:db8::5"),
+            ("2001:db8:0:0:1:0:0:1", "2001:db8::1:0:0:1"),
+            ("2001:db8:0:1:1:1:1:1", "2001:db8:0:1:1:1:1:1"),
+            ("0:0:0:0:0:0:0:0", "::"),
+            ("0:0:0:0:0:0:0:1", "::1"),
+            ("::FFFF:192.168.1.20", "::ffff:192.168.1.20"),
+            ("::ffff:c0a8:114", "::ffff:192.168.1.20"),
+            ("::1.2.3.4", "::102:304"),
+            ("fe80:0:0:0:0:0:0:1", "fe80::1"),
+            ("1:0:0:2:0:0:0:3", "1:0:0:2::3"),
+            ("::ffff:0:0", "::ffff:0.0.0.0"),
+            ("0:0:0:0:ffff::", "::ffff:0:0:0"),
+        ]
+        for (input, expected) in spellings {
+            XCTAssertEqual(PairingRoute("tls:[\(input)]:1"), .tls(host: expected, port: 1), input)
+            XCTAssertEqual(PairingRoute("tls:[\(input)]:1")?.text, "tls:[\(expected)]:1", input)
+            XCTAssertEqual(Pairing.typedAddress(input), .tls(host: expected, port: 47321), input)
+        }
+    }
+
     func testTypedAddresses() {
         XCTAssertEqual(Pairing.typedAddress("box.example"), .tls(host: "box.example", port: 47321))
         XCTAssertEqual(Pairing.typedAddress(" 192.168.1.20:8443 "), .tls(host: "192.168.1.20", port: 8443))
@@ -136,6 +161,45 @@ final class PairingLogicTests: XCTestCase {
         XCTAssertEqual(capped.count, 16)
         XCTAssertEqual(capped.first?.route, "tls:h4.example:1", "the least recently seen go first")
         XCTAssertEqual(RouteBook.decode(RouteBook.encode(capped)), capped)
+    }
+
+    func testRouteExpiryCountsFromTheNewestSighting() {
+        let day = 24 * 60 * 60 * 1000.0
+        let now = 100 * day
+        let away = now - 40 * day
+        let saved = [SavedRoute(route: "tls:a.example:1", seen: away),
+                     SavedRoute(route: "tls:b.example:1", seen: away - 30 * day),
+                     SavedRoute(route: "tls:c.example:1", seen: away - 30 * day - 1)]
+        XCTAssertEqual(RouteBook.merge(saved, [], now: now).map(\.route), ["tls:a.example:1", "tls:b.example:1"],
+                       "a phone left unused for 40 days keeps what it knew")
+        XCTAssertEqual(RouteBook.connected(saved, "tls:B.example:1", now: now),
+                       [SavedRoute(route: "tls:a.example:1", seen: away), SavedRoute(route: "tls:b.example:1", seen: now)],
+                       "a connection refreshes the winner and ages nothing else")
+        XCTAssertEqual(RouteBook.connected(saved, "tls:new.example:1", now: now).map(\.route),
+                       ["tls:a.example:1", "tls:b.example:1", "tls:new.example:1"])
+        XCTAssertEqual(RouteBook.merge(saved, ["tls:a.example:1"], now: now).map(\.route), ["tls:a.example:1"],
+                       "what the gateway reports now is the newest sighting")
+    }
+
+    func testHeadStartEndsEarlyForEveryWaiter() async {
+        let headStart = HeadStart()
+        let started = Date()
+        async let first: Void = headStart.wait()
+        async let second: Void = headStart.wait()
+        headStart.end()
+        _ = await (first, second)
+        await headStart.wait()
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1, "end() lets current and later waiters go at once")
+    }
+
+    func testRaceFailuresCarryTheContractsCodes() {
+        func code(_ errors: [RouteError]) -> String {
+            RaceFailure(failures: errors.enumerated().map { (route: "tls:h\($0.offset).example:1", error: $0.element) }, hubName: "Box").code
+        }
+        XCTAssertEqual(code([.timedOut, .pinMismatch]), "PIN_MISMATCH")
+        XCTAssertEqual(code([.timedOut, .timedOut]), "TIMEOUT")
+        XCTAssertEqual(code([.timedOut, .unreachable("refused")]), "UNREACHABLE")
+        XCTAssertEqual(code([]), "UNREACHABLE")
     }
 
     func testRacePlanStartsTheRememberedRouteFirst() {

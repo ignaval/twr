@@ -151,6 +151,30 @@ enum Pairing {
         return withUnsafeBytes(of: &address) { Array($0) }
     }
 
+    /// The RFC 5952 text of 16 address bytes, as the hub's Rust `Ipv6Addr` prints it:
+    /// lowercase hex without leading zeros, the first longest run of two or more zero groups
+    /// as `::`, and an IPv4-mapped address as `::ffff:a.b.c.d`. (inet_ntop would also print
+    /// IPv4-compatible addresses such as `::2` in dotted form, which the hub doesn't.)
+    static func ipv6Text(_ bytes: [UInt8]) -> String {
+        let groups: [Int] = (0..<8).map { (Int(bytes[2 * $0]) << 8) | Int(bytes[2 * $0 + 1]) }
+        if groups[0..<5].allSatisfy({ $0 == 0 }) && groups[5] == 0xffff {
+            return "::ffff:\(bytes[12]).\(bytes[13]).\(bytes[14]).\(bytes[15])"
+        }
+        var bestStart = 0
+        var bestLength = 0
+        var index = 0
+        while index < 8 {
+            if groups[index] != 0 { index += 1; continue }
+            var end = index
+            while end < 8 && groups[end] == 0 { end += 1 }
+            if end - index > bestLength { bestStart = index; bestLength = end - index }
+            index = end
+        }
+        func hex(_ slice: ArraySlice<Int>) -> String { slice.map { String($0, radix: 16) }.joined(separator: ":") }
+        guard bestLength > 1 else { return hex(groups[...]) }
+        return hex(groups[..<bestStart]) + "::" + hex(groups[(bestStart + bestLength)...])
+    }
+
     /// A DNS name as the hub accepts one: labels of ASCII letters, digits and inner hyphens,
     /// with at least one letter somewhere (so `12345` is not a name).
     static func validDNSName(_ name: String) -> Bool {
@@ -168,11 +192,11 @@ enum Pairing {
 
     private static func isASCIILetter(_ byte: UInt8) -> Bool { (byte >= 0x41 && byte <= 0x5a) || (byte >= 0x61 && byte <= 0x7a) }
 
-    /// A host as routes carry it: an IPv4 literal, an IPv6 literal (unbracketed), or a DNS
-    /// name, lowercased; nil for anything else.
+    /// A host as routes carry it: an IPv4 literal, an IPv6 literal (unbracketed, RFC 5952), or
+    /// a DNS name, lowercased; nil for anything else.
     static func canonicalHost(_ host: String) -> String? {
         if ipv4(host) != nil { return host }
-        if ipv6(host) != nil { return host.lowercased() }
+        if let v6 = ipv6(host) { return ipv6Text(v6) }
         return validDNSName(host) ? host.lowercased() : nil
     }
 
@@ -196,7 +220,7 @@ enum Pairing {
     static func typedAddress(_ input: String) -> PairingRoute? {
         let text = input.trimmingCharacters(in: .whitespaces)
         guard !text.isEmpty, text.utf8.count <= 255 else { return nil }
-        if ipv6(text) != nil { return .tls(host: text.lowercased(), port: defaultPort) }
+        if let v6 = ipv6(text) { return .tls(host: ipv6Text(v6), port: defaultPort) }
         if text.hasPrefix("["), let close = text.firstIndex(of: "]") {
             let after = text[text.index(after: close)...]
             if after.isEmpty { return PairingRoute.parseHostPort("\(text):\(defaultPort)") }
@@ -233,8 +257,9 @@ enum PairingRoute: Equatable {
         if rawHost.hasPrefix("[") {
             guard rawHost.hasSuffix("]"), rawHost.count >= 2 else { return nil }
             let inner = String(rawHost.dropFirst().dropLast())
-            guard Pairing.ipv6(inner) != nil else { return nil }
-            return .tls(host: inner.lowercased(), port: port)
+            // One address, one spelling: the hub's.
+            guard let v6 = Pairing.ipv6(inner) else { return nil }
+            return .tls(host: Pairing.ipv6Text(v6), port: port)
         }
         guard Pairing.ipv6(rawHost) == nil, let host = Pairing.canonicalHost(rawHost) else { return nil }
         return .tls(host: host, port: port)
@@ -285,10 +310,12 @@ enum RouteBook {
         routes.map { ["route": $0.route, "seen": $0.seen] }
     }
 
-    /// `incoming` (an invitation's routes, a winning route, or what the gateway's hello
-    /// reports) marked seen `now` and merged into `saved`, keeping the saved order and adding
-    /// new routes at the end; then the expired dropped, and past the limit the least recently
-    /// seen.
+    /// `incoming` (an invitation's routes, or what the gateway's hello reports) marked seen
+    /// `now` and merged into `saved`, keeping the saved order and adding new routes at the
+    /// end; then the expired dropped, and past the limit the least recently seen.
+    ///
+    /// "Expired" counts back from the newest sighting of any of the hub's routes, not from
+    /// today: a phone left unused for a month keeps its routes.
     static func merge(_ saved: [SavedRoute], _ incoming: [String], now: Double) -> [SavedRoute] {
         var routes: [SavedRoute] = []
         var known = Set<String>()
@@ -301,14 +328,33 @@ enum RouteBook {
                 routes.append(SavedRoute(route: route, seen: now))
             }
         }
-        routes.removeAll { now - $0.seen > lifetime }
-        if routes.count > limit {
-            let keep = Set(routes.indices.sorted { a, b in
-                routes[a].seen != routes[b].seen ? routes[a].seen > routes[b].seen : a < b
-            }.prefix(limit))
-            routes = routes.indices.filter { keep.contains($0) }.map { routes[$0] }
+        if let newest = routes.map(\.seen).max() {
+            routes.removeAll { newest - $0.seen > lifetime }
         }
-        return routes
+        return trimmed(routes)
+    }
+
+    /// `winner` connected `now`: it is seen now, and the others age from the newest sighting
+    /// before this one. A connection after a month away keeps the other routes; the routes
+    /// the gateway's hello reports then refresh the ones it still has.
+    static func connected(_ saved: [SavedRoute], _ winner: String, now: Double) -> [SavedRoute] {
+        var routes = merge(saved, [], now: now)
+        guard let route = PairingRoute(winner)?.text else { return routes }
+        if let index = routes.firstIndex(where: { $0.route == route }) {
+            routes[index].seen = max(routes[index].seen, now)
+        } else {
+            routes.append(SavedRoute(route: route, seen: now))
+        }
+        return trimmed(routes)
+    }
+
+    /// Past the limit, the least recently seen go; among equals, the one listed last.
+    private static func trimmed(_ routes: [SavedRoute]) -> [SavedRoute] {
+        guard routes.count > limit else { return routes }
+        let keep = Set(routes.indices.sorted { a, b in
+            routes[a].seen != routes[b].seen ? routes[a].seen > routes[b].seen : a < b
+        }.prefix(limit))
+        return routes.indices.filter { keep.contains($0) }.map { routes[$0] }
     }
 
     struct RaceEntry: Equatable {

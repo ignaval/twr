@@ -67,9 +67,10 @@ public final class Route {
         String normalized;
         if (host.startsWith("[")) {
             if (!host.endsWith("]")) throw new IllegalArgumentException("bad IPv6 literal");
-            String inner = host.substring(1, host.length() - 1);
-            if (ipv6(inner) == null) throw new IllegalArgumentException("bad IPv6 literal");
-            normalized = inner.toLowerCase(Locale.ROOT);
+            int[] address = ipv6(host.substring(1, host.length() - 1));
+            if (address == null) throw new IllegalArgumentException("bad IPv6 literal");
+            // One address, one spelling: the hub's.
+            normalized = ipv6Text(address);
         } else if (ipv4(host) != null) {
             normalized = host;
         } else if (validDnsName(host)) {
@@ -215,6 +216,42 @@ public final class Route {
             }
         }
         return expand(groups, count, gap);
+    }
+
+    /**
+     * The RFC 5952 text of 16 address bytes, as the hub's Rust {@code Ipv6Addr} prints it:
+     * lowercase hex without leading zeros, the first longest run of two or more zero groups as
+     * {@code ::}, and an IPv4-mapped address as {@code ::ffff:a.b.c.d}.
+     */
+    static String ipv6Text(int[] bytes) {
+        int[] groups = new int[8];
+        for (int g = 0; g < 8; g++) groups[g] = (bytes[2 * g] << 8) | bytes[2 * g + 1];
+        if (mappedIpv4(bytes)) return "::ffff:" + bytes[12] + "." + bytes[13] + "." + bytes[14] + "." + bytes[15];
+        int bestStart = -1, bestLength = 0;
+        for (int i = 0; i < 8; ) {
+            if (groups[i] != 0) {
+                i++;
+                continue;
+            }
+            int end = i;
+            while (end < 8 && groups[end] == 0) end++;
+            if (end - i > bestLength) {
+                bestStart = i;
+                bestLength = end - i;
+            }
+            i = end;
+        }
+        if (bestLength < 2) return hexGroups(groups, 0, 8);
+        return hexGroups(groups, 0, bestStart) + "::" + hexGroups(groups, bestStart + bestLength, 8);
+    }
+
+    private static String hexGroups(int[] groups, int from, int to) {
+        StringBuilder out = new StringBuilder();
+        for (int g = from; g < to; g++) {
+            if (g > from) out.append(':');
+            out.append(Integer.toHexString(groups[g]));
+        }
+        return out.toString();
     }
 
     private static int[] expand(int[] groups, int count, int gap) {

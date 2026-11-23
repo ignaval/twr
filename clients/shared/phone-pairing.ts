@@ -116,6 +116,17 @@ export function isIPv6(host: string) {
   }
 }
 
+/** An IPv6 literal in RFC 5952 form, as the hub's Rust `Ipv6Addr` prints it: lowercase,
+ * no leading zeros, the first longest run of zero groups as `::`, and an IPv4-mapped
+ * address as `::ffff:a.b.c.d` (where the URL parser prints hex). */
+export function canonicalIPv6(host: string): string {
+  const text = new URL(`http://[${host}]/`).hostname.slice(1, -1);
+  const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(text);
+  if (!mapped) return text;
+  const [high, low] = [parseInt(mapped[1], 16), parseInt(mapped[2], 16)];
+  return `::ffff:${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`;
+}
+
 function isDnsName(name: string) {
   return (
     name.length <= 253 &&
@@ -155,6 +166,8 @@ export function parseRoute(text: string): Route {
     if (!host.endsWith("]")) throw new Error("Bad IPv6 literal");
     host = host.slice(1, -1);
     if (!isIPv6(host)) throw new Error("Bad IPv6 literal");
+    // One address, one spelling: the hub's.
+    host = canonicalIPv6(host);
   } else if (!isIPv4(host)) {
     if (!isDnsName(host)) throw new Error("Bad host");
     host = host.toLowerCase();
@@ -489,7 +502,10 @@ export interface SeenRoute {
 
 /** Merges `incoming` (just seen) into `saved`: canonical, deduplicated, routes unseen
  * for 30 days dropped, at most 16 kept. The incoming routes come first in their own
- * order, then the others, the most recently seen first. Non-routes are ignored. */
+ * order, then the others, the most recently seen first. Non-routes are ignored.
+ *
+ * "Unseen for 30 days" counts back from the newest sighting of any of the hub's routes,
+ * not from today: a phone left unused for a month keeps its routes. */
 export function mergeRoutes(
   saved: SeenRoute[],
   incoming: string[],
@@ -501,38 +517,62 @@ export function mergeRoutes(
     if (canonical && !merged.has(canonical))
       merged.set(canonical, { route: canonical, seen: now });
   }
-  const older = saved
+  const known = saved
     .map((entry) => ({ ...entry, route: canonicalRoute(entry.route) }))
     .filter(
       (entry): entry is SeenRoute =>
         !!entry.route &&
         !merged.has(entry.route) &&
-        Number.isFinite(entry.seen) &&
-        now - entry.seen <= ROUTE_TTL,
-    )
+        Number.isFinite(entry.seen),
+    );
+  const newest = Math.max(
+    ...(merged.size ? [now] : []),
+    ...known.map((entry) => entry.seen),
+  );
+  const older = known
+    .filter((entry) => newest - entry.seen <= ROUTE_TTL)
     .sort((a, b) => b.seen - a.seen);
   for (const entry of older)
     if (!merged.has(entry.route)) merged.set(entry.route, entry);
   return [...merged.values()].slice(0, MAX_SAVED_ROUTES);
 }
 
+/** `route` connected `now`: it is seen now, and the others age from the newest sighting
+ * before this one. A connection after a month away keeps the other routes; the routes the
+ * gateway's hello reports then refresh the ones it still has. */
+export function rememberRoute(
+  saved: SeenRoute[],
+  route: string,
+  now = Date.now(),
+): SeenRoute[] {
+  const canonical = canonicalRoute(route);
+  const kept = mergeRoutes(saved, [], now);
+  if (!canonical) return kept;
+  return [
+    { route: canonical, seen: now },
+    ...kept.filter((entry) => entry.route !== canonical),
+  ].slice(0, MAX_SAVED_ROUTES);
+}
+
 // ---------------------------------------------------------------- racing
 
 /** Which routes to dial, in order: the remembered route for this network first (started
  * at once), then the other tls routes (started RACE_STAGGER later). Unknown route kinds
- * are skipped; on cellular, so are private LAN addresses. */
+ * are skipped; on cellular, so are private LAN addresses, unless they are all there is (a
+ * VPN over cellular reports as cellular and may reach them). */
 export function racePlan(
   routes: string[],
   remembered: string | undefined,
   network: NetworkType,
 ): { first?: string; rest: string[] } {
-  const dialable = [
+  const tls = [
     ...new Set(routes.map((r) => canonicalRoute(r)).filter(Boolean)),
-  ].filter(
-    (route) =>
-      route!.startsWith("tls:") &&
-      !(network === "cellular" && isPrivateRoute(route!)),
-  ) as string[];
+  ].filter((route) => route!.startsWith("tls:")) as string[];
+  const reachable =
+    network === "cellular"
+      ? tls.filter((route) => !isPrivateRoute(route))
+      : tls;
+  const dialable = reachable.length ? reachable : tls;
   const first =
     remembered && dialable.includes(canonicalRoute(remembered) || "")
       ? canonicalRoute(remembered)

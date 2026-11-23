@@ -106,6 +106,44 @@ public class RoutesTest {
         assertNull(saved.lastRoute());
     }
 
+    /** What Rust's Ipv6Addr prints for each (checked with rustc); the TypeScript and iOS tests carry the same list. */
+    private static final String[][] IPV6_SPELLINGS = {
+        {"2001:DB8::5", "2001:db8::5"},
+        {"2001:0db8:0000:0000:0000:0000:0000:0005", "2001:db8::5"},
+        {"2001:db8:0:0:1:0:0:1", "2001:db8::1:0:0:1"},
+        {"2001:db8:0:1:1:1:1:1", "2001:db8:0:1:1:1:1:1"},
+        {"0:0:0:0:0:0:0:0", "::"},
+        {"0:0:0:0:0:0:0:1", "::1"},
+        {"::FFFF:192.168.1.20", "::ffff:192.168.1.20"},
+        {"::ffff:c0a8:114", "::ffff:192.168.1.20"},
+        {"::1.2.3.4", "::102:304"},
+        {"fe80:0:0:0:0:0:0:1", "fe80::1"},
+        {"1:0:0:2:0:0:0:3", "1:0:0:2::3"},
+        {"::ffff:0:0", "::ffff:0.0.0.0"},
+        {"0:0:0:0:ffff::", "::ffff:0:0:0"},
+    };
+
+    @Test
+    public void ipv6HostsAreSpelledAsTheHubSpellsThem() {
+        for (String[] pair : IPV6_SPELLINGS) {
+            assertEquals(pair[0], "tls:[" + pair[1] + "]:1", Route.parse("tls:[" + pair[0] + "]:1").toString());
+            assertEquals(pair[0], pair[1], Route.parse("tls:[" + pair[0] + "]:1").host);
+            assertEquals(pair[0], "tls:[" + pair[1] + "]:47321", Route.fromAddress(pair[0]).toString());
+        }
+    }
+
+    @Test
+    public void aConnectionAfterAMonthAwayKeepsTheOtherRoutes() {
+        SavedRoutes saved = new SavedRoutes();
+        saved.merge(Arrays.asList("tls:192.168.1.20:47321", "tls:box.tail1234.ts.net:47321"), 0);
+        saved.connected(Route.parse("tls:box.tail1234.ts.net:47321"), NetworkType.CELLULAR, 40 * DAY);
+        assertEquals(Arrays.asList("tls:192.168.1.20:47321", "tls:box.tail1234.ts.net:47321"), saved.routes());
+        assertEquals("tls:box.tail1234.ts.net:47321", saved.lastByNetwork().get("cellular"));
+        // The hello then reports what the gateway has now; the LAN route it no longer has goes.
+        saved.merge(Collections.singletonList("tls:box.tail1234.ts.net:47321"), 40 * DAY);
+        assertEquals(Collections.singletonList("tls:box.tail1234.ts.net:47321"), saved.routes());
+    }
+
     @Test
     public void planRemembersPerNetworkAndSkipsTheLanOnCellular() {
         SavedRoutes saved = new SavedRoutes();
@@ -137,12 +175,30 @@ public class RoutesTest {
     @Test
     public void aRememberedLanRouteIsSkippedOnCellularToo() {
         SavedRoutes saved = new SavedRoutes();
-        saved.merge(Collections.singletonList("tls:192.168.1.20:47321"), 1000);
+        saved.merge(Arrays.asList("tls:192.168.1.20:47321", "tls:box.example.com:47321"), 1000);
         saved.restoreLast("cellular", "tls:192.168.1.20:47321");
         SavedRoutes.Plan cellular = saved.plan(NetworkType.CELLULAR);
-        assertTrue(cellular.empty());
+        assertNull(cellular.first);
+        assertEquals(Collections.singletonList(Route.parse("tls:box.example.com:47321")), cellular.rest);
         assertEquals(1, cellular.skipped.size());
         assertTrue(Failures.summary(Collections.emptyList(), cellular.skipped, "box").contains("cellular"));
+    }
+
+    @Test
+    public void onlyPrivateRoutesAreTriedOnCellularAnyway() {
+        // A VPN over cellular reports as cellular and may reach the LAN.
+        SavedRoutes saved = new SavedRoutes();
+        saved.merge(Arrays.asList("tls:192.168.1.20:47321", "tls:[fd00::7]:47321", "tls:box.local:47321", "relay:later"), 1000);
+        SavedRoutes.Plan fresh = saved.plan(NetworkType.CELLULAR);
+        assertNull(fresh.first);
+        assertEquals(3, fresh.rest.size());
+        assertTrue(fresh.skipped.isEmpty());
+
+        saved.restoreLast("cellular", "tls:[fd00::7]:47321");
+        SavedRoutes.Plan remembered = saved.plan(NetworkType.CELLULAR);
+        assertEquals(Route.parse("tls:[fd00::7]:47321"), remembered.first);
+        assertEquals(Arrays.asList(Route.parse("tls:192.168.1.20:47321"), Route.parse("tls:box.local:47321")), remembered.rest);
+        assertTrue(remembered.skipped.isEmpty());
     }
 
     @Test
