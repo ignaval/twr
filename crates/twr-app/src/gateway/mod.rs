@@ -942,14 +942,16 @@ async fn pair(
             Json(json!({"error":"Too many pairing attempts; wait a minute"})),
         );
     }
-    if ![10, 64].contains(&p.code.len()) || p.name.is_empty() || p.name.len() > 80 {
+    // A code as typed (`abcd-efgh-jk23`) is the code; anything else never reaches the hub.
+    let code = twr_core::phone_pairing::normalize_code(&p.code);
+    let (Some(code), false) = (code, p.name.is_empty() || p.name.len() > 80) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error":"Invalid pairing request"})),
         );
-    }
+    };
     let result = server
-        .owner_call("device.pair_complete", json!({"code":p.code,"name":p.name}))
+        .owner_call("device.pair_complete", json!({"code":code,"name":p.name}))
         .await;
     match result {
         Ok(mut value) => {

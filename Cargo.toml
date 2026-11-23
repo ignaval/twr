@@ -94,6 +94,13 @@ cpal = "0.18"
 [profile.dev]
 debug = "line-tables-only"
 
+# Phone pairing's Argon2id (`twr_core::phone_pairing::proof_key`, 64 MiB, 3 passes) runs for
+# every invitation the hub begins, tests' included: unoptimized, it takes seconds.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+
 # Release binaries (the GitHub release workflow builds these). `panic` stays `unwind`: tokio
 # turns a panicking task into a JoinError instead of taking the hub down.
 [profile.release]
