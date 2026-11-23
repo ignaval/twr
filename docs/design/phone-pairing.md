@@ -60,7 +60,7 @@ proof     = HMAC-SHA256(K_proof, "twr-mobile-pin-v2" || 0x00 || pin (32 raw byte
 {"service":"twr-mobile","protocol":2,"gateway_id":"<uuid>","pin":"<43 chars>"}
 ```
 
-In certificate mode, `pin` is absent. Protocol 1 clients ignore the new field. A gateway without a pin (certificate or development mode) answers `/v1/pair/proof` with `404`.
+In certificate mode, `pin` is absent and `protocol` stays `1`: released desktop clients refuse any other number. Pinned-mode clients check that `pin` is there, not the number. Protocol 1 clients ignore the new field. A gateway without a pin (certificate or development mode) answers `/v1/pair/proof` with `404`.
 
 **`GET /v1/pair/proof?nonce=<base64url-nopad of 32 bytes>`, unauthenticated.**
 

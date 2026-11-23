@@ -686,7 +686,7 @@ mod socket_tests {
             StatusCode::NOT_FOUND
         );
     }
-    /// `/health` says protocol 2, and the pin in pinned mode only.
+    /// `/health` says protocol 2 and the pin in pinned mode only; certificate mode stays 1.
     #[tokio::test]
     async fn health_carries_the_pin_in_pinned_mode() {
         let dir = tempfile::tempdir().unwrap();
@@ -698,7 +698,7 @@ mod socket_tests {
         assert_eq!(pinned["gateway_id"], server.push.gateway_id.as_str());
         let plain = tempfile::tempdir().unwrap();
         let Json(plain) = health(State(test_server(plain.path()))).await;
-        assert_eq!(plain["protocol"], 2);
+        assert_eq!(plain["protocol"], 1, "released desktop clients require 1");
         assert!(plain.get("pin").is_none());
     }
     /// `--pair --json` in pinned mode: today's fields, the version 2 invitation and its link;
@@ -1028,7 +1028,8 @@ mod socket_tests {
         assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), small);
     }
 }
-async fn owner_client() -> Result<twr_core::client::Client> {
+/// A connection to the default workspace's hub as this user (the gateway's own).
+pub async fn owner_client() -> Result<twr_core::client::Client> {
     // A unit test's gateway has a hub of its own or none: never this machine's.
     if cfg!(test) {
         anyhow::bail!("a gateway in a unit test never connects to this machine's hub");
@@ -3049,15 +3050,14 @@ pub fn pair_json(
 }
 
 /// Begins a device invitation with `scopes` on the hub (`device.pair_begin`, as the owner
-/// through `owner`) and prints its code: as JSON with `json` (with the gateway id from the
-/// gateway directory `dir`, and a pinned gateway's invitation), else as lines.
-async fn announce_pairing(
+/// through `owner`): the [`pair_json`] line for it, with the gateway id from the gateway
+/// directory `dir` and a pinned gateway's invitation. An invitation it cannot show is cancelled.
+pub async fn begin_invitation(
     owner: &mut twr_core::client::Client,
     scopes: &[&str],
-    json: bool,
     dir: &Path,
     pinned: Option<&PinnedInvitation>,
-) -> Result<()> {
+) -> Result<Value> {
     let pairing_started = remote::auth::now();
     let begun = owner
         .call("device.pair_begin", json!({"scopes":scopes}))
@@ -3069,40 +3069,50 @@ async fn announce_pairing(
             .unwrap_or(300)
             .min(twr_core::devices::PAIRING_SECONDS);
     let gateway_id = std::fs::read_to_string(dir.join("gateway-id")).unwrap_or_default();
-    let line = pair_json(code, expires_at, scopes, gateway_id.trim(), pinned);
-    let line = match line {
-        Ok(line) => line,
+    match pair_json(code, expires_at, scopes, gateway_id.trim(), pinned) {
+        Ok(line) => Ok(line),
         Err(error) => {
-            // No invitation to show: none stays open.
             let _ = owner.call("device.pair_cancel", json!({"code":code})).await;
-            return Err(error);
+            Err(error)
         }
-    };
+    }
+}
+/// [`begin_invitation`], printed: as its JSON line with `json`, else as lines.
+async fn announce_pairing(
+    owner: &mut twr_core::client::Client,
+    scopes: &[&str],
+    json: bool,
+    dir: &Path,
+    pinned: Option<&PinnedInvitation>,
+) -> Result<()> {
+    let line = begin_invitation(owner, scopes, dir, pinned).await?;
     if json {
         println!("{line}");
-    } else {
-        println!(
-            "Pairing code (one use, five minutes): {}",
-            twr_core::phone_pairing::display_code(code)
-        );
-        if let Some(link) = line["link"].as_str() {
-            println!("Link: {link}");
-            for route in line["invitation"]["routes"]
-                .as_array()
-                .into_iter()
-                .flatten()
-            {
-                println!("Route: {}", route.as_str().unwrap_or(""));
-            }
+        return Ok(());
+    }
+    println!(
+        "Pairing code (one use, five minutes): {}",
+        twr_core::phone_pairing::display_code(line["code"].as_str().unwrap_or(""))
+    );
+    if let Some(link) = line["link"].as_str() {
+        println!("Link: {link}");
+        for route in line["invitation"]["routes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            println!("Route: {}", route.as_str().unwrap_or(""));
         }
     }
     Ok(())
 }
-/// `GET /health`: the gateway's id, and in pinned mode the pin it serves.
+/// `GET /health`: the gateway's id; in pinned mode protocol 2 and the pin it serves. A
+/// certificate-mode gateway stays protocol 1, which released desktop clients require.
 async fn health(State(server): State<Shared>) -> Json<Value> {
     let mut health =
-        json!({"service":"twr-mobile","protocol":2,"gateway_id":server.push.gateway_id});
+        json!({"service":"twr-mobile","protocol":1,"gateway_id":server.push.gateway_id});
     if let Some(pinned) = &server.pinned {
+        health["protocol"] = json!(2);
         health["pin"] = json!(pinned.pin);
     }
     Json(health)

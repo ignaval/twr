@@ -86,7 +86,8 @@ pub fn order(address: Option<&str>, listeners: &[SocketAddr], interfaces: &[IpAd
         routes.push(route);
     }
     let mut found: Vec<(Class, bool, IpAddr, u16)> = Vec::new();
-    for listener in listeners {
+    // A listener whose port the system has yet to choose has no route.
+    for listener in listeners.iter().filter(|l| l.port() != 0) {
         let ip = listener.ip();
         if !ip.is_unspecified() {
             // A listener on one address: that one, whatever it is (a loopback one too).
@@ -233,6 +234,8 @@ mod tests {
             ["tls:127.0.0.1:5000"]
         );
         assert!(order(None, &all(), &ips(&["127.0.0.1", "fe80::2"])).is_empty());
+        let unbound = ["0.0.0.0:0".parse().unwrap()];
+        assert!(order(None, &unbound, &interfaces).is_empty());
         // The configured address once, even when an interface has it too.
         let routes = order(Some("203.0.113.9"), &v4, &ips(&["203.0.113.9"]));
         assert_eq!(texts(&routes), ["tls:203.0.113.9:47321"]);
