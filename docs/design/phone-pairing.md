@@ -238,11 +238,19 @@ When the drawn code doesn't fit the terminal, they say so and show the link, the
 
 **Starting with the hub.** When the default workspace's hub starts and answers, it starts the pinned gateway, detached, if all of these hold:
 
-- the saved settings have `autostart` on (`twr phone` turns it on, `twr phone off` off; a pinned gateway that starts with no settings writes them with it on);
+- the saved settings have `autostart` on;
 - no gateway runs;
 - a device is paired, or an invitation is open.
 
-Without saved settings it never starts one, so a desktop user whose certificate-mode gateway keeps no settings never gets a pinned gateway they didn't ask for. A test's hub (a debug build under `TWR_HOME`) and `TWR_GATEWAY_AUTOSTART=off` never start one.
+It starts the gateway with no `--listen`, so it listens where the saved `listen` says, or on `0.0.0.0:47321` and `[::]:47321` when that is empty.
+
+**Autostart is opt-in, through `twr phone` alone:**
+
+- `twr phone` turns it on. It also saves the `listen` of the pinned gateway it pairs through, the one it started or the one it found running, so a later autostart listens there too: the default pair (`0.0.0.0:47321` and `[::]:47321`) is saved as an empty `listen`, any other set as itself.
+- `twr phone off` turns it off, and so does `--stop-gateway` (the desktop app's "Stop gateway") whenever settings exist: a gateway someone stopped stays stopped.
+- A gateway started any other way, by the desktop app or a bare `twr gateway`, never turns it on. With no settings it writes none, unless it is given `--address`, which it saves with autostart off.
+
+So a desktop user who never ran `twr phone` never gets a gateway started for them. A test's hub (a debug build under `TWR_HOME`) and `TWR_GATEWAY_AUTOSTART=off` never start one.
 
 `--gateway-info` adds `"pin"` (absent in certificate mode) and `"routes"`, the list the gateway would put in an invitation now. Both are absent while a certificate-mode gateway runs. When no gateway runs, they describe the pinned gateway that would start, if its identity exists. A running gateway's record also carries `"mode"`: `pinned`, `certificate` or `development`. Its `"listen"` is the first address it listens on, one `host:port`, and `"listens"` lists every one, `listen` first: a pinned gateway on all addresses has `"listen":"0.0.0.0:47321","listens":["0.0.0.0:47321","[::]:47321"]`. A gateway older than `listens` joined them all in `listen` with commas, so readers take `listens` when it is there and split `listen` on commas when it isn't. A pinned gateway's `tls_cert` and `tls_key` are its `identity-cert.pem` and `identity-key.pem`, so the desktop app's checks still read the record.
 

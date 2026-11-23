@@ -2543,20 +2543,11 @@ pub async fn run(args: Args, programs: Programs) -> Result<()> {
     let (binary, companion) = programs.resolve(args.binary_dir.as_deref())?;
     let paths = twr_core::paths::Paths::from_env_in(Some("default"))?;
     let mobile_dir = paths.config_file.with_file_name("mobile");
-    // A pinned gateway that serves keeps its settings, and `--address` is saved for later runs.
-    // Administration alone (the desktop app's `--gateway-info`, `--pair-only`, …, which name no
-    // certificate) writes none: settings turn autostart on.
-    let administration = args.pair_only
-        || args.list_devices
-        || args.gateway_info
-        || args.stop_gateway
-        || args.cancel_invitation
-        || args.revoke.is_some();
+    // A pinned gateway's saved settings, with `--address` saved for later runs. Only `twr
+    // phone` turns autostart on: a gateway started any other way (the desktop app, a bare
+    // `twr gateway`) never does.
     let settings = match mode {
-        Mode::Pinned if !administration || args.address.is_some() => {
-            Some(settings_with(&mobile_dir, args.address.as_deref())?)
-        }
-        Mode::Pinned => Some(settings::Settings::load(&mobile_dir)?.unwrap_or_default()),
+        Mode::Pinned => Some(settings_with(&mobile_dir, args.address.as_deref())?),
         _ => None,
     };
     if args.gateway_info {
@@ -2564,6 +2555,13 @@ pub async fn run(args: Args, programs: Programs) -> Result<()> {
         return Ok(());
     }
     if args.stop_gateway {
+        // Stopped is stopped: a hub that starts doesn't bring it back (`twr phone` does).
+        if let Some(mut saved) = settings::Settings::load(&mobile_dir)? {
+            if saved.autostart {
+                saved.autostart = false;
+                saved.save(&mobile_dir)?;
+            }
+        }
         remote::gateway_lifecycle::stop(
             &mobile_dir,
             args.expected_instance
@@ -2639,25 +2637,18 @@ pub async fn run(args: Args, programs: Programs) -> Result<()> {
         Mode::Pinned => Some(identity::Identity::ensure(&mobile_dir)?),
         _ => None,
     };
-    let default_port = |ip: IpAddr| SocketAddr::new(ip, DEFAULT_PORT);
     let wanted: Vec<(SocketAddr, bool)> = match (args.listen, &settings) {
         (Some(listen), _) => vec![(listen, true)],
         (None, Some(settings)) if !settings.listen.is_empty() => {
             settings.listen.iter().map(|l| (*l, true)).collect()
         }
         // Every IPv4 address, and IPv6's too where it binds.
-        (None, Some(_)) => vec![
-            (
-                default_port(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
-                true,
-            ),
-            (
-                default_port(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)),
-                false,
-            ),
-        ],
+        (None, Some(_)) => {
+            let [v4, v6] = ALL_ADDRESSES;
+            vec![(v4, true), (v6, false)]
+        }
         (None, None) => vec![(
-            default_port(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), DEFAULT_PORT),
             true,
         )],
     };
@@ -2906,6 +2897,12 @@ pub async fn run(args: Args, programs: Programs) -> Result<()> {
 
 /// The gateway's port when none is given.
 pub const DEFAULT_PORT: u16 = 47321;
+/// Where a pinned gateway listens when its settings name nowhere: every IPv4 address, and
+/// every IPv6 one where IPv6 binds.
+pub const ALL_ADDRESSES: [SocketAddr; 2] = [
+    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), DEFAULT_PORT),
+    SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), DEFAULT_PORT),
+];
 
 /// How a gateway serves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2945,17 +2942,15 @@ fn bind(address: SocketAddr) -> std::io::Result<std::net::TcpListener> {
     Ok(socket.into())
 }
 
-/// The pinned gateway's saved settings in `dir`, made (with autostart on) if there were none,
-/// with `address` saved when given.
+/// The pinned gateway's saved settings in `dir` (the defaults, autostart off, when there are
+/// none), with `address` saved when given. Nothing is written without one.
 fn settings_with(dir: &Path, address: Option<&str>) -> Result<settings::Settings> {
     let saved = settings::Settings::load(dir)?;
-    let mut settings = saved.clone().unwrap_or(settings::Settings {
-        autostart: true,
-        ..Default::default()
-    });
-    if let Some(address) = address {
-        settings.set_address(address)?;
-    }
+    let mut settings = saved.clone().unwrap_or_default();
+    let Some(address) = address else {
+        return Ok(settings);
+    };
+    settings.set_address(address)?;
     if saved.as_ref() != Some(&settings) {
         settings.save(dir)?;
     }
@@ -3015,10 +3010,7 @@ pub async fn gateway_info(dir: &Path) -> Result<Value> {
     } else {
         match settings::Settings::load(dir)? {
             Some(settings) if !settings.listen.is_empty() => settings.listen,
-            _ => vec![
-                SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), DEFAULT_PORT),
-                SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), DEFAULT_PORT),
-            ],
+            _ => ALL_ADDRESSES.to_vec(),
         }
     };
     if let Some(identity) = identity::Identity::load(dir)? {
