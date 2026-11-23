@@ -77,6 +77,12 @@ pub async fn pair(level: &str, address: Option<&str>, json: bool) -> anyhow::Res
     if started && !json {
         outln!("Started the phone gateway: it runs on its own now.");
     }
+    // Catch the signals before the code exists, so one that arrives right after the
+    // invitation opens still cancels it (instead of leaving it open to its expiry).
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut interrupt = signal(SignalKind::interrupt()).context("SIGINT handler")?;
+    let mut term = signal(SignalKind::terminate()).context("SIGTERM handler")?;
+    let mut hangup = signal(SignalKind::hangup()).context("SIGHUP handler")?;
     let opened = phone::open_invitation(&dir, &scopes).await?;
     let line = &opened.line;
     let code = line["code"].as_str().context("no code")?.to_owned();
@@ -86,16 +92,8 @@ pub async fn pair(level: &str, address: Option<&str>, json: bool) -> anyhow::Res
         show(line, level);
     }
     let stop = async {
-        use tokio::signal::unix::{signal, SignalKind};
-        let (Ok(mut term), Ok(mut hangup)) = (
-            signal(SignalKind::terminate()),
-            signal(SignalKind::hangup()),
-        ) else {
-            let _ = tokio::signal::ctrl_c().await;
-            return;
-        };
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
+            _ = interrupt.recv() => {}
             _ = term.recv() => {}
             _ = hangup.recv() => {}
         }
