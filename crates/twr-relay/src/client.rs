@@ -700,11 +700,23 @@ impl HubClient {
 // ---- HTTPS helpers -------------------------------------------------------------------------
 
 /// A minimal HTTPS/1.1 request to a relay's API, checking the relay as its URL says (§3.4).
+/// A body is sent as `application/json`; [`https_raw`] takes its own content type.
 pub async fn https(
     target: &Target,
     method: &str,
     path: &str,
     body: Option<Vec<u8>>,
+) -> Result<(u16, Vec<u8>)> {
+    https_raw(target, method, path, body.map(|b| (b, "application/json"))).await
+}
+
+/// [`https`] with the request body's content type given, for example a pkarr packet as
+/// `application/octet-stream` (§9). Returns the status and the raw response body.
+pub async fn https_raw(
+    target: &Target,
+    method: &str,
+    path: &str,
+    body: Option<(Vec<u8>, &str)>,
 ) -> Result<(u16, Vec<u8>)> {
     use http_body_util::{BodyExt, Full};
     let url = &target.url;
@@ -720,10 +732,14 @@ pub async fn https(
         .method(method)
         .uri(path)
         .header("host", host);
-    if body.is_some() {
-        req = req.header("content-type", "application/json");
-    }
-    let req = req.body(Full::new(bytes::Bytes::from(body.unwrap_or_default())))?;
+    let body = match body {
+        Some((b, content_type)) => {
+            req = req.header("content-type", content_type);
+            b
+        }
+        None => Vec::new(),
+    };
+    let req = req.body(Full::new(bytes::Bytes::from(body)))?;
     let resp = tokio::time::timeout(CONNECT_TIMEOUT, sender.send_request(req))
         .await
         .context("the relay didn't answer")??;

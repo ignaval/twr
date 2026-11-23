@@ -159,6 +159,7 @@ fn info(s: &Shared) -> Resp {
             "records": "pkarr",
             "phone_suffixes": s.suffixes,
             "iroh_url": s.iroh_url,
+            "iroh_quic_port": s.iroh_quic_port,
             "records_url": s.records_url(),
             "relay_pin": s.relay_pin_text(),
         }),

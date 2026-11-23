@@ -585,6 +585,8 @@ async fn info_status_and_moved() {
     assert_eq!(info["relay"], "twr-relay");
     assert_eq!(info["hub_protocols"][0], "twr-relay/1");
     assert_eq!(info["phone_suffixes"][0], "relay.test");
+    // This relay runs no iroh, so no QUIC address discovery either.
+    assert!(info["iroh_quic_port"].is_null(), "{info}");
 
     let (s, key) = connect(&r).await;
     let name = s.welcome.hub.clone();
@@ -667,6 +669,18 @@ async fn record_store_semantics() {
     );
     let (st, got) = client::https(&r.t(), "GET", &path, None).await.unwrap();
     assert_eq!((st, got), (200, a.clone()));
+    // The content type doesn't matter to the store: a later packet as octet-stream.
+    let b = pkarr_body(&key, 2_500, &[1u8; 12]);
+    let t = r.t();
+    let put = client::https_raw(
+        &t,
+        "PUT",
+        &path,
+        Some((b.clone(), "application/octet-stream")),
+    );
+    assert_eq!(put.await.unwrap().0, 200);
+    let (st, got) = client::https_raw(&r.t(), "GET", &path, None).await.unwrap();
+    assert_eq!((st, got), (200, b));
     assert_eq!(
         client::https(
             &r.t(),
@@ -684,7 +698,7 @@ async fn record_store_semantics() {
             &r.t(),
             "PUT",
             &path,
-            Some(pkarr_body(&key, 2_000, &[1u8; 12]))
+            Some(pkarr_body(&key, 2_500, &[2u8; 12]))
         )
         .await
         .unwrap()
@@ -762,6 +776,8 @@ async fn iroh_refuses_endpoints_not_admitted() {
     let r = dnsless("").await;
     let info = client::info(&r.t()).await.unwrap();
     let url: iroh_base::RelayUrl = info["iroh_url"].as_str().unwrap().parse().unwrap();
+    let quic = r.running.as_ref().unwrap().quic_addr.unwrap();
+    assert_eq!(info["iroh_quic_port"], quic.port(), "{info}");
     let secret = iroh_base::SecretKey::from_bytes(&[9; 32]);
     let res =
         iroh_relay::client::ClientBuilder::new(url, secret, iroh_dns::dns::DnsResolver::new())

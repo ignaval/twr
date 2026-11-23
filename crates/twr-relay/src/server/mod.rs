@@ -136,6 +136,8 @@ pub(crate) struct Shared {
     public_host: String,
     public_port: u16,
     iroh_url: Option<String>,
+    /// The UDP port of iroh's QUIC address discovery, when it runs (§8.1).
+    iroh_quic_port: Option<u16>,
     /// Hub name → its own port, for port mode (§7).
     port_routes: HashMap<String, u16>,
 }
@@ -393,6 +395,7 @@ pub async fn start(cfg: Config, version: &str) -> Result<Running> {
         public_host,
         public_port,
         iroh_url,
+        iroh_quic_port: quic_addr.map(|a| a.port()),
         port_routes,
         version: version.to_string(),
         started: Instant::now(),

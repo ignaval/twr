@@ -333,9 +333,13 @@ Served on the relay's own host name, or with no SNI, over HTTP/1.1 or HTTP/2. Ev
  "records":"pkarr",
  "phone_suffixes":["eu.relay.twr.tools"],
  "iroh_url":"https://iroh.eu.relay.twr.tools/",
+ "iroh_quic_port":7842,
  "records_url":"https://eu.relay.twr.tools/pkarr",
  "relay_pin":null}
 ```
+
+- `iroh_quic_port`: the UDP port of iroh's QUIC address discovery (QAD, [§10.1](#101-the-relay)) on the iroh host, or `null` when the relay doesn't run it. An endpoint that finds it `null` or missing (a relay from before this field) runs without QAD.
+- The other fields are as in the [welcome](#54-welcome).
 
 Cacheable for 5 minutes. Monitoring uses it as the liveness check.
 
@@ -364,7 +368,7 @@ The relay's replacement for `dns.iroh.link`: a store for signed pkarr packets, h
 - `PUT /pkarr/<z32 public key>`, body `<64-byte Ed25519 signature><u64be timestamp in microseconds><DNS packet, at most 1000 bytes>`.
   - The signature must verify under the key for the BEP 44 signable `"3:seqi" || decimal(timestamp) || "e1:v" || decimal(len(packet)) || ":" || packet`.
   - `200` when stored. `400` for a bad key, signature or length. `409` if the store holds a packet for this key with a later timestamp. `428` if it holds one with the same timestamp but different content. `429` per [§11](#11-limits-and-refusals).
-  - The relay doesn't parse the DNS packet beyond its length.
+  - The relay doesn't parse the DNS packet beyond its length, and ignores the request's `Content-Type`. Clients should send `application/pkarr.org/relays#payload` or `application/octet-stream`. If a later version checks it, it keeps accepting any type for one release.
 - `GET /pkarr/<z32 public key>`: `200` with the stored body (`application/pkarr.org/relays#payload`) and `Last-Modified` and `memento-datetime` headers set to when it was stored; `304` if `If-Modified-Since` isn't older than that; `404` if there is none. `Cache-Control: public, max-age=30`.
 - A `policy` query parameter is accepted and ignored: there is no DHT behind this store.
 - Records expire 2 hours after they were stored. iroh republishes every 5 minutes, and pairing locators live 15 minutes, so a live record never expires. The store isn't persisted; after a restart, publishers fill it again within minutes.
@@ -376,7 +380,7 @@ z32 is z-base-32 of the 32-byte key, 52 characters, as pkarr writes it.
 
 ### 10.1 The relay
 
-On its iroh host name the relay runs iroh's own relay server (the `iroh-relay` crate, at the version `twr-link` uses), with TLS terminated by the relay under its own certificate. The protocol is iroh's: HTTP upgrade at `/relay`, plus `/ping` and `/generate_204` for latency probes. Its versioning is iroh's 1.x wire promise. If the relay runs QAD, it does so on UDP 7842 with the same certificate.
+On its iroh host name the relay runs iroh's own relay server (the `iroh-relay` crate, at the version `twr-link` uses), with TLS terminated by the relay under its own certificate. The protocol is iroh's: HTTP upgrade at `/relay`, plus `/ping` and `/generate_204` for latency probes. Its versioning is iroh's 1.x wire promise. If the relay runs QAD, it does so on UDP (7842 by default) with the same certificate, and `/v1/info` gives the port as `iroh_quic_port`.
 
 Only **admitted** endpoints may connect. A relay that serves iroh must refuse every other endpoint at the relay handshake.
 
@@ -499,3 +503,4 @@ What the relay records: counters (connections, bytes, refusals by reason), per-h
 |---|---|
 | 2026-11-23 | First draft of version 1. |
 | 2026-11-23 | Built and tested. Clarified: error answers carry the request's type in `ref` (§5.2); each side's yamux limits (§5.1); exempt addresses (§11); the test files (§13); the iroh relay's log (§14). No wire change. |
+| 2026-11-23 | `/v1/info` gains `iroh_quic_port` (§8.1, §10.1). The record store ignores `Content-Type` (§9). Additive: older clients ignore the field. |
