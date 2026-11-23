@@ -60,7 +60,10 @@ const infoSchema = z.discriminatedUnion("running", [
     instance: z.uuid(),
     version: z.string(),
     executable: z.string(),
+    // The first address; `twr phone` and autostart's gateway once printed them all, comma-separated.
     listen: z.string(),
+    // Every address the gateway listens on, when it reports them.
+    listens: z.array(z.string()).optional(),
     // Certificate mode only; a pinned gateway may leave them empty or out.
     tls_cert: z.string().nullable().optional(),
     tls_key: z.string().nullable().optional(),
@@ -89,7 +92,7 @@ export interface GatewayDependencies {
    * key `--gateway-info` reports (`info.pin`) in pinned mode. */
   local(
     settings: GatewaySettings,
-    info?: { pin?: string },
+    info?: { pin?: string; listen?: string; listens?: string[] },
   ): Promise<GatewayCheck>;
   pause(): Promise<void>;
 }
@@ -103,14 +106,42 @@ function pem(path: string): Buffer {
     closeSync(file);
   }
 }
+const LISTEN_PROBLEM = "Enter an IP address and a port from 1 to 65535";
 function validateListen(listen: string) {
   const address = listen.slice(0, listen.lastIndexOf(":"));
   const port = Number(listen.slice(listen.lastIndexOf(":") + 1));
   if (!isIP(address.replace(/^\[|\]$/g, "")) || port < 1 || port > 65535)
-    throw new Error("Enter an IP address and a port from 1 to 65535");
+    throw new Error(LISTEN_PROBLEM);
+}
+function isListen(listen: string): boolean {
+  if (!settingsSchema.shape.listen.safeParse(listen).success) return false;
+  try {
+    validateListen(listen);
+    return true;
+  } catch {
+    return false;
+  }
+}
+/** A readable reason for settings that don't parse: never the schema's own report. */
+function settingsProblem(error: z.ZodError): string {
+  switch (error.issues[0]?.path[0]) {
+    case "listen":
+      return LISTEN_PROBLEM;
+    case "url":
+      return "Enter the gateway's https:// address";
+    case "cert":
+    case "key":
+      return "Choose the TLS certificate and private key";
+    case "scopes":
+      return "Choose what paired devices may do";
+    default:
+      return "These gateway settings can't be used. Check them and try again.";
+  }
 }
 export function validateGatewaySettings(input: unknown): GatewaySettings {
-  const settings = settingsSchema.parse(input);
+  const parsed = settingsSchema.safeParse(input);
+  if (!parsed.success) throw new Error(settingsProblem(parsed.error));
+  const settings = parsed.data;
   if (gatewayMode(settings) === "pinned") {
     // The gateway serves its own key: no address, certificate or key to check.
     validateListen(settings.listen);
@@ -157,14 +188,50 @@ export function gatewayLaunchArgs(
 export function certificateDigest(path: string): string {
   return createHash("sha256").update(pem(path)).digest("hex");
 }
-/** Where this computer reaches its own listener: a wildcard address means loopback. */
-function localTarget(listen: string) {
-  const address = listen
-    .slice(0, listen.lastIndexOf(":"))
-    .replace(/^\[|\]$/g, "");
-  const host =
-    address === "0.0.0.0" ? "127.0.0.1" : address === "::" ? "::1" : address;
-  return { host, port: Number(listen.slice(listen.lastIndexOf(":") + 1)) };
+/** Every address a running gateway listens on: its `listens` when it reports them, else its
+ * `listen`, which older gateways (`twr phone`, autostart) printed as a comma-separated list. */
+export function gatewayListens(info: {
+  listen: string;
+  listens?: string[];
+}): string[] {
+  const all = info.listens?.length ? info.listens : info.listen.split(",");
+  return all.map((listen) => listen.trim()).filter(Boolean);
+}
+/** The loopback address that reaches a listener on `host`, if loopback does. */
+function loopbackHost(host: string): string | undefined {
+  if (host === "0.0.0.0") return "127.0.0.1";
+  if (/^127\./.test(host)) return host;
+  if (
+    host === "::" ||
+    (isIP(host) === 6 && new URL(`http://[${host}]`).hostname === "[::1]")
+  )
+    return "::1";
+}
+/** Where this computer reaches its own listener: the first address loopback reaches (a
+ * wildcard or a loopback address), else the first address, one of this computer's own. */
+export function localTarget(listens: string[]): { host: string; port: number } {
+  const targets = listens.flatMap((listen) => {
+    const colon = listen.lastIndexOf(":");
+    const host = listen.slice(0, colon).replace(/^\[|\]$/g, "");
+    const digits = listen.slice(colon + 1);
+    const port = Number(digits);
+    if (colon < 1 || !isIP(host) || !/^[0-9]{1,5}$/.test(digits)) return [];
+    if (port < 1 || port > 65535) return [];
+    return [{ host, port, loopback: loopbackHost(host) }];
+  });
+  const target = targets.find((t) => t.loopback) || targets[0];
+  if (!target)
+    throw new Error("The gateway reports no address this computer can reach");
+  return { host: target.loopback || target.host, port: target.port };
+}
+/** The running gateway's listeners when known, else the settings' own. */
+function localListens(
+  settings: GatewaySettings,
+  info?: { listen?: string; listens?: string[] },
+): string[] {
+  return info?.listen !== undefined
+    ? gatewayListens({ listen: info.listen, listens: info.listens })
+    : [settings.listen];
 }
 function isGatewayHealth(status: number, data: any) {
   return (
@@ -178,8 +245,9 @@ function isGatewayHealth(status: number, data: any) {
 }
 export async function checkLocalGateway(
   settings: GatewaySettings,
+  info?: { listen?: string; listens?: string[] },
 ): Promise<GatewayCheck> {
-  const { host, port } = localTarget(settings.listen);
+  const { host, port } = localTarget(localListens(settings, info));
   const { status, data } = await gatewayRequest(settings.url, "/health", {
     timeout: 2000,
     connect: { host, port },
@@ -195,12 +263,13 @@ export async function checkLocalGateway(
 export async function checkLocalPinned(
   settings: GatewaySettings,
   pin: string | undefined,
+  info?: { listen?: string; listens?: string[] },
 ): Promise<GatewayCheck> {
   if (!pin)
     throw new Error(
       "The running gateway reports no key of its own. Update twr, or use your own certificate under Advanced.",
     );
-  const { host, port } = localTarget(settings.listen);
+  const { host, port } = localTarget(localListens(settings, info));
   const route = tlsRoute(host, port);
   const { socket } = await pinnedConnect(route, pin, {
     timeout: 2000,
@@ -255,8 +324,8 @@ export class GatewaySetup {
         }),
       local: (settings, info) =>
         gatewayMode(settings) === "pinned"
-          ? checkLocalPinned(settings, info?.pin)
-          : checkLocalGateway(settings),
+          ? checkLocalPinned(settings, info?.pin, info)
+          : checkLocalGateway(settings, info),
       pause: () => new Promise((resolve) => setTimeout(resolve, 250)),
       launch: async (settings, binary = this.binary) => {
         try {
@@ -322,9 +391,14 @@ export class GatewaySetup {
     return result;
   }
   private async info(): Promise<GatewayInfo> {
-    return infoSchema.parse(
+    const parsed = infoSchema.safeParse(
       await this.dependencies.command(["--gateway-info"]),
     );
+    if (!parsed.success)
+      throw new Error(
+        "The gateway's status could not be read. Update twr and try again.",
+      );
+    return parsed.data;
   }
   private differs(
     settings: GatewaySettings,
@@ -333,8 +407,10 @@ export class GatewaySetup {
   ): boolean {
     const pinned = gatewayMode(settings) === "pinned";
     if (pinned !== !!info.pin) return true;
+    const listens = gatewayListens(info);
     if (
-      info.listen !== settings.listen ||
+      listens.length !== 1 ||
+      listens[0] !== settings.listen ||
       info.executable !== realpathSync(binary)
     )
       return true;
@@ -394,7 +470,7 @@ export class GatewaySetup {
       return {
         running: true,
         runningVersion: info.version,
-        listen: info.listen,
+        listen: gatewayListens(info).join(", "),
         restartRequired,
         ...(info.pin
           ? { pin: info.pin, routes: info.routes || [] }
@@ -441,13 +517,27 @@ export class GatewaySetup {
       // Preserve a configuration that is known to reproduce the running TLS context.
       // Refuse destructive restart if certificate renewal has removed those bytes.
       let previous: GatewaySettings;
+      let previousBinary: string;
       if (current.pin) {
         // A pinned gateway restarts from its listener alone; its key stays on disk.
+        const listens = gatewayListens(current);
+        // One this app started comes back as it was. Another, such as `twr phone`'s or
+        // autostart's (another executable, every address), comes back as this app's own
+        // gateway with this app's saved listener: the same directory, so the same key.
+        const ours =
+          current.executable === realpathSync(this.binary) &&
+          listens.length === 1 &&
+          isListen(listens[0]);
         previous = validateGatewaySettings({
           ...(this.settings || settings),
           mode: "pinned",
-          listen: current.listen,
+          listen: ours
+            ? listens[0]
+            : this.settings && isListen(this.settings.listen)
+              ? this.settings.listen
+              : settings.listen,
         });
+        previousBinary = ours ? realpathSync(current.executable) : this.binary;
       } else {
         const base = this.settings || settings;
         try {
@@ -469,8 +559,8 @@ export class GatewaySetup {
           throw new Error(
             "The running gateway's certificate files differ from its active TLS context. Check certificate renewal status and logs. If renewal cannot complete, use Stop gateway, then start with the replacement certificate; the hub keeps running.",
           );
+        previousBinary = realpathSync(current.executable);
       }
-      const previousBinary = realpathSync(current.executable);
       await this.cancelNow();
       await this.dependencies.command([
         "--stop-gateway",
@@ -630,7 +720,9 @@ export class GatewaySetup {
   }): Promise<CreatedInvitation> {
     return this.serial(async () => {
       if (!this.settings) throw new Error("Complete gateway setup first");
-      const scopes = settingsSchema.shape.scopes.parse(input.scopes);
+      const scope = settingsSchema.shape.scopes.safeParse(input?.scopes);
+      if (!scope.success) throw new Error("Choose what paired devices may do");
+      const scopes = scope.data;
       const info = await this.info();
       if (!info.running || this.differs(this.settings, info))
         throw new Error(
@@ -652,7 +744,7 @@ export class GatewaySetup {
               ? ["--allow-terminal", "--allow-admin"]
               : []),
       ];
-      const invitation = z
+      const created = z
         .object({
           code: z.string().min(4).max(128),
           expires_at: z.number().int().positive(),
@@ -662,7 +754,12 @@ export class GatewaySetup {
           invitation: z.record(z.string(), z.unknown()).optional(),
           link: z.string().max(4096).optional(),
         })
-        .parse(await this.dependencies.command(args));
+        .safeParse(await this.dependencies.command(args));
+      if (!created.success)
+        throw new Error(
+          "The gateway's invitation could not be read. Update twr and try again.",
+        );
+      const invitation = created.data;
       this.activeCode = invitation.code;
       if (invitation.gateway_id !== info.gateway_id)
         throw new Error(

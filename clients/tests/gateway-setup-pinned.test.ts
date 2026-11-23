@@ -8,6 +8,8 @@ import {
   GatewaySetup,
   checkLocalPinned,
   gatewayLaunchArgs,
+  gatewayListens,
+  localTarget,
   validateGatewaySettings,
 } from "../desktop/gateway-setup";
 import type { GatewaySettings } from "../shared/connections";
@@ -41,6 +43,8 @@ function fixture(
   options: {
     running?: "pinned" | "certificate" | false;
     invitation?: any;
+    // Merged into the gateway running at the start, not into one this app launches.
+    started?: Record<string, unknown>;
   } = {},
 ) {
   const runningInfo = (mode: "pinned" | "certificate") => ({
@@ -69,7 +73,7 @@ function fixture(
   let info: any =
     options.running === false
       ? { running: false, gateway_id: GATEWAY, pin: vectors.pin }
-      : runningInfo(options.running ?? "pinned");
+      : { ...runningInfo(options.running ?? "pinned"), ...options.started };
   const command = vi.fn(async (args: string[]) => {
     if (args[0] === "--gateway-info") return info;
     if (args[0] === "--cancel-invitation") return { cancelled: true };
@@ -249,6 +253,100 @@ describe("the pinned gateway wizard", () => {
     );
     expect(f.launch).toHaveBeenCalledTimes(2);
     expect(f.save).toHaveBeenLastCalledWith(pinned);
+  });
+});
+
+describe("a gateway that twr phone or autostart started", () => {
+  // Another executable, and every address: once a comma list in `listen`, now `listens`.
+  const theirs = (form: "comma" | "listens") => ({
+    executable: "/opt/twr/bin/twr",
+    ...(form === "comma"
+      ? { listen: "0.0.0.0:47321,[::]:47321" }
+      : { listen: "0.0.0.0:47321", listens: ["0.0.0.0:47321", "[::]:47321"] }),
+  });
+  const started = (form: "comma" | "listens") =>
+    fixture({ started: theirs(form) });
+  it.each(["comma", "listens"] as const)(
+    "asks for a restart, then takes over with this app's listener (%s)",
+    async (form) => {
+      const f = started(form);
+      expect(await f.setup.status()).toMatchObject({
+        running: true,
+        listen: "0.0.0.0:47321, [::]:47321",
+        restartRequired: true,
+      });
+      expect(await f.setup.setup(pinned)).toMatchObject({
+        restartRequired: true,
+        tls: false,
+      });
+      expect(f.launch).not.toHaveBeenCalled();
+      const result = await f.setup.restart(pinned);
+      expect(result).toMatchObject({ tls: true, pin: vectors.pin });
+      expect(f.launch).toHaveBeenCalledOnce();
+      expect(f.launch.mock.calls[0]).toEqual([pinned]);
+      expect(f.save).toHaveBeenLastCalledWith(pinned);
+    },
+  );
+  it("rolls a failed takeover back to this app's own gateway and listener", async () => {
+    const f = started("comma");
+    f.local.mockRejectedValueOnce(new Error("PIN_MISMATCH: busy"));
+    const next = { ...pinned, listen: "0.0.0.0:47322" };
+    await expect(f.setup.restart(next)).rejects.toThrow(
+      "previous gateway configuration was restored",
+    );
+    // Restored with this app's binary (launch's default) and saved listener, not `twr`.
+    expect(f.launch.mock.calls.map((call) => call.length)).toEqual([1, 1]);
+    expect(f.launch.mock.calls[1]).toEqual([pinned]);
+  });
+});
+
+describe("gateway errors in words", () => {
+  it.each([
+    [{ ...pinned, listen: "0.0.0.0:47321,[::]:47321" }, "Enter an IP address"],
+    [{ ...pinned, listen: 47321 }, "Enter an IP address"],
+    [{ ...pinned, scopes: "everything" }, "Choose what paired devices may do"],
+    [{ ...pinned, extra: 1 }, "can't be used"],
+    [null, "can't be used"],
+  ])("never shows the schema's report for %j", (input, message) => {
+    let error: unknown;
+    try {
+      validateGatewaySettings(input);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(message);
+    expect((error as Error).message).not.toMatch(/invalid_|"path"|\[/);
+  });
+  it("words a --gateway-info record it can't read", async () => {
+    const f = fixture();
+    f.command.mockResolvedValue({ running: true });
+    await expect(f.setup.status()).rejects.toThrow(
+      "The gateway's status could not be read",
+    );
+  });
+});
+
+describe("the local listener's address", () => {
+  it.each([
+    [["0.0.0.0:47321", "[::]:47321"], { host: "127.0.0.1", port: 47321 }],
+    [["[::]:47321"], { host: "::1", port: 47321 }],
+    [["192.168.1.20:1", "[::1]:2"], { host: "::1", port: 2 }],
+    [["192.168.1.20:1", "10.0.0.1:2"], { host: "192.168.1.20", port: 1 }],
+    [["127.0.0.2:5"], { host: "127.0.0.2", port: 5 }],
+    [["nonsense", "[0:0:0:0:0:0:0:1]:9"], { host: "::1", port: 9 }],
+  ])("for %j is %j", (listens, target) => {
+    expect(localTarget(listens)).toEqual(target);
+  });
+  it("splits an older gateway's comma list", () => {
+    expect(gatewayListens({ listen: "0.0.0.0:1, [::]:1" })).toEqual([
+      "0.0.0.0:1",
+      "[::]:1",
+    ]);
+    expect(
+      gatewayListens({ listen: "0.0.0.0:1", listens: ["0.0.0.0:1", "[::]:1"] }),
+    ).toEqual(["0.0.0.0:1", "[::]:1"]);
+    expect(() => localTarget(["x"])).toThrow("no address");
   });
 });
 
