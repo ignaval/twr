@@ -35,6 +35,7 @@ mod loops_tests;
 pub mod md;
 pub mod notify;
 pub mod order;
+pub mod qr;
 pub mod queue;
 #[cfg(test)]
 mod reconnect_tests;
