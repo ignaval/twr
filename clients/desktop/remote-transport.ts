@@ -383,6 +383,8 @@ export class DesktopTransport {
           timeout: this.options.routeTimeout,
           hubName,
         });
+        // A loser's /health stops with the race.
+        abort.addEventListener("abort", () => socket.destroy(), { once: true });
         await this.health(route, socket, { gatewayId, pin });
       },
       { signal, hubName },

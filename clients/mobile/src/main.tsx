@@ -439,7 +439,7 @@ function Mobile() {
       return true;
     } catch (e) {
       await remote?.stop().catch(() => {});
-      setError(errorMessage(e));
+      setError(pairErrorText(e));
       return false;
     } finally {
       setBusy(false);

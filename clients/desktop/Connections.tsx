@@ -236,7 +236,7 @@ export function Connections({
     try {
       await job();
     } catch (e) {
-      setError(errorMessage(e));
+      setError(pairErrorText(e));
     } finally {
       setBusy(false);
     }

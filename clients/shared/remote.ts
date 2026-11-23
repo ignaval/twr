@@ -244,7 +244,8 @@ export class RemoteHost {
       this.authenticationRevoked ||
       !this.foreground ||
       this.parked ||
-      type === "none" ||
+      // Offline, or not a network event at all (a listener given every event).
+      !["wifi", "cellular", "other"].includes(type) ||
       // The app's first workspace is still being chosen; that connection decides.
       !this.confirmedWorkspace
     )
@@ -432,7 +433,7 @@ export class RemoteHost {
     try {
       this.networkListener = await this.transport.addListener(
         "network",
-        ({ type }) => this.networkChanged(type),
+        (value) => this.networkChanged(value?.type),
       );
     } catch {
       /* A transport without network events reconnects on its timeouts. */
