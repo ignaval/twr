@@ -109,8 +109,10 @@ The QR code and the copied link both carry this JSON:
 
 | Kind | Rest | Meaning |
 |---|---|---|
-| `tls` | `<host>:<port>`, where host is an IPv4 literal, `[IPv6]` or a DNS name | Direct TLS to the gateway, authenticated by the pin |
+| `tls` | `<host>:<port>`, where host is an IPv4 literal, `[IPv6]` or a DNS name, and port is 1 to 5 ASCII digits, 1-65535 (no sign) | Direct TLS to the gateway, authenticated by the pin |
 | `relay` | reserved for phase 2; defined by the relay specification | |
+
+Hubs print IPv6 hosts in RFC 5952 form (lowercase, compressed), so one address has one spelling. Clients store routes as they receive them.
 
 **How the hub builds the list:**
 
@@ -205,7 +207,7 @@ Every case returns a `Hub`; pinned ones carry `pin`, `routes` and `route`. The `
 
 ## Gateway command-line output (for `twr phone`, the TUI and the desktop wizard)
 
-In pinned mode, `--pair --pair-json`, and `twr gateway --pair --pair-json` once the gateway is folded into `twr`, prints one JSON line. It is a superset of today's:
+In pinned mode, `twr gateway --pair --json` (and `--pair --pair-only --json`, which the desktop wizard uses) prints one JSON line. The flag is `--json`; `pair_json` is only the field's name in the code. The line is a superset of today's:
 
 ```json
 {"code":"ABCDEFGHJK23","expires_at":1763900000,"scopes":["read","operate"],"gateway_id":"<uuid>",
@@ -233,3 +235,54 @@ When the drawn code doesn't fit the terminal, they say so and show the link, the
 Without saved settings it never starts one, so a desktop user whose certificate-mode gateway keeps no settings never gets a pinned gateway they didn't ask for. A test's hub (a debug build under `TWR_HOME`) and `TWR_GATEWAY_AUTOSTART=off` never start one.
 
 `--gateway-info` adds `"pin"` (absent in certificate mode) and `"routes"`, the list the gateway would put in an invitation now. Both are absent while a certificate-mode gateway runs. When no gateway runs, they describe the pinned gateway that would start, if its identity exists. A running gateway's record also carries `"mode"`: `pinned`, `certificate` or `development`. A pinned gateway's `tls_cert` and `tls_key` are its `identity-cert.pem` and `identity-key.pem`, so the desktop app's checks still read the record.
+
+## Client rules settled in implementation (2026-11-23)
+
+The contract left these open. The Android, iOS and desktop clients all implement them, and new clients should too.
+
+**Saved routes:**
+
+- "30 days unseen" counts back from the newest sighting of any of the hub's routes, not from today. So a phone left unused for a month keeps its routes.
+- Past 16 routes, the least recently seen go first. Unknown kinds count toward the 16.
+
+**Racing:**
+
+- With no remembered route, every route starts at once.
+- The 250 ms head start ends early if the remembered route fails.
+- On cellular, a remembered private route is skipped as well.
+- If every route is private, they are tried anyway, since a VPN may reach them.
+
+**Typed pairing:**
+
+- It makes one aborted handshake first: the client captures the key, then refuses. The gateway doesn't log it as an error or count it toward rate limits.
+- A `/health` without `pin` is a certificate-mode gateway. The client refuses typed pairing with `CERTIFICATE_MODE` and says to pair by its `https://` address.
+- A wrong code and a man in the middle look the same, so a failed proof is `BAD_CODE`, worded to cover both.
+
+**The `network` event** may fire once when it is registered, and for a change between two networks of the same type (Wi-Fi to Wi-Fi). Computers report `other` or `none`.
+
+**Error codes.** Rejections carry one of these tokens at the start of the message, or as the reject code:
+
+| Token | Meaning |
+|---|---|
+| `PIN_MISMATCH` | another device's key |
+| `BAD_CODE` | a malformed code, or a failed proof |
+| `NO_INVITATION` | the gateway has no open invitation |
+| `UNREACHABLE` | the route couldn't be reached |
+| `TIMEOUT` | the route timed out |
+| `RATE_LIMITED` | the gateway refused for rate |
+| `PAIR_REFUSED` | the hub refused the code |
+| `CERTIFICATE_MODE` | typed pairing reached a certificate-mode gateway |
+| `BAD_ADDRESS` | the typed address isn't usable |
+| `BAD_INVITATION` | the invitation doesn't parse or validate |
+| `BAD_ROUTES` | no usable route in the list |
+| `UNKNOWN_HUB` | no saved hub with that id |
+| `KDF_FAILED` | Argon2id couldn't run, for example out of memory |
+
+User interfaces show the text after the token.
+
+**The `twr://` scheme.** Any app on a phone can register `twr://`, so another app could receive a tapped invitation link and use its one-use code first. The pin prevents a man in the middle, not theft of the link. Two things limit it:
+
+- `twr phone` and the TUI print the name of the device that paired, so an unexpected one shows at once and can be revoked.
+- Scanning the QR code inside the twr app avoids the link entirely.
+
+Universal links would need an `apple-app-site-association` on a domain, and are not used.
