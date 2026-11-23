@@ -157,3 +157,44 @@ A man in the middle presenting its own key can't produce a valid proof for that 
 **Reconnect at once on a network change:** Android's `ConnectivityManager` callback, iOS's `NWPathMonitor`. Don't wait for a timeout.
 
 **While connected, the gateway reports its current routes** in the connection hello, as `routes`. The client merges them under the limits above.
+
+## Client API (TypeScript ↔ native transport)
+
+`clients/shared/remote.ts` `NativeTransport` is implemented by Android (`TwrTransportPlugin.java`), iOS (`TwrTransportPlugin.swift`) and the desktop (`clients/desktop/remote-transport.ts`). The extensions below are backwards compatible: certificate-mode hubs keep working unchanged.
+
+```ts
+interface Hub {
+  id: string; name: string; url: string; scopes: string[]; gateway_id?: string;
+  pin?: string;       // set for pinned hubs; absent for certificate-mode hubs
+  routes?: string[];  // pinned hubs: known routes, e.g. "tls:192.168.1.20:47321"
+  route?: string;     // pinned hubs: the route last connected
+}
+interface PairRequest {
+  code: string; name: string; hubName: string;
+  url?: string;                                            // certificate mode (v1), as today
+  pin?: string; gatewayId?: string; routes?: string[]; iroh?: string;  // a scanned v2 invitation
+  address?: string;                                        // typed pairing: "host" or "host:port" (default 47321)
+}
+interface NativeTransport {
+  // existing: listHubs, pair, connect, send, disconnect, removeHub, addListener("message", …)
+  updateRoutes(request: { id: string; routes: string[] }): Promise<void>;
+  addListener(event: "network", listener: (value: { type: "wifi" | "cellular" | "other" | "none" }) => void):
+    Promise<{ remove(): Promise<void> }>;
+}
+```
+
+**`pair`:**
+
+- `pin` set: a scanned invitation. Race `routes` with the pin check. Then `POST /v1/pair` on the winner.
+- `address` set: typed pairing, with the proof flow above.
+- Otherwise: `url`, certificate mode.
+
+Every case returns a `Hub`; pinned ones carry `pin`, `routes` and `route`. The `url` of a pinned hub is `https://<host>:<port>` of the winning route, for display only.
+
+**`connect`.** For a pinned hub, race the saved routes as in [Racing routes](#racing-routes), then open `/v1/socket` on the winner, with the pin check, and remember the winner. Certificate-mode hubs connect as today.
+
+**`updateRoutes`** merges the routes the gateway's hello reports into the saved hub, within the limits in [Saved hub](#saved-hub-client-side). The shared TypeScript calls it when the hello carries `routes`.
+
+**The `network` event** fires when the device's default network changes. When it fires, the TypeScript layer reconnects at once if it was connected, or was trying to be, without waiting for a timeout or backoff.
+
+**Errors.** `pair` and `connect` reject with messages that name the route and the reason: unreachable, timed out, another device's key, or bad code. A pin mismatch carries `PIN_MISMATCH` in the message.
