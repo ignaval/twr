@@ -517,7 +517,7 @@ try {
         : "QA workstation",
     );
   await page
-    .getByLabel("Hub URL", { exact: true })
+    .getByLabel("Hub address", { exact: true })
     .fill(`http://127.0.0.1:${port}`);
   await page.getByLabel("Pairing code", { exact: true }).fill(code);
   await page.getByLabel("This device", { exact: true }).fill("Android QA");
@@ -1894,7 +1894,7 @@ try {
       .getByLabel("Hub name", { exact: true })
       .fill("Limited access QA");
     await page
-      .getByLabel("Hub URL", { exact: true })
+      .getByLabel("Hub address", { exact: true })
       .fill(`http://127.0.0.1:${port}`);
     await page.getByLabel("Pairing code", { exact: true }).fill(limitedCode);
     await page.getByLabel("This device", { exact: true }).fill("Limited QA");
@@ -1980,7 +1980,7 @@ try {
     await page.getByRole("button", { name: /Pair.*hub/i }).click();
     await page.getByLabel("Hub name", { exact: true }).fill("Read only QA");
     await page
-      .getByLabel("Hub URL", { exact: true })
+      .getByLabel("Hub address", { exact: true })
       .fill(`http://127.0.0.1:${port}`);
     await page.getByLabel("Pairing code", { exact: true }).fill(readOnlyCode);
     await page.getByLabel("This device", { exact: true }).fill("Read only QA");
