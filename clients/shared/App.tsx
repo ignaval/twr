@@ -35,6 +35,7 @@ import {
 import { MessageBody } from "./MessageBody";
 import { ConversationSearch, NeedsYouInbox } from "./InboxSearch";
 import { PaneResize } from "./LayoutOptions";
+import { stepTextSize, textSizeShortcut } from "./layoutPreferences";
 import { WORKSPACE_REFRESH_MS, workspaceEntries } from "./workspaceTree";
 import { attentionSummary } from "./attentionSummary";
 import { connectionWords, errorMessage } from "./errors";
@@ -1167,6 +1168,9 @@ export default function App({
       }
       if (event.type === "menu-attention")
         openAttention.current(event.workspace, event.thread);
+      if (event.type === "menu-text-larger") stepTextSize("larger", "menu");
+      if (event.type === "menu-text-smaller") stepTextSize("smaller", "menu");
+      if (event.type === "menu-text-reset") stepTextSize("reset", "menu");
       if (event.type === "menu-palette") {
         setPalette(true);
         setQuery("");
@@ -1533,6 +1537,12 @@ export default function App({
         ".terminal-surface",
       );
       if (inTerminal) return;
+      const textStep = textSizeShortcut(event, mac);
+      if (textStep) {
+        event.preventDefault();
+        stepTextSize(textStep, "keyboard");
+        return;
+      }
       if (mod && event.key.toLowerCase() === "n") {
         event.preventDefault();
         actionRef.current("new");

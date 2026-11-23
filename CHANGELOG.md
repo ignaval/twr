@@ -4,6 +4,10 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ## [Unreleased]
 
+### Added
+
+- Keyboard shortcuts for the text size in the desktop and phone apps: Ctrl/⌘ with + (or =, the same key without Shift) makes the interface and code text a pixel larger, Ctrl/⌘ with - a pixel smaller, and Ctrl/⌘+0 returns them to the defaults, within Settings › General › Layout & text's bounds (12 to 22 px, 11 to 24 px for code) and saved on this device like the setting. On the desktop the View menu's **Larger Text**, **Smaller Text** and **Actual Text Size** take these keys in place of page zoom ([desktop.md](docs/desktop.md#layout-and-offline-recovery)).
+
 ## [0.6.0] - 2026-11-22
 
 Simpler desktop and phone apps: Settings in tabs, forms that pick from lists, fewer pages for the same thing and one menu per conversation. twr's own neural voices read aloud on your machine (Kokoro, Supertonic 3 and Piper), with a voice for each language picked in the apps, and whisper's `small` models make dictation more accurate. The model and effort change from the message box, the orchestrator's in place; the orchestrator can search the web, run with full access and change twr's configuration when you ask; the apps show usage limits; and a single review pass (`--once`) runs one round. Also many fixes to drafts and attached files in the apps.
