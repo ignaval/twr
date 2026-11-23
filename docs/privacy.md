@@ -42,6 +42,7 @@ The apps published in the App Store and on Google Play show notifications only w
 - The desktop app and `twr update` ask GitHub for the latest twr release, and download it from there when you update.
 - `twr voice setup` downloads the speech model from whisper.cpp's published models, when you run it.
 - `twr voices install` downloads one of twr's own voices from sherpa-onnx's releases on GitHub, when you run it (or the apps' **Download** in Settings › Voice; a phone's downloads it onto the hub's computer). Speaking with it sends nothing anywhere: the voice runs on your machine. A phone that reads aloud with one gets the audio from the hub's computer over its own encrypted connection to your gateway, as it gets your messages.
+- The hub checks that its machine reaches the internet, every 30 seconds by default: it opens a TCP connection to the model APIs its runtimes use (`api.anthropic.com`, `api.openai.com`, `api.x.ai`, port 443), or to your proxy when `HTTPS_PROXY` or `ALL_PROXY` is set, and closes it at once without sending anything. `[hub] connectivity_targets` changes where it connects, and `connectivity_check_secs = 0` turns it off ([configuration.md](configuration.md)).
 
 These requests carry no identifier of yours beyond what any download reveals (your IP address, to GitHub or the model's host).
 

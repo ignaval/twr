@@ -1857,6 +1857,12 @@ pub struct AttentionItem {
     /// user's alone to answer (`resume` or `stop`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub loop_stuck: bool,
+    /// When the hub's machine lost its internet connection, for an item the hub raised about
+    /// that ([`offline_since`]: `ext.twr.offline.since`): the hub's own card on [`HUB_THREAD`],
+    /// or a thread's stall while the connection was down. A client labels it as such
+    /// ("No internet since 14:02") rather than as a plain stall.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_since: Option<DateTime<Utc>>,
     /// What a permission or question was raised in ([`RequestContext::of`]), when its event
     /// says anything about it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2017,6 +2023,7 @@ impl AttentionStack {
                     item.proposal = is_confirm_card(&ev.thread, &p.ext);
                     item.loop_setup = ev.source == Source::Hub && is_loop_setup_card(&p.ext);
                     item.loop_stuck = ev.source == Source::Hub && is_loop_stuck_item(&p.ext);
+                    item.offline_since = offline_since(&ev.source, &p.ext);
                     item.context = RequestContext::of(p.reason, &p.ext);
                     return;
                 }
@@ -2037,6 +2044,7 @@ impl AttentionStack {
                         proposal: is_confirm_card(&ev.thread, &p.ext),
                         loop_setup: ev.source == Source::Hub && is_loop_setup_card(&p.ext),
                         loop_stuck: ev.source == Source::Hub && is_loop_stuck_item(&p.ext),
+                        offline_since: offline_since(&ev.source, &p.ext),
                         context: RequestContext::of(p.reason, &p.ext),
                     },
                 );

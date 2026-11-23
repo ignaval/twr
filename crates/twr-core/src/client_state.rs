@@ -53,6 +53,7 @@ pub const ALL_NOTIFY_EVENTS: &[NotifyEvent] = &[
     NotifyEvent::Error,
     NotifyEvent::Review,
     NotifyEvent::Hung,
+    NotifyEvent::Offline,
     NotifyEvent::Stalled,
     NotifyEvent::Report,
     NotifyEvent::Reply,

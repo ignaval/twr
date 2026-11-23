@@ -325,6 +325,7 @@ const ANNOUNCED: &[NotifyEvent] = &[
     NotifyEvent::Error,
     NotifyEvent::Review,
     NotifyEvent::Hung,
+    NotifyEvent::Offline,
     NotifyEvent::Stalled,
 ];
 

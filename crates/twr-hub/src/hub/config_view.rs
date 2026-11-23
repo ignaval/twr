@@ -84,6 +84,8 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
         listen,
         tls,
         allow_insecure_remote,
+        connectivity_check_secs,
+        connectivity_targets,
     } = hub;
     let ThreadsConfig {
         thinking,
@@ -338,6 +340,9 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
             "listen": listen,
             "tls": tls.is_some(),
             "allow_insecure_remote": allow_insecure_remote,
+            "connectivity_check_secs": connectivity_check_secs
+                .unwrap_or(twr_core::config::CONNECTIVITY_CHECK_SECS),
+            "connectivity_targets": connectivity_targets,
         },
         "loops": {
             "profile": loop_profile,

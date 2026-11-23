@@ -101,6 +101,7 @@ import {
   CirclePause,
   Scissors,
   Shrink,
+  WifiOff,
 } from "lucide-react";
 import {
   commands as applicationCommands,
@@ -149,6 +150,13 @@ import {
 import { Manager, JobLog, navSection, type Section } from "./Managers";
 import { ActionsMenu, type MenuItem } from "./ActionsMenu";
 import { StatusStrip, type StripItem } from "./StatusStrip";
+import {
+  attentionKindLabel,
+  hubOffline,
+  isOffline,
+  offlineNoticeText,
+  offlineThreads,
+} from "./connectivity";
 import { PermissionModePicker, ThreadActions } from "./ThreadActions";
 import "./palette.css";
 import { useEditorSessions } from "./editors";
@@ -1708,6 +1716,7 @@ export default function App({
           reason: item.reason,
           loop_setup: item.loop_setup === true,
           loop_stuck: item.loop_stuck === true,
+          offline: isOffline(item),
           summary: item.summary,
           threadName: view.threads.find((t) => t.id === item.thread)?.name,
         }),
@@ -3202,6 +3211,7 @@ export default function App({
     ? `Offline · saved ${new Date(savedOffline.savedAt).toLocaleString()}. Requests need a live connection before you can answer.`
     : "";
   const connectionNotice = !!(connectionError || connecting);
+  const noInternet = hubOffline(view.attention);
   // The host reconnecting on its own (its error names the hub's socket): news, not alarm.
   const reconnecting = !connecting && !!connectionWords(connectionError).detail;
   const notices: StripItem[] = [
@@ -3247,6 +3257,22 @@ export default function App({
             role: "status" as const,
             tone: "offline" as const,
             content: offlineWords,
+          },
+        ]
+      : []),
+    // The hub's machine lost its internet connection (twr-hub `hub::net`): its own notice,
+    // while it is open.
+    ...(connected && noInternet
+      ? [
+          {
+            key: "no-internet",
+            role: "status" as const,
+            tone: "warning" as const,
+            icon: <WifiOff size={15} />,
+            content: offlineNoticeText(
+              noInternet,
+              offlineThreads(view.attention),
+            ),
           },
         ]
       : []),
@@ -5570,13 +5596,7 @@ function AttentionCard({
       <header>
         <span className="attention-kind" id={`${ids}-kind`}>
           <AlertCircle size={14} />
-          {item.loop_stuck
-            ? "Loop stuck"
-            : item.reason === "permission"
-              ? "Permission requested"
-              : item.reason === "question"
-                ? "Question for you"
-                : item.reason}
+          {attentionKindLabel(item)}
         </span>
         <span id={`${ids}-thread`}>{thread?.name || "twr"}</span>
       </header>

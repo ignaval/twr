@@ -101,6 +101,35 @@ pub fn went_on(ext: &Option<JsonMap>) -> bool {
         == Some(true)
 }
 
+/// `attention.raised` `ext.twr` key of an item the hub raised because its own machine has no
+/// internet connection (`twr-hub` `hub::net`): `{since}`, when the connection was lost (RFC
+/// 3339). Its reason is `stalled`. The hub raises one on [`HUB_THREAD`] for the outage (its
+/// checks of the model APIs fail), and a thread on the hub's own box that is silent for the
+/// stall threshold meanwhile gets its stall with it instead of a plain one: its runtime cannot
+/// reach its model API. Both close when the connection is back, [`BACK_ONLINE_KEY`].
+pub const OFFLINE_KEY: &str = "offline";
+
+/// `attention.resolved` `ext.twr` key of an item marked [`OFFLINE_KEY`] the hub closed (`by:
+/// timeout`) because the connection came back: when (RFC 3339).
+pub const BACK_ONLINE_KEY: &str = "back_online";
+
+/// When the connection was lost, for an `attention.raised` by `source` with `ext` that is one
+/// of the hub's items about it ([`OFFLINE_KEY`]).
+pub fn offline_since(source: &Source, ext: &Option<JsonMap>) -> Option<DateTime<Utc>> {
+    if *source != Source::Hub {
+        return None;
+    }
+    let since = ext
+        .as_ref()?
+        .get("twr")?
+        .get(OFFLINE_KEY)?
+        .get("since")?
+        .as_str()?;
+    DateTime::parse_from_rfc3339(since)
+        .ok()
+        .map(|d| d.with_timezone(&Utc))
+}
+
 /// `conversation.update` `ext.twr` key of a routine update the hub mirrors into the
 /// orchestrator's conversation (`twr-hub` `hub::updates`): one that tells of work going on, not
 /// of something to decide. Its value says which: [`ROUTINE_INTERIM`], [`ROUTINE_BACKGROUND_DONE`]

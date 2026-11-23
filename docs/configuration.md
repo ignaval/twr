@@ -156,7 +156,7 @@ native = true                     # names the native account (the runtime's own 
 
 [notify]                          # the hub runs a command when something needs you; see notifications.md
 # command = ["notify-send", "--app-name=twr", "{title}", "{body}"]  # unset = off; no shell; {title} {body} {workspace}
-events = ["permission", "question", "confirm", "error", "review", "hung", "report", "reply"]  # add "stalled" for stalls
+events = ["permission", "question", "confirm", "error", "review", "hung", "offline", "report", "reply"]  # add "stalled" for stalls
 detail = false                    # true: what's asked or reported goes along (it may hold secrets)
 timeout_secs = 30                 # the command is ended after this long (1 to 600)
 
@@ -174,7 +174,7 @@ colors = "auto"                   # "256", "16" or "none"; auto: from NO_COLOR, 
 [tui.notify]
 terminal = "off"                  # bell | osc9 | osc777: alert the terminal when something needs you
 when = "unfocused"                # always: also while the terminal has focus
-events = ["permission", "question", "confirm", "error", "review", "hung", "report", "reply"]  # add "stalled" for stalls
+events = ["permission", "question", "confirm", "error", "review", "hung", "offline", "report", "reply"]  # add "stalled" for stalls
 
 [speech]                          # reading aloud, on the machine you listen on; see read-aloud.md
 engine = "auto"                   # say (macOS) | avspeech (macOS) | spd (Linux) | command; auto: say, else spd if installed
@@ -223,6 +223,10 @@ efforts = ["low", "medium", "high", "xhigh", "max"]
 # A non-loopback listen address needs one of these:
 # tls = { cert = "hub.pem", key = "hub.key" }   # serve wss:// (PEM files)
 allow_insecure_remote = false     # true: plain ws:// on the network (events in clear text)
+connectivity_check_secs = 30      # how often the hub checks it reaches the internet; 0 = never
+# connectivity_targets = ["api.anthropic.com:443"]  # host:port it connects to (any one answering
+                                  # is enough); unset = the proxy of HTTPS_PROXY / ALL_PROXY when
+                                  # set, else api.anthropic.com, api.openai.com and api.x.ai on 443
 
 [boxes.gpu]                       # example: a box the hub reaches over SSH; see runners.md
 transport = "ssh"                 # the hub connects to it; unset = "token" (its runner connects to the hub)
