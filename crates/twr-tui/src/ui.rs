@@ -4734,7 +4734,7 @@ fn thread_box(
     threads: &Threads,
 ) -> Vec<TranscriptRow> {
     let thread = threads.get(name);
-    let frame = Style::default().fg(thread.map_or(Color::DarkGray, thread_color));
+    let frame = box_frame(thread);
     let label = thread.map_or(name, |t| t.name.as_str());
     let mut out = Vec::new();
     if width < BOX_MIN_WIDTH {
@@ -4750,6 +4750,37 @@ fn thread_box(
         }
         return out;
     }
+    out.push(box_top(thread, label, width, threads));
+    if !text.is_empty() {
+        // Its text's markdown rendered; the frame comes after the last span of a row.
+        for r in crate::md::rows(text, width - 4, 0) {
+            out.push(box_row(
+                (r.line, r.join, None, Edge::Gutter(r.gutter as u16)),
+                frame,
+                width,
+            ));
+        }
+    }
+    if closed {
+        out.push(box_bottom(frame, width));
+    }
+    out
+}
+
+/// The color of a thread box's frame ([`thread_box`]): the thread's, dim grey for none.
+fn box_frame(thread: Option<&ThreadView>) -> Style {
+    Style::default().fg(thread.map_or(Color::DarkGray, thread_color))
+}
+
+/// A thread box's top border ([`thread_box`]), `width` cells (at least [`BOX_MIN_WIDTH`]):
+/// `label` in bold in the frame's color, then a live thread's status when it fits.
+fn box_top(
+    thread: Option<&ThreadView>,
+    label: &str,
+    width: usize,
+    threads: &Threads,
+) -> TranscriptRow {
+    let frame = box_frame(thread);
     // `╭─ `, the title, a space, at least one `─`, `╮`.
     let room = width - 6;
     let mut title = vec![Span::styled(
@@ -4770,34 +4801,106 @@ fn thread_box(
     top.extend(title);
     let fill = "─".repeat(width.saturating_sub(used + 5));
     top.push(Span::styled(format!(" {fill}╮"), frame));
-    out.push((Line::from(top), Join::Newline, None, Edge::Top(used)));
-    if !text.is_empty() {
-        let inner = width - 4;
-        // Its text's markdown rendered; the frame comes after the last span of a row.
-        for r in crate::md::rows(text, inner, 0) {
-            let used: usize = r
-                .line
-                .spans
-                .iter()
-                .map(|s| crate::edit::width(&s.content))
-                .sum();
-            let pad = " ".repeat(inner.saturating_sub(used));
-            let mut spans = vec![Span::styled("│ ", frame)];
-            spans.extend(r.line.spans.into_iter().filter(|s| !s.content.is_empty()));
-            spans.push(Span::styled(format!("{pad} │"), frame));
-            let edge = match u16::try_from(r.gutter).unwrap_or(u16::MAX) {
-                0 => Edge::Bars,
-                n => Edge::BarsIndent(n),
-            };
-            out.push((Line::from(spans), r.join, None, edge));
-        }
+    (Line::from(top), Join::Newline, None, Edge::Top(used))
+}
+
+/// A row drawn `width - 4` cells wide, framed to `width` inside a thread box: `│ `, its
+/// spans padded, ` │`. Its gutter, if any, stays left out of a copy with the frame.
+fn box_row(row: TranscriptRow, frame: Style, width: usize) -> TranscriptRow {
+    let (line, join, link, edge) = row;
+    let inner = width - 4;
+    let used: usize = line
+        .spans
+        .iter()
+        .map(|s| crate::edit::width(&s.content))
+        .sum();
+    let pad = " ".repeat(inner.saturating_sub(used));
+    let mut spans = vec![Span::styled("│ ", frame)];
+    spans.extend(line.spans.into_iter().filter(|s| !s.content.is_empty()));
+    spans.push(Span::styled(format!("{pad} │"), frame));
+    let edge = match edge {
+        Edge::Gutter(n) if n > 0 => Edge::BarsIndent(n),
+        Edge::BarsIndent(n) => Edge::BarsIndent(n),
+        _ => Edge::Bars,
+    };
+    (Line::from(spans), join, link, edge)
+}
+
+/// A thread box's bottom border, `width` cells.
+fn box_bottom(frame: Style, width: usize) -> TranscriptRow {
+    let line = Line::from(Span::styled(format!("╰{}╯", "─".repeat(width - 2)), frame));
+    // All frame: a copy across it joins the rows around it, no blank line between.
+    (line, Join::Skip, None, Edge::Bottom)
+}
+
+/// The worker a hub update in the orchestrator's conversation (`threads.boxes`) is about,
+/// for its box ([`boxed_update`]): the thread its `about` names. The hub names it by id, and
+/// only an id is taken: a name can be reused once its thread is deleted, an id cannot. An
+/// update that acknowledges your message (it draws your prompt first) has no box.
+fn update_thread<'a>(e: &Entry, threads: &Threads<'a>) -> Option<&'a ThreadView> {
+    if !threads.boxes {
+        return None;
     }
-    if closed {
-        let line = Line::from(Span::styled(format!("╰{}╯", "─".repeat(width - 2)), frame));
-        // All frame: a copy across it joins the rows around it, no blank line between.
-        out.push((line, Join::Skip, None, Edge::Bottom));
+    let Entry::HubUpdate {
+        about: Some(id),
+        user_message: None,
+        ..
+    } = e
+    else {
+        return None;
+    };
+    threads
+        .get(id)
+        .filter(|t| t.id == *id && !t.is_orchestrator())
+}
+
+/// The rows `draw` puts in a `v.width - 4` wide view, in the box of `thread` ([`update_thread`]),
+/// as an orchestrator reply's section about it is ([`thread_box`]): titled with its name and
+/// status, framed in its color. Without a thread, or in a pane too narrow for a box, the rows
+/// as they are.
+/// A click on any row of the box does what a click on its rows does when they all do the
+/// same (a folded run's row expands it from its frame too). Returns the row, in `v.out`, the
+/// first of `draw`'s rows went to.
+fn boxed_update(
+    v: &mut View,
+    thread: Option<&ThreadView>,
+    threads: &Threads,
+    draw: impl FnOnce(&mut View),
+) -> usize {
+    let Some(t) = thread.filter(|_| v.width >= BOX_MIN_WIDTH) else {
+        let at = v.out.len();
+        draw(v);
+        return at;
+    };
+    v.block(Kind::Block);
+    let mut inner = View {
+        out: Vec::new(),
+        prev: None,
+        blank: None,
+        width: v.width - 4,
+    };
+    draw(&mut inner);
+    let mut rows = inner.out;
+    while rows.last().is_some_and(|r| r.0.width() == 0) {
+        rows.pop();
     }
-    out
+    let link = rows
+        .first()
+        .and_then(|r| r.2.clone())
+        .filter(|l| rows.iter().all(|r| r.2.as_deref() == Some(l)));
+    let frame = box_frame(Some(t));
+    let mut top = box_top(Some(t), &t.name, v.width, threads);
+    top.2.clone_from(&link);
+    v.out.push(top);
+    let at = v.out.len();
+    for row in rows {
+        v.out.push(box_row(row, frame, v.width));
+    }
+    let mut bottom = box_bottom(frame, v.width);
+    bottom.2 = link;
+    v.out.push(bottom);
+    v.prev = Some(Kind::Block);
+    at
 }
 
 /// Pushes `text` wrapped to `width` onto `out` in `style`, each row linked to `link`.
@@ -5013,16 +5116,20 @@ pub fn transcript_view_spans(
         match &entries[i] {
             Entry::HubUpdate { .. } if runs.as_ref().and_then(|r| r.of(i)).is_some() => {
                 let run = runs.as_ref().and_then(|r| r.of(i)).unwrap();
+                let thread = update_thread(&entries[i], threads);
                 if !collapse.folded(&run.key) {
                     v.block(Kind::Compact);
-                    hub_update_rows(&mut v, &entries[i], threads);
+                    boxed_update(&mut v, thread, threads, |v| {
+                        hub_update_rows(v, &entries[i], threads);
+                    });
                     limit_block(&mut v, start, block_key(&entries[i], i, threads), threads);
                 } else if run.newest() == i {
                     v.block(Kind::Compact);
-                    let at = v.out.len();
-                    let row = routine_row(run, entries, threads, width);
-                    v.out
-                        .push((row, Join::Newline, Some(run.key.clone()), Edge::Gutter(2)));
+                    let at = boxed_update(&mut v, thread, threads, |v| {
+                        let row = routine_row(run, entries, threads, v.width);
+                        v.out
+                            .push((row, Join::Newline, Some(run.key.clone()), Edge::Gutter(2)));
+                    });
                     folded_runs.push((
                         at,
                         crate::summary::DrawnRun {
@@ -5072,16 +5179,25 @@ pub fn transcript_view_spans(
                 if n >= ANSWERS_FOLD && collapse.folded(&key) {
                     v.block(Kind::Compact);
                     let run: Vec<&Entry> = entries[i..i + n].iter().collect();
-                    let row = answers_marker(&run, threads, width);
-                    let marker = v.out.len();
-                    v.out.push((row, Join::Newline, Some(key), Edge::Gutter(2)));
+                    // Boxed only when every request of the run is one thread's.
+                    let first = update_thread(run[0], threads);
+                    let thread = first.filter(|t| {
+                        run.iter()
+                            .all(|e| update_thread(e, threads).is_some_and(|o| o.id == t.id))
+                    });
+                    let marker = boxed_update(&mut v, thread, threads, |v| {
+                        let row = answers_marker(&run, threads, v.width);
+                        v.out.push((row, Join::Newline, Some(key), Edge::Gutter(2)));
+                    });
                     spans.push(v.drawn(start));
                     spans.extend((1..n).map(|_| marker..marker));
                 } else {
                     for (offset, e) in entries[i..i + n].iter().enumerate() {
                         let from = v.out.len();
                         v.block(Kind::Compact);
-                        hub_update_rows(&mut v, e, threads);
+                        boxed_update(&mut v, update_thread(e, threads), threads, |v| {
+                            hub_update_rows(v, e, threads);
+                        });
                         limit_block(&mut v, from, block_key(e, i + offset, threads), threads);
                         spans.push(v.drawn(from));
                     }
@@ -5449,7 +5565,9 @@ fn entry_rows(v: &mut View, e: &Entry, threads: &Threads) {
         }
         Entry::HubUpdate { .. } => {
             v.block(Kind::Compact);
-            hub_update_rows(v, e, threads);
+            boxed_update(v, update_thread(e, threads), threads, |v| {
+                hub_update_rows(v, e, threads);
+            });
         }
         Entry::Tool { .. } => {
             v.block(Kind::Block);
@@ -18108,8 +18226,10 @@ mod tests {
                 resolution: false,
                 routine: None,
             };
+            // (Its box's title names the thread it is about: only its own words are read.)
             transcript_view(&[e], 200, &Collapse::default(), &threads)
                 .iter()
+                .filter(|r| !matches!(r.3, Edge::Top(_)))
                 .flat_map(|r| r.0.spans.iter())
                 .filter_map(|s| match s.style.fg {
                     Some(c)
@@ -18197,6 +18317,156 @@ mod tests {
         ] {
             assert_eq!(colored(text, about), want, "{text}");
         }
+    }
+
+    /// A hub update about a worker is in that worker's box, as the orchestrator's section
+    /// about it is: titled with its name (and status), framed in its color, its rows the
+    /// update's as they would be without it, their frame left out of a copy. Only the id the
+    /// hub names (`about`) picks the thread, never a name; an update about none, the
+    /// orchestrator's own or a worker's transcript, and a pane too narrow, have no box.
+    #[test]
+    fn a_hub_update_about_a_worker_is_in_its_box() {
+        let st = three_threads();
+        let gamma = color_of(&st, "t-gamma");
+        let update = |text: &str, about: Option<&str>, outcome: Option<&str>| Entry::HubUpdate {
+            text: text.into(),
+            user_message: None,
+            attn_id: None,
+            about: about.map(str::to_string),
+            outcome: outcome.map(str::to_string),
+            seq: 1,
+            resolution: false,
+            routine: None,
+        };
+        let view = |entries: &[Entry], width: u16, boxes: bool| -> Vec<TranscriptRow> {
+            let threads = Threads {
+                boxes,
+                state: Some(&st),
+            };
+            let mut rows = transcript_view(
+                entries,
+                width,
+                &Collapse {
+                    on: true,
+                    ..Collapse::default()
+                },
+                &threads,
+            );
+            // (In the orchestrator's conversation, beta's open permission comes first, in
+            // its own box, then a blank row.)
+            let beta = rows
+                .first()
+                .is_some_and(|r| r.0.to_string().starts_with("╭─ beta"));
+            let skip = if beta {
+                rows.iter().position(|r| r.3 == Edge::Bottom).unwrap() + 2
+            } else {
+                0
+            };
+            rows.split_off(skip.min(rows.len()))
+        };
+        let text = |rows: &[TranscriptRow]| -> Vec<String> {
+            rows.iter()
+                .map(|r| r.0.to_string().trim_end().to_string())
+                .collect()
+        };
+
+        let rows = view(
+            &[update(
+                "gamma finished (success): Done.",
+                Some("t-gamma"),
+                None,
+            )],
+            60,
+            true,
+        );
+        let lines = text(&rows);
+        assert!(lines[0].starts_with("╭─ gamma · running ─"), "{lines:#?}");
+        assert!(lines[0].ends_with("╮"), "{lines:#?}");
+        assert!(
+            lines[1].starts_with("│ ● gamma finished · success "),
+            "{lines:#?}"
+        );
+        assert!(lines[1].ends_with(" │"), "{lines:#?}");
+        assert!(lines[2].starts_with("│   Done."), "{lines:#?}");
+        assert_eq!(lines.last().unwrap(), &format!("╰{}╯", "─".repeat(58)));
+        for r in &rows {
+            assert_eq!(crate::edit::width(&r.0.to_string()), 60, "{lines:#?}");
+            assert_eq!(
+                r.0.spans.first().unwrap().style.fg,
+                Some(gamma),
+                "{lines:#?}"
+            );
+        }
+        assert!(matches!(rows[0].3, Edge::Top(_)));
+        assert!(matches!(rows[1].3, Edge::BarsIndent(2)));
+        assert_eq!(rows.last().unwrap().3, Edge::Bottom);
+
+        // One row's update: three rows, the frame around it.
+        let rows = view(
+            &[update(
+                "gamma background work finished.",
+                Some("t-gamma"),
+                None,
+            )],
+            60,
+            true,
+        );
+        assert_eq!(rows.len(), 3, "{:#?}", text(&rows));
+        assert!(text(&rows)[1].starts_with("│ · gamma background work finished."));
+
+        // By name, about nobody, or an unknown id: as it was, one row.
+        for about in [Some("gamma"), None, Some("t-gone")] {
+            let rows = view(
+                &[update("gamma background work finished.", about, None)],
+                60,
+                true,
+            );
+            assert_eq!(
+                text(&rows),
+                ["· gamma background work finished."],
+                "{about:?}"
+            );
+        }
+        // Not the orchestrator's conversation, or too narrow for a box.
+        let one = [update(
+            "gamma background work finished.",
+            Some("t-gamma"),
+            None,
+        )];
+        assert_eq!(
+            text(&view(&one, 60, false)),
+            ["· gamma background work finished."]
+        );
+        assert!(view(&one, 7, true)
+            .iter()
+            .all(|r| matches!(r.3, Edge::None | Edge::Gutter(_))));
+
+        // A folded run of ended requests: boxed when they are all one thread's.
+        let asked = |name: &str| format!("{name} needs permission: Bash: ls");
+        let alphas: Vec<Entry> = (0..3)
+            .map(|_| update(&asked("alpha"), Some("t-alpha"), Some("answered: allow")))
+            .collect();
+        let rows = view(&alphas, 60, true);
+        let lines = text(&rows);
+        assert!(lines[0].starts_with("╭─ alpha"), "{lines:#?}");
+        assert!(
+            lines[1].starts_with("│ ✓ 3 requests · 3 allowed · alpha"),
+            "{lines:#?}"
+        );
+        assert_eq!(rows.len(), 3, "{lines:#?}");
+        // A click on its frame expands it too.
+        assert!(
+            rows.iter().all(|r| r.2.as_deref() == Some("answers:1")),
+            "{lines:#?}"
+        );
+        let mut mixed = alphas.clone();
+        mixed[1] = update(&asked("gamma"), Some("t-gamma"), Some("answered: allow"));
+        let lines = text(&view(&mixed, 60, true));
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(
+            lines[0].starts_with("✓ 3 requests · 3 allowed"),
+            "{lines:#?}"
+        );
     }
 
     /// In a dive, the header band is filled with the thread's color, its text black or white

@@ -4,7 +4,8 @@ import { describe, expect, it, vi } from "vitest";
 import { MessageBody } from "../shared/MessageBody";
 import { THREAD_COLORS, threadInk } from "../shared/threadColor";
 import type { HubEvent, Thread } from "../shared/types";
-import { blocksOf } from "../shared/transcript";
+import { blocksOf, foldRoutineBlocks } from "../shared/transcript";
+import { ThreadBox, aboutThread } from "../shared/ThreadMessage";
 
 vi.mock("../shared/host", () => ({
   useHostAPI: () => ({
@@ -899,5 +900,90 @@ describe("orchestrator thread sections", () => {
       expect(html).toContain("&lt;thread");
     }
     expect(tool).toContain("**body**");
+  });
+});
+
+describe("hub updates about a worker", () => {
+  const thread = (overrides: Partial<Thread>): Thread => ({
+    id: "t1",
+    name: "api",
+    accent: THREAD_COLORS[3],
+    runtime: "fake",
+    box_name: "local",
+    mode: "default",
+    status: "idle",
+    is_orchestrator: false,
+    ...overrides,
+  });
+  const update = (
+    seq: number,
+    text: string,
+    about?: string,
+    routine = false,
+  ): HubEvent =>
+    ({
+      id: `e${seq}`,
+      seq,
+      thread: "orch",
+      ts: "2026-11-23T01:55:00Z",
+      kind: "conversation.update",
+      source: "hub",
+      routine,
+      data: { text, ...(about ? { about_thread: about } : {}) },
+    }) as HubEvent;
+  const box = (threads: Thread[], about?: string) =>
+    renderToStaticMarkup(
+      createElement(ThreadBox, {
+        thread: aboutThread(threads, about),
+        children: createElement("p", null, "body"),
+      }),
+    );
+
+  it("picks the thread by id, never by a reused name", () => {
+    // A deleted `api`'s name now belongs to t2; the update was about t1.
+    const threads = [
+      thread({ id: "t2", accent: THREAD_COLORS[5] }),
+      thread({ id: "t1", name: "api-old", accent: THREAD_COLORS[3] }),
+    ];
+    expect(aboutThread(threads, "t1")?.name).toBe("api-old");
+    expect(aboutThread(threads, "api")).toBeUndefined();
+    const [section] = boxes(box(threads, "t1"));
+    expect(section.name).toBe("api-old");
+    const html = box(threads, "t1");
+    expect(html).toContain(`--thread-color:${THREAD_COLORS[3]}`);
+    expect(html).not.toContain(THREAD_COLORS[5]);
+    expect(html).toContain(
+      '<div class="thread-message-name thread-ink">api-old</div><p>body</p>',
+    );
+  });
+
+  it("leaves an update about no thread, an unknown one or the orchestrator unboxed", () => {
+    const threads = [
+      thread({}),
+      thread({ id: "orch", name: "orchestrator", is_orchestrator: true }),
+    ];
+    for (const about of [undefined, "gone", "orch"])
+      expect(box(threads, about)).toBe("<p>body</p>");
+    expect(box([], "t1")).toBe("<p>body</p>");
+  });
+
+  it("carries the thread id onto an update and onto its folded run", () => {
+    const events = [
+      update(1, "api finished (success): Done.", "t1"),
+      update(2, "Queued until api finishes: x"),
+      update(3, "api background work finished.", "t1", true),
+      update(4, "api background work finished.", "t1", true),
+    ];
+    const blocks = foldRoutineBlocks(blocksOf(events), events, []);
+    expect(blocks.map((block) => [block.kind, block.about])).toEqual([
+      ["notice", "t1"],
+      ["notice", undefined],
+      ["notice", "t1"],
+    ]);
+    // A run is always about one thread: every update in it names the same id.
+    expect(blocks[2].children?.map((child) => child.about)).toEqual([
+      "t1",
+      "t1",
+    ]);
   });
 });

@@ -2,7 +2,7 @@ import type { Blockquote, Root, RootContent } from "mdast";
 import type { Extension as FromMarkdownExtension } from "mdast-util-from-markdown";
 import type { Extension, State, Tokenizer } from "micromark-util-types";
 import type { Plugin } from "unified";
-import { memo } from "react";
+import { memo, type ReactNode } from "react";
 import { Markdown } from "./ui";
 import { threadStyle } from "./threadColor";
 import type { Thread } from "./types";
@@ -277,3 +277,37 @@ export const ThreadMessage = memo(function ThreadMessage({
     />
   );
 });
+
+/** The worker a hub update is about. The hub names it by id (`about_thread`), never by
+ * name: a name can be reused once its thread is deleted, an id cannot. An id that matches no
+ * listed thread, or the orchestrator, gets no box. */
+export function aboutThread(
+  threads: Thread[] | undefined,
+  id: string | undefined,
+): Thread | undefined {
+  if (!id) return undefined;
+  return threads?.find((thread) => thread.id === id && !thread.is_orchestrator);
+}
+
+/** A hub update about `thread` (a report, a request, a run of routine updates), drawn in
+ * the same box as an orchestrator reply's `<thread>` section: framed in the thread's colour
+ * and titled with its name. Without a thread, the content as it is. */
+export function ThreadBox({
+  thread,
+  children,
+}: {
+  thread?: Thread;
+  children: ReactNode;
+}) {
+  if (!thread) return <>{children}</>;
+  return (
+    <section
+      className="thread-message"
+      aria-label={thread.name}
+      style={threadStyle(thread.accent)}
+    >
+      <div className="thread-message-name thread-ink">{thread.name}</div>
+      {children}
+    </section>
+  );
+}
