@@ -65,7 +65,7 @@ In certificate mode, `pin` is absent and `protocol` stays `1`: released desktop 
 **`GET /v1/pair/proof?nonce=<base64url-nopad of 32 bytes>`, unauthenticated.**
 
 - `200 {"proof":"<base64url-nopad of 32 bytes>"}` while an invitation is open.
-- `404` when none is.
+- `404` when none is. That includes a hub from a twr older than this contract, which has no `device.pair_proof` (`method_not_found`): its `error` says the hub is from an older twr and to restart it, and the gateway logs that. Never `503` for it.
 - `400` for a malformed nonce.
 - It shares `/v1/pair`'s rate limits, per address and global, and its 35-second deadline.
 - A proof request doesn't count as a failed attempt. Every proof for the open code is derived from the same key, so a second one tells an attacker nothing new.
@@ -225,6 +225,8 @@ In pinned mode, `twr gateway --pair --json` (and `--pair --pair-only --json`, wh
 ```
 
 `expires_at` is seconds, as today; the invitation's `expiresAt` is milliseconds. In certificate mode the output is unchanged, with no `invitation` and no `link`.
+
+**A hub from an older twr.** A hub that still runs from a twr before 12-character codes answers `device.pair_begin` with a 10-character code. In either mode, the gateway, `twr phone` and the TUI's `/phone` then cancel that code and print no invitation. They fail with one line saying the running hub is from an older twr and to restart it (`twr hub stop`, then run twr again), never a generic "not a pairing code".
 
 **Terminal QR codes.** `twr phone` and the TUI's `/phone` draw a QR code of the invitation JSON without its optional `iroh` and `scopes`, which every scanner accepts. They print the `twr://pair#` link beside it as text, for copy, paste and tap. Base64 makes the link a third larger. At low error correction, with a 2-module quiet zone, a three-route invitation takes:
 

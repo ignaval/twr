@@ -525,8 +525,11 @@ mod socket_tests {
         assert_eq!(attempt("[2001:db8:1::1]:1").await, StatusCode::BAD_REQUEST);
     }
     /// A hub that answers a gateway's owner calls from the device store in `dir`, as the hub
-    /// does: `hello` as the user, `device.pair_proof` from the open invitation.
-    async fn proof_hub(dir: &Path) -> twr_core::client::Client {
+    /// does: `hello` as the user, `device.pair_proof` from the open invitation. An `older` one
+    /// answers as a twr before 12-symbol codes: `device.pair_begin` with a 10-symbol code,
+    /// `device.pair_cancel` (noting the code in `dir`'s `cancelled`), and no
+    /// `device.pair_proof`.
+    async fn proof_hub(dir: &Path, older: bool) -> twr_core::client::Client {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use twr_core::phone_pairing::{b64url_decode, b64url_encode, decode_pin};
         let path = dir.join("hub.sock");
@@ -543,6 +546,17 @@ mod socket_tests {
                         let (id, p) = (&request["id"], &request["params"]);
                         let reply = match request["method"].as_str().unwrap() {
                             "hello" => json!({"id":id,"result":{"identity":"user:local"}}),
+                            "device.pair_begin" if older => {
+                                json!({"id":id,"result":{"code":"ABCDEFGHJK","expires_in":300}})
+                            }
+                            "device.pair_cancel" if older => {
+                                let code = p["code"].as_str().unwrap();
+                                std::fs::write(store.join("cancelled"), code).unwrap();
+                                json!({"id":id,"result":{"cancelled":true}})
+                            }
+                            "device.pair_proof" if older => json!({"id":id,"error":{
+                                "code":"method_not_found",
+                                "message":"unknown method device.pair_proof"}}),
                             "device.pair_proof" => {
                                 let pin = decode_pin(p["pin"].as_str().unwrap()).unwrap();
                                 let nonce = b64url_decode(p["nonce"].as_str().unwrap()).unwrap();
@@ -575,6 +589,10 @@ mod socket_tests {
     }
     /// A pinned gateway over the device store in `dir`, with [`proof_hub`] as its hub.
     async fn pinned_server(dir: &Path) -> (Shared, identity::Identity) {
+        pinned_server_of(dir, false).await
+    }
+    /// [`pinned_server`], its hub an `older` one or not ([`proof_hub`]).
+    async fn pinned_server_of(dir: &Path, older: bool) -> (Shared, identity::Identity) {
         use std::os::unix::fs::PermissionsExt;
         let _ = rustls::crypto::ring::default_provider().install_default();
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -583,7 +601,7 @@ mod socket_tests {
             Auth::open(dir).unwrap(),
             remote::push::Push::new(dir, None, None).unwrap(),
             remote::receipts::Receipts::new(dir).unwrap(),
-            Some(proof_hub(dir).await),
+            Some(proof_hub(dir, older).await),
             (
                 dir.join("twr"),
                 remote::companion::Command::program(dir.join("twr-desktop-bridge")),
@@ -685,6 +703,38 @@ mod socket_tests {
             ask_proof(&server, "192.0.2.1:1", &encoded).await.0,
             StatusCode::NOT_FOUND
         );
+    }
+    /// A hub from a twr before 12-symbol codes and typed pairing: its code is cancelled and
+    /// the gateway says to restart it, both when it begins an invitation and when a phone asks
+    /// for a proof (404, as for no invitation, never 503 or "not a pairing code").
+    #[tokio::test]
+    async fn an_older_hub_is_named_as_such() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _) = pinned_server_of(dir.path(), true).await;
+        let nonce = twr_core::phone_pairing::b64url_encode(&[5u8; 32]);
+        let (status, body) = ask_proof(&server, "192.0.2.1:1", &nonce).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let error = body["error"].as_str().unwrap();
+        assert!(
+            error.contains("older twr") && error.contains("twr hub stop"),
+            "{error}"
+        );
+        let mut owner = server.owner.lock().await.take().unwrap();
+        let pinned = PinnedInvitation {
+            pin: "p".repeat(43),
+            iroh: String::new(),
+            routes: vec![routes::configured("192.0.2.4", 47321).unwrap()],
+        };
+        for pinned in [Some(&pinned), None] {
+            let _ = std::fs::remove_file(dir.path().join("cancelled"));
+            let error = begin_invitation(&mut owner, &["read"], dir.path(), pinned)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, OLDER_HUB);
+            let cancelled = std::fs::read_to_string(dir.path().join("cancelled")).unwrap();
+            assert_eq!(cancelled, "ABCDEFGHJK");
+        }
     }
     /// `/health` says protocol 2 and the pin in pinned mode only; certificate mode stays 1.
     #[tokio::test]
@@ -1329,6 +1379,16 @@ async fn pair_proof(
                 .is_some_and(|e| e.code == twr_core::proto::codes::NOT_FOUND) =>
         {
             none_open()
+        }
+        // A hub older than typed pairing has no invitation this twr made, and no proofs.
+        Err(error)
+            if error
+                .downcast_ref::<twr_core::proto::RpcError>()
+                .is_some_and(|e| e.code == twr_core::proto::codes::METHOD_NOT_FOUND) =>
+        {
+            crate::gateway_log!("Typed pairing refused: {OLDER_HUB}");
+            let message = format!("No pairing invitation is open: {OLDER_HUB}");
+            (StatusCode::NOT_FOUND, Json(json!({ "error": message })))
         }
         _ => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3098,14 +3158,22 @@ pub async fn begin_invitation(
             .unwrap_or(300)
             .min(twr_core::devices::PAIRING_SECONDS);
     let gateway_id = std::fs::read_to_string(dir.join("gateway-id")).unwrap_or_default();
-    match pair_json(code, expires_at, scopes, gateway_id.trim(), pinned) {
-        Ok(line) => Ok(line),
-        Err(error) => {
-            let _ = owner.call("device.pair_cancel", json!({"code":code})).await;
-            Err(error)
-        }
+    // A hub older than 12-symbol codes makes 10-symbol ones, which nothing of this twr takes.
+    let line = match twr_core::phone_pairing::normalize_code(code) {
+        Some(_) => pair_json(code, expires_at, scopes, gateway_id.trim(), pinned),
+        None => Err(anyhow::anyhow!(OLDER_HUB)),
+    };
+    if line.is_err() {
+        let _ = owner.call("device.pair_cancel", json!({"code":code})).await;
     }
+    line
 }
+
+/// What the gateway, `twr phone` and the TUI say when the hub that runs is from a twr older
+/// than 12-symbol pairing codes and `device.pair_proof`.
+pub const OLDER_HUB: &str = "the twr hub that runs is from an older twr, which can't pair \
+                             phones with this one: restart it (`twr hub stop`, then run twr \
+                             again)";
 /// [`begin_invitation`], printed: as its JSON line with `json`, else as lines.
 async fn announce_pairing(
     owner: &mut twr_core::client::Client,

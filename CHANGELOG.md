@@ -6,7 +6,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 Pair a phone with a hub on any computer, a server over SSH included, with no certificate or domain: `twr phone` shows a QR code, and the phone pins the hub's own key.
 
-Upgrading: a gateway started without `--tls-cert` no longer refuses to start; it serves its own key and listens on all addresses (`0.0.0.0:47321` and `[::]:47321`). Pairing codes have 12 characters, so a code from an older gateway doesn't pair with a new one (codes last five minutes anyway). Gateways with a certificate keep `/health` protocol 1, so released desktop apps keep working with them; pairing by key needs this release's apps.
+Upgrading: a gateway started without `--tls-cert` no longer refuses to start; it serves its own key and listens on all addresses (`0.0.0.0:47321` and `[::]:47321`). Pairing codes have 12 characters, so a code from an older gateway doesn't pair with a new one (codes last five minutes anyway). A desktop app older than this release can't pair phones through a hub installed with this release's command line, whose codes have 12 characters: update both. A hub still running from an older twr makes 10-character codes and can't prove typed codes; `twr phone`, the TUI's `/phone` and the gateway say so, and to restart it (`twr hub stop`, then run twr again). Gateways with a certificate keep `/health` protocol 1, so released desktop apps keep working with them; pairing by key needs this release's apps.
 
 ### Added
 
