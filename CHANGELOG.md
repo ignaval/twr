@@ -4,6 +4,10 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ## [Unreleased]
 
+### Added
+
+- A working cursor in the desktop and phone apps' conversation, the TUI's: a `_` that breathes up to a block and back where the orchestrator's, or the open thread's, next text will appear, at the end of a reply streaming in or under the last message. It shows from the moment you send, before the turn starts or the first text arrives, and goes when the turn ends or the thread waits on you; only while the conversation is at its bottom, and without moving it. Reduced motion and `[tui] animate = false` keep it still ([desktop.md](docs/desktop.md#workflows-and-cli-coverage)).
+
 ## [0.6.0] - 2026-11-22
 
 Simpler desktop and phone apps: Settings in tabs, forms that pick from lists, fewer pages for the same thing and one menu per conversation. twr's own neural voices read aloud on your machine (Kokoro, Supertonic 3 and Piper), with a voice for each language picked in the apps, and whisper's `small` models make dictation more accurate. The model and effort change from the message box, the orchestrator's in place; the orchestrator can search the web, run with full access and change twr's configuration when you ask; the apps show usage limits; and a single review pass (`--once`) runs one round. Also many fixes to drafts and attached files in the apps.

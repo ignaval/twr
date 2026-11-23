@@ -2958,3 +2958,170 @@ describe("messages put back in the box stay messages", () => {
     expect(sentMessages()).toEqual(["/usage\n\n!ls"]);
   });
 });
+
+describe("the working cursor in the conversation", () => {
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+  let subscription = "";
+  let answerSay: ((value: Json) => void) | undefined;
+  const start = async (options: HostOptions = {}) => {
+    vi.resetModules();
+    subscription = "";
+    answerSay = undefined;
+    mounted = await mount({
+      ...options,
+      rpc: (method, params) => {
+        if (method === "desktop.subscribe") subscription = params.subscription;
+        if (method === "thread.transcript")
+          return Promise.resolve({
+            events: [
+              {
+                id: "orch:1",
+                thread: "orch",
+                seq: 10,
+                turn: 1,
+                ts: "2026-11-23T12:00:00Z",
+                kind: "turn.started",
+                data: { from: "user", prompt: "Earlier" },
+              },
+              {
+                id: "orch:1:end",
+                thread: "orch",
+                seq: 11,
+                turn: 1,
+                ts: "2026-11-23T12:00:01Z",
+                kind: "turn.ended",
+                data: { result: "ok" },
+              },
+            ],
+            turn: 1,
+            more: false,
+          });
+        if (method === "say")
+          return new Promise<Json>((resolve) => (answerSay = resolve));
+        return options.rpc?.(method, params);
+      },
+    });
+  };
+  const orchestrator = (status: string) =>
+    views.default.map((t) => (t.id === "orch" ? { ...t, status } : t));
+  const lineCursor = () => app().all(".working-line .working-cursor").length;
+  const emit = async (event: Partial<HubEvent>) => {
+    await app().act(async () => {
+      app().host.emit({
+        type: "thread",
+        subscription,
+        event: {
+          id: "orch:" + event.seq,
+          thread: "orch",
+          turn: 2,
+          ts: "2026-11-23T12:01:00Z",
+          data: {},
+          ...event,
+        },
+      } as DesktopEvent);
+    });
+    await app().wait(60);
+  };
+
+  it("shows from the send through the turn, and goes while the thread waits on you", async () => {
+    await start();
+    expect(lineCursor()).toBe(0);
+    await app().type("Build the thing");
+    await app().press("Enter");
+    // In flight: the hub hasn't answered yet.
+    expect(lineCursor()).toBe(1);
+    await app().act(async () => answerSay!({ action: "sent" }));
+    await app().settle();
+    // Sent, the turn not running yet: still there.
+    expect(lineCursor()).toBe(1);
+    await app().live("default", orchestrator("running"));
+    await emit({
+      seq: 20,
+      kind: "turn.started",
+      data: { from: "user", prompt: "Build the thing" },
+    });
+    expect(lineCursor()).toBe(1);
+    // A permission waits on you: no cursor, though the turn is open.
+    await app().live("default", orchestrator("waiting"));
+    expect(lineCursor()).toBe(0);
+    await app().live("default", orchestrator("running"));
+    expect(lineCursor()).toBe(1);
+    // A reply streams in: the cursor leaves its own line for the reply's end (the
+    // virtual rows, which this stand-in DOM never lays out: working.test.ts covers it).
+    await emit({
+      seq: 21,
+      kind: "agent.text",
+      data: { text: "On it", delta: true },
+    });
+    expect(lineCursor()).toBe(0);
+    await emit({
+      seq: 22,
+      kind: "agent.text",
+      data: { text: "On it", final: true },
+    });
+    // The reply is done, the thread still works (background tasks, a tool): its own line.
+    expect(lineCursor()).toBe(1);
+    await emit({ seq: 23, kind: "turn.ended", data: { result: "ok" } });
+    await app().live("default", orchestrator("idle"));
+    expect(lineCursor()).toBe(0);
+  });
+
+  it("stops being awaited when the turn ends before the status ever showed it running", async () => {
+    await start();
+    await app().type("Quick one");
+    await app().press("Enter");
+    await app().act(async () => answerSay!({ action: "sent" }));
+    await app().settle();
+    expect(lineCursor()).toBe(1);
+    await emit({ seq: 30, kind: "turn.ended", data: { result: "ok" } });
+    expect(lineCursor()).toBe(0);
+  });
+
+  it("only shows while the conversation is scrolled to its bottom", async () => {
+    await start();
+    await app().live("default", orchestrator("running"));
+    expect(lineCursor()).toBe(1);
+    const scroller = app().find(".conversation-scroll");
+    Object.assign(scroller, {
+      scrollHeight: 3000,
+      clientHeight: 500,
+      scrollTop: 200,
+    });
+    await app().act(async () => {
+      scroller.dispatchEvent(new FakeEvent("scroll"));
+    });
+    await app().settle();
+    expect(lineCursor()).toBe(0);
+    Object.assign(scroller, { scrollTop: 2500 });
+    await app().act(async () => {
+      scroller.dispatchEvent(new FakeEvent("scroll"));
+    });
+    await app().settle();
+    expect(lineCursor()).toBe(1);
+  });
+
+  it("keeps still with [tui] animate = false, and moves again once it is set back", async () => {
+    let animate = false;
+    await start({
+      rpc: (method) =>
+        method === "config.show"
+          ? Promise.resolve({ preferences: { "tui.animate": animate } })
+          : undefined,
+    });
+    await app().live("default", orchestrator("running"));
+    expect(lineCursor()).toBe(1);
+    const still = () =>
+      app().find(".conversation-scroll").hasAttribute("data-still");
+    expect(still()).toBe(true);
+    // The orchestrator sets it at once: the conversation says so, the file says to what.
+    animate = true;
+    await emit({
+      seq: 40,
+      kind: "config.changed",
+      data: { key: "tui.animate", value: true, before: false },
+    });
+    expect(still()).toBe(false);
+  });
+});

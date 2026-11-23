@@ -123,6 +123,17 @@ earliest boundary, the shortcut says **No earlier messages from you** and does n
 It stays focusable while loading and at that boundary so changing its target does not
 discard keyboard focus. Scrolling and background loads never transfer focus.
 
+While the orchestrator, or the thread whose conversation you have open, works, the
+conversation shows the TUI's working cursor ([What is working](tui.md#what-is-working)): a
+`_` in the accent color that breathes up to a block and back, at the end of a reply that
+is streaming in, or under the last message (beside **Show full message** while a long reply
+is collapsed). It appears as you send, before the hub has started the turn or the first
+text arrives, stays while the turn or its background tasks run, and goes when the turn ends
+or the thread waits on you for a permission or an answer. It shows only while the
+conversation is at its bottom and takes no room, so it never moves what you read. It is
+never copied with the text or read out. With reduced motion, or `[tui] animate = false`
+([configuration](configuration.md)), it stays a still `_`.
+
 Recent history and live updates appear first. Older turns, including all their pages,
 load in the background when the predecessor is not yet known, skipping automatic turns.
 If an older page fails, recent history stays available and **Load earlier turn** retries
