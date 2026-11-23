@@ -701,6 +701,27 @@ mod socket_tests {
         assert_eq!(plain["protocol"], 1, "released desktop clients require 1");
         assert!(plain.get("pin").is_none());
     }
+    /// A running gateway's record names its listeners in `listens`, `listen` being the first
+    /// alone; a gateway before `listens` joined them all in `listen` with commas.
+    #[test]
+    fn the_record_names_every_listener() {
+        let both: Vec<SocketAddr> = vec![
+            "0.0.0.0:47321".parse().unwrap(),
+            "[::]:47321".parse().unwrap(),
+        ];
+        let record = remote::gateway_lifecycle::Info {
+            listens: both.iter().map(ToString::to_string).collect(),
+            ..remote::gateway_lifecycle::Info::new("g".into(), both[0].to_string(), None, None)
+                .unwrap()
+        };
+        let record = serde_json::to_value(&record).unwrap();
+        assert_eq!(record["listen"], "0.0.0.0:47321");
+        assert_eq!(record["listens"], json!(["0.0.0.0:47321", "[::]:47321"]));
+        assert_eq!(listeners_of(&record), both);
+        let older = json!({"listen": "0.0.0.0:47321,[::]:47321"});
+        assert_eq!(listeners_of(&older), both);
+        assert!(listeners_of(&json!({})).is_empty());
+    }
     /// `--pair --json` in pinned mode: today's fields, the version 2 invitation and its link;
     /// in certificate mode today's fields alone.
     #[test]
@@ -2654,11 +2675,7 @@ pub async fn run(args: Args, programs: Programs) -> Result<()> {
         .iter()
         .map(std::net::TcpListener::local_addr)
         .collect::<std::io::Result<_>>()?;
-    let listen = bound
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
+    let listens: Vec<String> = bound.iter().map(ToString::to_string).collect();
     let (cert_path, key_path) = match (&identity, &args.tls_cert, &args.tls_key) {
         (Some(_), _, _) => (
             Some(mobile_dir.join(identity::CERT_FILE)),
@@ -2666,12 +2683,15 @@ pub async fn run(args: Args, programs: Programs) -> Result<()> {
         ),
         (None, cert, key) => (cert.clone(), key.clone()),
     };
+    // `listen` is the first address alone, as older readers of the record parse it; `listens`
+    // has them all.
     let mut info = remote::gateway_lifecycle::Info::new(
         push.gateway_id.clone(),
-        listen.clone(),
+        listens.first().cloned().unwrap_or_default(),
         cert_path.as_deref(),
         key_path.as_deref(),
     )?;
+    info.listens = listens.clone();
     info.mode = mode.name().into();
     info.pin = identity.as_ref().map(|i| i.pin.clone());
     let mut lifecycle = remote::gateway_lifecycle::Lifecycle::acquire(&mobile_dir, info)?;
@@ -2726,7 +2746,8 @@ pub async fn run(args: Args, programs: Programs) -> Result<()> {
     let connections = server.connections.clone();
     let app = router(server).into_make_service_with_connect_info::<SocketAddr>();
     crate::gateway_log!(
-        "twr mobile gateway listening on {listen} ({} mode)",
+        "twr mobile gateway listening on {} ({} mode)",
+        listens.join(", "),
         mode.name()
     );
     // Every listener serves, until one fails or the gateway is asked to stop.
@@ -2948,10 +2969,15 @@ pub struct PinnedInvitation {
     pub routes: Vec<twr_core::phone_pairing::Route>,
 }
 
-/// The listeners `listen` names (`Info::listen`: comma-separated).
-fn listeners_of(listen: &str) -> Vec<SocketAddr> {
-    listen
-        .split(',')
+/// The listeners a running gateway's record `info` names: its `listens`, or from a gateway
+/// before them, its `listen` (which joined them with commas).
+pub fn listeners_of(info: &Value) -> Vec<SocketAddr> {
+    let listens: Vec<&str> = match info["listens"].as_array() {
+        Some(listens) => listens.iter().filter_map(Value::as_str).collect(),
+        None => info["listen"].as_str().unwrap_or("").split(',').collect(),
+    };
+    listens
+        .iter()
         .filter_map(|l| l.trim().parse().ok())
         .collect()
 }
@@ -2968,7 +2994,7 @@ pub async fn running_pinned(dir: &Path) -> Result<Option<PinnedInvitation>> {
         info["pin"] == identity.pin.as_str(),
         "the running gateway serves another key than its directory holds: restart it"
     );
-    let listeners = listeners_of(info["listen"].as_str().unwrap_or(""));
+    let listeners = listeners_of(&info);
     Ok(Some(PinnedInvitation {
         pin: identity.pin,
         iroh: identity.iroh,
@@ -2985,7 +3011,7 @@ pub async fn gateway_info(dir: &Path) -> Result<Value> {
         return Ok(info);
     }
     let listeners = if running {
-        listeners_of(info["listen"].as_str().unwrap_or(""))
+        listeners_of(&info)
     } else {
         match settings::Settings::load(dir)? {
             Some(settings) if !settings.listen.is_empty() => settings.listen,
