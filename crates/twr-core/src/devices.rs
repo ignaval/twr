@@ -41,12 +41,43 @@ struct Database {
     #[serde(default)]
     pairing: Option<Pairing>,
 }
+/// The open invitation: its code only as a hash, and the code's `K_proof`
+/// ([`crate::phone_pairing::proof_key`]) for the typed-pairing proofs. Neither is ever logged:
+/// this type has no `Debug`.
 #[derive(Serialize, Deserialize)]
 struct Pairing {
     hash: String,
     expires: u64,
     attempts: u32,
     scopes: Vec<String>,
+    /// `K_proof`, hex. Absent in an invitation an older twr began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proof_key: Option<String>,
+}
+impl Pairing {
+    /// Whether the invitation still takes a code: not expired, attempts left.
+    fn open(&self) -> bool {
+        self.attempts < MAX_ATTEMPTS && now() < self.expires
+    }
+}
+/// How long an invitation lasts, in seconds.
+pub const PAIRING_SECONDS: u64 = 300;
+/// The wrong codes an invitation takes before it closes.
+const MAX_ATTEMPTS: u32 = 5;
+/// What became of an invitation ([`Auth::invitation`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvitationState {
+    /// It still takes its code.
+    Open,
+    /// Another invitation replaced it.
+    Replaced,
+    /// Used, cancelled, expired or out of attempts.
+    Gone,
+}
+/// The hash a code is kept as: of the normalized code, so that `abcd-efgh-jk23` is the code
+/// `ABCDEFGHJK23`; text that is no code is hashed as it is (and matches no invitation).
+fn code_hash(code: &str) -> String {
+    digest(&crate::phone_pairing::normalize_code(code).unwrap_or_else(|| code.to_owned()))
 }
 pub struct Auth {
     path: PathBuf,
@@ -75,8 +106,11 @@ impl Auth {
         file.lock()?;
         Ok(file)
     }
+    /// A new invitation for `scopes`, replacing any open one: its code (12 symbols,
+    /// [`crate::phone_pairing::new_code`]), which is kept only as a hash beside its `K_proof`.
+    /// Deriving `K_proof` takes Argon2id's time (64 MiB): call it off an async runtime's
+    /// threads.
     pub fn begin(&self, scopes: Vec<String>) -> Result<String> {
-        let _lock = self.lock()?;
         anyhow::ensure!(
             scopes
                 .iter()
@@ -88,22 +122,70 @@ impl Auth {
             !scopes.iter().any(|s| s == "admin") || scopes.iter().any(|s| s == "terminal"),
             "Admin access includes running commands; grant terminal access with it"
         );
-        let mut bytes = [0u8; 10];
-        SystemRandom::new().fill(&mut bytes).expect("OS entropy");
-        let alphabet = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-        let code: String = bytes
-            .into_iter()
-            .map(|b| alphabet[(b & 31) as usize] as char)
-            .collect();
+        // The slow part (Argon2id) before the lock.
+        let code = crate::phone_pairing::new_code();
+        let key = crate::phone_pairing::proof_key(&code)?;
+        let _lock = self.lock()?;
         let mut db = self.read()?;
         db.pairing = Some(Pairing {
             hash: digest(&code),
-            expires: now() + 300,
+            expires: now() + PAIRING_SECONDS,
             attempts: 0,
             scopes,
+            proof_key: Some(hex::encode(key)),
         });
         self.save(&db)?;
         Ok(code)
+    }
+    /// The pin proof ([`crate::phone_pairing::pin_proof`]) of the open invitation for `pin`
+    /// (raw), `nonce` and `gateway_id`; `None` when no invitation is open or it has no proof
+    /// key. Asking is no attempt at the code.
+    pub fn proof(
+        &self,
+        pin: &[u8; 32],
+        nonce: &[u8],
+        gateway_id: &str,
+    ) -> Result<Option<[u8; 32]>> {
+        let db = self.read()?;
+        let Some(pairing) = db.pairing.as_ref().filter(|p| p.open()) else {
+            return Ok(None);
+        };
+        let Some(key) = pairing.proof_key.as_deref() else {
+            return Ok(None);
+        };
+        let key: [u8; 32] = hex::decode(key)
+            .ok()
+            .and_then(|k| k.try_into().ok())
+            .context("Damaged pairing state")?;
+        crate::phone_pairing::pin_proof(&key, pin, nonce, gateway_id).map(Some)
+    }
+    /// What became of the invitation of `code`.
+    pub fn invitation(&self, code: &str) -> Result<InvitationState> {
+        let hash = code_hash(code);
+        Ok(match self.read()?.pairing {
+            Some(p) if p.hash == hash && p.open() => InvitationState::Open,
+            Some(p) if p.hash != hash => InvitationState::Replaced,
+            _ => InvitationState::Gone,
+        })
+    }
+    /// How many devices are paired, and whether an invitation is open.
+    pub fn summary(&self) -> Result<(usize, bool)> {
+        let db = self.read()?;
+        Ok((
+            db.devices.len(),
+            db.pairing.as_ref().is_some_and(Pairing::open),
+        ))
+    }
+    /// Revokes every device and closes the invitation (`twr phone rekey`); how many devices
+    /// were paired.
+    pub fn revoke_all(&self) -> Result<usize> {
+        let _lock = self.lock()?;
+        let mut db = self.read()?;
+        let count = db.devices.len();
+        db.devices.clear();
+        db.pairing = None;
+        self.save(&db)?;
+        Ok(count)
     }
     /// Cancel exactly this invitation; closing an old window cannot cancel a newer code.
     pub fn cancel_pairing(&self, code: &str) -> Result<bool> {
@@ -112,7 +194,7 @@ impl Auth {
         let cancelled = db
             .pairing
             .as_ref()
-            .is_some_and(|pairing| pairing.hash == digest(code));
+            .is_some_and(|pairing| pairing.hash == code_hash(code));
         if cancelled {
             db.pairing = None;
             self.save(&db)?;
@@ -152,16 +234,11 @@ impl Auth {
         let mut db = self.read()?;
         let valid = if let Some(p) = &mut db.pairing {
             p.attempts = p.attempts.saturating_add(1);
-            p.attempts <= 5
+            // Only a code as `phone_pairing::normalize_code` reads it: separators and case
+            // aside, 12 symbols of the alphabet.
+            p.attempts <= MAX_ATTEMPTS
                 && now() < p.expires
-                && matches(
-                    &p.hash,
-                    &if code.len() == 10 {
-                        code.to_ascii_uppercase()
-                    } else {
-                        code.to_owned()
-                    },
-                )
+                && crate::phone_pairing::normalize_code(code).is_some_and(|c| matches(&p.hash, &c))
         } else {
             false
         };
@@ -170,7 +247,7 @@ impl Auth {
             if db
                 .pairing
                 .as_ref()
-                .is_some_and(|p| p.attempts > 5 || now() >= p.expires)
+                .is_some_and(|p| p.attempts >= MAX_ATTEMPTS || now() >= p.expires)
             {
                 db.pairing = None;
             }
@@ -391,6 +468,7 @@ pub const METHOD_SCOPES: &[(&str, &[&str])] = &[
             "device.pair_begin",
             "device.pair_complete",
             "device.pair_cancel",
+            "device.pair_proof",
             "account.list",
             "account.status",
             "account.add",
@@ -487,6 +565,92 @@ mod tests {
         assert!(auth.cancel_pairing(&third).unwrap());
         assert!(!auth.cancel_pairing(&third).unwrap());
         assert!(auth.pair(&third, "reader").is_err());
+    }
+    /// Codes are 12 symbols, taken in any case and with separators; the invitation keeps its
+    /// `K_proof`, which gives proofs a phone checks, until the invitation closes, by pairing,
+    /// cancelling, expiring or running out of attempts. Asking for a proof is no attempt.
+    #[test]
+    fn invitations_keep_their_proof_key_until_they_close() {
+        use crate::phone_pairing::{display_code, pin_bytes, proof_key, verify_pin_proof};
+        let dir = tempfile::tempdir().unwrap();
+        let auth = Auth::open(dir.path()).unwrap();
+        let (pin, nonce) = (pin_bytes(b"spki"), [9u8; 32]);
+        assert!(
+            auth.proof(&pin, &nonce, "gw").unwrap().is_none(),
+            "no invitation"
+        );
+        let code = auth.begin(vec!["read".into()]).unwrap();
+        assert_eq!(code.len(), 12);
+        let stored = std::fs::read_to_string(dir.path().join("devices.json")).unwrap();
+        assert!(!stored.contains(&code), "the code is kept only as a hash");
+        let key = proof_key(&code).unwrap();
+        assert!(stored.contains(&hex::encode(key)));
+        for _ in 0..8 {
+            let proof = auth.proof(&pin, &nonce, "gw").unwrap().unwrap();
+            assert!(verify_pin_proof(&key, &pin, &nonce, "gw", &proof));
+        }
+        assert!(
+            auth.proof(&pin, &[1u8; 16], "gw").is_err(),
+            "a nonce is 32 bytes"
+        );
+        assert_eq!(auth.invitation(&code).unwrap(), InvitationState::Open);
+        assert_eq!(auth.summary().unwrap(), (0, true));
+        // Four wrong codes and the right one, displayed and in lower case.
+        for _ in 0..4 {
+            assert!(auth.pair("ABCDEFGHJK23", "phone").is_err());
+        }
+        let typed = display_code(&code).to_ascii_lowercase();
+        let (device, _) = auth.pair(&typed, "phone").unwrap();
+        assert_eq!(device.scopes, ["read"]);
+        assert!(auth.proof(&pin, &nonce, "gw").unwrap().is_none());
+        assert_eq!(auth.invitation(&code).unwrap(), InvitationState::Gone);
+        assert_eq!(auth.summary().unwrap(), (1, false));
+        let stored = std::fs::read_to_string(dir.path().join("devices.json")).unwrap();
+        assert!(
+            !stored.contains(&hex::encode(key)),
+            "removed with the pairing"
+        );
+        // Five wrong codes close an invitation, and its proofs with it.
+        let code = auth.begin(vec!["read".into()]).unwrap();
+        for _ in 0..5 {
+            assert!(auth.pair("ABCD-EFGH-JK23", "phone").is_err());
+        }
+        assert!(auth.proof(&pin, &nonce, "gw").unwrap().is_none());
+        assert!(auth.pair(&code, "phone").is_err());
+        // Cancelling takes the displayed code too; a newer invitation replaces an older one.
+        let first = auth.begin(vec!["read".into()]).unwrap();
+        let second = auth.begin(vec!["read".into()]).unwrap();
+        assert_eq!(auth.invitation(&first).unwrap(), InvitationState::Replaced);
+        assert!(auth.cancel_pairing(&display_code(&second)).unwrap());
+        assert!(auth.proof(&pin, &nonce, "gw").unwrap().is_none());
+        assert_eq!(auth.invitation(&second).unwrap(), InvitationState::Gone);
+        // Expired.
+        let code = auth.begin(vec!["read".into()]).unwrap();
+        let path = dir.path().join("devices.json");
+        let mut db: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        db["pairing"]["expires"] = serde_json::json!(now() - 1);
+        std::fs::write(&path, db.to_string()).unwrap();
+        assert!(auth.proof(&pin, &nonce, "gw").unwrap().is_none());
+        assert_eq!(auth.invitation(&code).unwrap(), InvitationState::Gone);
+        assert!(auth.pair(&code, "phone").is_err());
+        assert_eq!(auth.revoke_all().unwrap(), 1);
+        assert_eq!(auth.summary().unwrap(), (0, false));
+    }
+    /// An invitation an older twr began, without a proof key, still pairs; it gives no proof.
+    #[test]
+    fn an_invitation_without_a_proof_key_gives_no_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = Auth::open(dir.path()).unwrap();
+        let code = "ABCDEFGHJK23";
+        let db = serde_json::json!({"devices": [], "pairing": {
+            "hash": digest(code), "expires": now() + 60, "attempts": 0, "scopes": ["read"]}});
+        let path = dir.path().join("devices.json");
+        std::fs::write(&path, db.to_string()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let pin = crate::phone_pairing::pin_bytes(b"spki");
+        assert!(auth.proof(&pin, &[0u8; 32], "gw").unwrap().is_none());
+        assert!(auth.pair("abcd efgh jk23", "phone").is_ok());
     }
     #[test]
     fn admin_invitations_include_terminal_access() {

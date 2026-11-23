@@ -186,6 +186,10 @@ pub struct ViewState {
     pub runner: Option<RunnerPanel>,
     pub runner_session: Option<String>,
     pub runner_generation: u64,
+    /// `/phone`'s view ([`crate::phone`]): private, like the runner's.
+    pub phone: Option<crate::phone::PhonePanel>,
+    /// Which `/phone` run the view shows: a result of an older one is dropped.
+    pub phone_generation: u64,
     /// The selected card: a worker thread, [`HUB_THREAD`] for the hub's card, or the current
     /// orchestrator while its attention banner shows (in the stack view's main conversation
     /// only); `None` (as at start, or after Esc) selects nothing. Always something the current
@@ -1273,6 +1277,14 @@ pub enum Action {
     CancelRunner {
         session: Option<String>,
     },
+    /// Run `twr phone --json` for this access level (`/phone`); its results come back as
+    /// `phone.local`, with the generation.
+    Phone {
+        generation: u64,
+        level: String,
+    },
+    /// Stop the `twr phone` that runs, which cancels its invitation (Esc in `/phone`).
+    CancelPhone,
     /// A fresh orchestrator session, without a handoff (`/clear`).
     ResetOrchestrator,
     /// Read the orchestrator's access level, or set it (`orchestrator.access`, `/access`, the
@@ -4010,6 +4022,16 @@ impl AppState {
     /// listing the items it names, and `y` purges exactly those, by id.
     pub fn apply_result(&mut self, method: &'static str, result: &Value) {
         match method {
+            "phone.local" => {
+                let current = result["generation"].as_u64() == Some(self.view.phone_generation);
+                if let (true, Some(panel)) = (current, self.view.phone.as_ref()) {
+                    let (next, status) = crate::phone::apply(panel, result);
+                    self.view.phone = next;
+                    if let Some(status) = status {
+                        self.view.status = Some(status);
+                    }
+                }
+            }
             "runner.local" => {
                 if self.view.runner.is_some() {
                     self.view.runner_session = result["session"].as_str().map(String::from);
@@ -5466,6 +5488,54 @@ impl AppState {
     /// Runs a slash command typed on the input line (see [`crate::slash`]). Returns the
     /// actions to run now (a confirmation or a status line otherwise) and whether the line is
     /// done with (cleared).
+    /// `/phone` with access `level`: the view waits for the invitation `twr phone` opens.
+    fn start_phone(&mut self, level: String) -> Vec<Action> {
+        self.view.phone_generation += 1;
+        self.view.phone = Some(crate::phone::PhonePanel::Preparing(level.clone()));
+        vec![Action::Phone {
+            generation: self.view.phone_generation,
+            level,
+        }]
+    }
+
+    /// A key in `/phone`'s view, which takes every key: the choice, then Esc cancels the
+    /// invitation and `c` copies its link; a note closes on any key.
+    fn phone_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        use crate::phone::PhonePanel;
+        let levels = twr_core::slash::PHONE_LEVELS;
+        match self.view.phone.clone() {
+            Some(PhonePanel::Choose(i)) => match key.code {
+                KeyCode::Up => self.view.phone = Some(PhonePanel::Choose(i.saturating_sub(1))),
+                KeyCode::Down => {
+                    self.view.phone = Some(PhonePanel::Choose((i + 1).min(levels.len() - 1)))
+                }
+                KeyCode::Enter => return self.start_phone(levels[i].to_string()),
+                KeyCode::Char(c @ '1'..='4') => {
+                    return self.start_phone(levels[c as usize - '1' as usize].to_string())
+                }
+                KeyCode::Esc => self.view.phone = None,
+                _ => {}
+            },
+            Some(PhonePanel::Preparing(_) | PhonePanel::Showing { .. })
+                if key.code == KeyCode::Esc =>
+            {
+                self.view.phone = None;
+                self.view.phone_generation += 1;
+                return vec![Action::CancelPhone];
+            }
+            Some(PhonePanel::Showing { line, .. }) if key.code == KeyCode::Char('c') => {
+                if let Some(link) = line["link"].as_str() {
+                    return vec![Action::Copy {
+                        text: link.to_string(),
+                    }];
+                }
+            }
+            Some(PhonePanel::Note(_)) => self.view.phone = None,
+            _ => {}
+        }
+        Vec::new()
+    }
+
     fn run_slash(&mut self, line: &str) -> (Vec<Action>, bool) {
         let cmd = match slash::parse(line) {
             Ok(c) => c,
@@ -5709,6 +5779,16 @@ impl AppState {
                      {name}",
                     self.attach_via
                 ));
+            }
+            Slash::Phone { level } => {
+                return match level {
+                    Some(level) => (self.start_phone(level), true),
+                    None => {
+                        self.view.phone_generation += 1;
+                        self.view.phone = Some(crate::phone::PhonePanel::Choose(1));
+                        (Vec::new(), true)
+                    }
+                };
             }
             Slash::Runner => {
                 self.view.runner = Some(RunnerPanel("Preparing a pairing code…".into()));
@@ -6453,6 +6533,9 @@ impl AppState {
         }
         // The help is drawn over the trash: it takes the key first. Both scroll with the
         // arrows, PgUp/PgDn and Home/End; any other key closes them.
+        if self.view.phone.is_some() {
+            return self.phone_key(key);
+        }
         if self.view.runner.is_some() {
             if key.code == KeyCode::Esc {
                 self.view.runner = None;
@@ -15789,7 +15872,7 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(
             items,
-            ["/help", "/orch", "/trash", "/attach"],
+            ["/help", "/phone", "/orch", "/trash", "/attach"],
             "/orch: its alias has an h"
         );
         // Enter on a partial command without arguments completes and runs it.
@@ -30104,5 +30187,76 @@ pub(crate) mod tests {
                 assert!(said.contains(says), "{said}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod phone_tests {
+    use super::*;
+    use crate::phone::PhonePanel;
+    use serde_json::json;
+
+    fn key(st: &mut AppState, code: KeyCode) -> Vec<Action> {
+        st.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// `/phone` offers the access, runs `twr phone` for the one chosen, shows its invitation,
+    /// and closes once a phone pairs; Esc cancels it; results of an older run are dropped. The
+    /// code reaches neither the input nor the history.
+    #[test]
+    fn phone_view_runs_an_invitation_to_its_end() {
+        let mut st = AppState::new();
+        let (actions, _) = st.run_slash("/phone");
+        assert!(actions.is_empty());
+        assert_eq!(st.view.phone, Some(PhonePanel::Choose(1)));
+        assert!(key(&mut st, KeyCode::Down).is_empty());
+        let actions = key(&mut st, KeyCode::Enter);
+        let generation = st.view.phone_generation;
+        assert_eq!(
+            actions,
+            [Action::Phone {
+                generation,
+                level: "terminal".into()
+            }]
+        );
+        let line = json!({"code":"ABCDEFGHJK23","expires_at":1,"link":"twr://pair#x",
+            "invitation":{"routes":["tls:192.168.1.20:47321"]}});
+        st.apply_result(
+            "phone.local",
+            &json!({"generation": generation - 1, "line": line}),
+        );
+        assert!(
+            matches!(st.view.phone, Some(PhonePanel::Preparing(_))),
+            "stale"
+        );
+        st.apply_result(
+            "phone.local",
+            &json!({"generation": generation, "line": line}),
+        );
+        assert!(
+            matches!(st.view.phone, Some(PhonePanel::Showing { ref level, .. }) if level == "terminal")
+        );
+        assert!(
+            key(&mut st, KeyCode::Char('x')).is_empty(),
+            "keys go to the view"
+        );
+        assert_eq!(
+            key(&mut st, KeyCode::Char('c')),
+            [Action::Copy {
+                text: "twr://pair#x".into()
+            }]
+        );
+        let paired = json!({"generation": generation, "outcome": {"paired": {"name": "Pixel"}}});
+        st.apply_result("phone.local", &paired);
+        assert_eq!(st.view.phone, None);
+        assert_eq!(st.view.status.as_deref(), Some("paired Pixel"));
+        // Straight to an access level; Esc cancels.
+        let (actions, _) = st.run_slash("/phone admin");
+        assert!(matches!(&actions[..], [Action::Phone { level, .. }] if level == "admin"));
+        assert_eq!(key(&mut st, KeyCode::Esc), [Action::CancelPhone]);
+        assert_eq!(st.view.phone, None);
+        assert!(!format!("{:?}", st.view).contains("ABCDEFGHJK23"));
+        let (actions, _) = st.run_slash("/phone root");
+        assert!(actions.is_empty() && st.view.phone.is_none());
     }
 }

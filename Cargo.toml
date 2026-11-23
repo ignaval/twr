@@ -19,6 +19,7 @@ twr-runner = { path = "crates/twr-runner" }
 twr-hub = { path = "crates/twr-hub" }
 twr-mcp = { path = "crates/twr-mcp" }
 twr-tui = { path = "crates/twr-tui" }
+twr-app = { path = "crates/twr-app" }
 twr-docs = { path = "crates/twr-docs" }
 twr-avspeech = { path = "crates/twr-avspeech" }
 twr-neural = { path = "crates/twr-neural" }
@@ -92,6 +93,13 @@ cpal = "0.18"
 # debugging session: CARGO_PROFILE_DEV_DEBUG=full cargo build.
 [profile.dev]
 debug = "line-tables-only"
+
+# Phone pairing's Argon2id (`twr_core::phone_pairing::proof_key`, 64 MiB, 3 passes) runs for
+# every invitation the hub begins, tests' included: unoptimized, it takes seconds.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
 
 # Release binaries (the GitHub release workflow builds these). `panic` stays `unwind`: tokio
 # turns a panicking task into a JoinError instead of taking the hub down.

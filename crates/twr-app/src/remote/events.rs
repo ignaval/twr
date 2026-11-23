@@ -97,7 +97,7 @@ impl Sender {
             .and_then(|v| v.as_u64());
         // Encode once, using the same 16 MiB limit as RPC replies. Message's
         // UTF-8 bytes clone by sharing storage, without cloning a JSON tree.
-        let message = crate::socket_message(&value);
+        let message = crate::gateway::socket_message(&value);
         let Message::Text(text) = &message else {
             unreachable!("socket_message always returns text")
         };
@@ -262,10 +262,10 @@ mod tests {
     async fn events_above_the_socket_limit_are_bounded_errors() {
         let sender = Sender::new();
         let mut receiver = sender.subscribe();
-        sender.send(json!("x".repeat(crate::MAX_SOCKET_REPLY + 1)));
+        sender.send(json!("x".repeat(crate::gateway::MAX_SOCKET_REPLY + 1)));
         let event = receiver.recv().await.unwrap().value();
         assert_eq!(event["type"], "error");
-        assert_eq!(event["error"], crate::OVERSIZED_REPLY_ERROR);
+        assert_eq!(event["error"], crate::gateway::OVERSIZED_REPLY_ERROR);
         assert!(sender.buffer.lock().unwrap().bytes < 1024);
     }
 
