@@ -520,19 +520,21 @@ export function mergeRoutes(
 
 /** Which routes to dial, in order: the remembered route for this network first (started
  * at once), then the other tls routes (started RACE_STAGGER later). Unknown route kinds
- * are skipped; on cellular, so are private LAN addresses. */
+ * are skipped; on cellular, so are private LAN addresses, unless they are all there is (a
+ * VPN over cellular reports as cellular and may reach them). */
 export function racePlan(
   routes: string[],
   remembered: string | undefined,
   network: NetworkType,
 ): { first?: string; rest: string[] } {
-  const dialable = [
+  const tls = [
     ...new Set(routes.map((r) => canonicalRoute(r)).filter(Boolean)),
-  ].filter(
-    (route) =>
-      route!.startsWith("tls:") &&
-      !(network === "cellular" && isPrivateRoute(route!)),
-  ) as string[];
+  ].filter((route) => route!.startsWith("tls:")) as string[];
+  const reachable =
+    network === "cellular"
+      ? tls.filter((route) => !isPrivateRoute(route))
+      : tls;
+  const dialable = reachable.length ? reachable : tls;
   const first =
     remembered && dialable.includes(canonicalRoute(remembered) || "")
       ? canonicalRoute(remembered)

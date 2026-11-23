@@ -164,7 +164,8 @@ public final class SavedRoutes {
     /**
      * The routes to race on {@code network} (docs/design/phone-pairing.md, Racing routes): the
      * remembered one first, then the remaining {@code tls} routes; on cellular, private LAN
-     * addresses are skipped.
+     * addresses are skipped, unless they are all there is: a VPN over cellular reports as
+     * cellular and may reach them.
      */
     public Plan plan(NetworkType network) {
         List<Route> dialable = new ArrayList<>();
@@ -174,6 +175,10 @@ public final class SavedRoutes {
             if (!route.dialable()) continue;
             if (network == NetworkType.CELLULAR && route.privateLan()) skipped.add(route);
             else dialable.add(route);
+        }
+        if (dialable.isEmpty()) {
+            dialable.addAll(skipped);
+            skipped.clear();
         }
         Route first = null;
         String remembered = last.get(network.lastKey());

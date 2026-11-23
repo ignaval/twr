@@ -490,6 +490,27 @@ describe("racing routes", () => {
       racePlan(routes, "tls:gone.example:1", "other").first,
     ).toBeUndefined();
   });
+  it("tries private addresses on cellular when they are all there is", () => {
+    // A VPN over cellular reports as cellular and may reach the LAN.
+    const lan = [
+      "tls:192.168.1.20:47321",
+      "tls:[fd00::7]:47321",
+      "tls:box.local:47321",
+      "relay:phase-2",
+    ];
+    expect(racePlan(lan, undefined, "cellular")).toEqual({
+      first: undefined,
+      rest: [
+        "tls:192.168.1.20:47321",
+        "tls:[fd00::7]:47321",
+        "tls:box.local:47321",
+      ],
+    });
+    expect(racePlan(lan, "tls:box.local:47321", "cellular")).toEqual({
+      first: "tls:box.local:47321",
+      rest: ["tls:192.168.1.20:47321", "tls:[fd00::7]:47321"],
+    });
+  });
   it("starts the remembered route at once and the others 250 ms later", async () => {
     vi.useFakeTimers();
     const started: [string, number][] = [];

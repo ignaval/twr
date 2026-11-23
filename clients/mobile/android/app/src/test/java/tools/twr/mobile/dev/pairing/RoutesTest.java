@@ -137,12 +137,30 @@ public class RoutesTest {
     @Test
     public void aRememberedLanRouteIsSkippedOnCellularToo() {
         SavedRoutes saved = new SavedRoutes();
-        saved.merge(Collections.singletonList("tls:192.168.1.20:47321"), 1000);
+        saved.merge(Arrays.asList("tls:192.168.1.20:47321", "tls:box.example.com:47321"), 1000);
         saved.restoreLast("cellular", "tls:192.168.1.20:47321");
         SavedRoutes.Plan cellular = saved.plan(NetworkType.CELLULAR);
-        assertTrue(cellular.empty());
+        assertNull(cellular.first);
+        assertEquals(Collections.singletonList(Route.parse("tls:box.example.com:47321")), cellular.rest);
         assertEquals(1, cellular.skipped.size());
         assertTrue(Failures.summary(Collections.emptyList(), cellular.skipped, "box").contains("cellular"));
+    }
+
+    @Test
+    public void onlyPrivateRoutesAreTriedOnCellularAnyway() {
+        // A VPN over cellular reports as cellular and may reach the LAN.
+        SavedRoutes saved = new SavedRoutes();
+        saved.merge(Arrays.asList("tls:192.168.1.20:47321", "tls:[fd00::7]:47321", "tls:box.local:47321", "relay:later"), 1000);
+        SavedRoutes.Plan fresh = saved.plan(NetworkType.CELLULAR);
+        assertNull(fresh.first);
+        assertEquals(3, fresh.rest.size());
+        assertTrue(fresh.skipped.isEmpty());
+
+        saved.restoreLast("cellular", "tls:[fd00::7]:47321");
+        SavedRoutes.Plan remembered = saved.plan(NetworkType.CELLULAR);
+        assertEquals(Route.parse("tls:[fd00::7]:47321"), remembered.first);
+        assertEquals(Arrays.asList(Route.parse("tls:192.168.1.20:47321"), Route.parse("tls:box.local:47321")), remembered.rest);
+        assertTrue(remembered.skipped.isEmpty());
     }
 
     @Test
