@@ -38,11 +38,11 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 # Let's Encrypt (tls-alpn-01) for the relay's own names; the same crate iroh-relay's server uses.
 tokio-rustls-acme = { version = "0.9.1", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
 # iroh's relay server for linked runners, at twr-link's iroh version (§10).
-iroh-relay = { version = "=1.4.1", default-features = false, features = ["server", "tls-ring"], optional = true }
-iroh-base = { version = "=1.4.1", default-features = false, optional = true }
+iroh-relay = { version = "=1.4.2", default-features = false, features = ["server", "tls-ring"], optional = true }
+iroh-base = { version = "=1.4.2", default-features = false, optional = true }
 async-trait = { version = "0.1", optional = true }
 # `twr relay probe`'s iroh check: the iroh relay client needs a resolver, unused for IP URLs.
-iroh-dns = { version = "=1.4.1", default-features = false, optional = true }
+iroh-dns = { version = "=1.4.2", default-features = false, optional = true }
 
 [features]
 default = []
