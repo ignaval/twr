@@ -1002,6 +1002,11 @@ async fn hub_client_reconnects_and_follows_its_phone_set() {
     let ((streams, _t), ()) = tokio::join!(hub_side, phone_side);
     let _keep = streams;
 
+    // A moved note through the client.
+    let (body, sig) =
+        client::sign_moved(&key, twr_relay::now_unix(), serde_json::json!(["x"])).unwrap();
+    hub.moved(body, sig).await.unwrap();
+
     // Emptying the set reaches the relay: the phone is refused.
     hub.set_phones(vec![]);
     let mut refused = false;

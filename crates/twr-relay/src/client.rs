@@ -513,8 +513,11 @@ pub struct HubStatus {
 pub struct HubClient {
     phones: watch::Sender<Vec<PhoneCred>>,
     status: watch::Receiver<HubStatus>,
+    moved: mpsc::Sender<MovedRequest>,
     cancel: CancellationToken,
 }
+
+type MovedRequest = (String, String, oneshot::Sender<Result<()>>);
 
 impl Drop for HubClient {
     fn drop(&mut self) {
@@ -548,12 +551,21 @@ impl HubClient {
         let (stream_tx, stream_rx) = mpsc::channel(16);
         let cancel = CancellationToken::new();
         let c = cancel.clone();
+        let (moved_tx, mut moved_rx) = mpsc::channel::<MovedRequest>(4);
         tokio::spawn(async move {
             let mut failures = 0u32;
             loop {
                 let started = std::time::Instant::now();
-                let result =
-                    Self::run_once(&cfg, &key, phones_rx.clone(), &status_tx, &stream_tx, &c).await;
+                let result = Self::run_once(
+                    &cfg,
+                    &key,
+                    phones_rx.clone(),
+                    &status_tx,
+                    &stream_tx,
+                    &mut moved_rx,
+                    &c,
+                )
+                .await;
                 // A session that held for a minute ends a run of failures; one that drops at
                 // once doesn't, so a relay that accepts and then drops isn't hammered.
                 if result.is_ok() && started.elapsed() >= Duration::from_secs(60) {
@@ -586,6 +598,7 @@ impl HubClient {
             Self {
                 phones: phones_tx,
                 status: status_rx,
+                moved: moved_tx,
                 cancel,
             },
             stream_rx,
@@ -598,6 +611,7 @@ impl HubClient {
         mut phones: watch::Receiver<Vec<PhoneCred>>,
         status: &watch::Sender<HubStatus>,
         streams: &mpsc::Sender<PhoneStream>,
+        moved: &mut mpsc::Receiver<MovedRequest>,
         cancel: &CancellationToken,
     ) -> Result<Closed> {
         let mut session = match HubSession::connect(cfg, key).await {
@@ -637,6 +651,9 @@ impl HubClient {
                     Some(s) => { let _ = streams.send(s).await; }
                     None => break wait_closed(closed.clone()).await,
                 },
+                m = moved.recv() => if let Some((body, sig, tx)) = m {
+                    let _ = tx.send(session.moved(body, sig).await);
+                },
             }
         };
         session.close();
@@ -647,6 +664,23 @@ impl HubClient {
             }
         });
         Ok(why)
+    }
+
+    /// Leaves a signed moved note (see [`sign_moved`]) at this relay, before the hub stops
+    /// using it (§5.7). Fails if the hub isn't connected to the relay right now.
+    pub async fn moved(&self, body: String, sig: String) -> Result<()> {
+        if !self.status.borrow().connected {
+            bail!("not connected to the relay");
+        }
+        let (tx, rx) = oneshot::channel();
+        self.moved
+            .send((body, sig, tx))
+            .await
+            .map_err(|_| anyhow!("the client has stopped"))?;
+        tokio::time::timeout(CONNECT_TIMEOUT * 2, rx)
+            .await
+            .context("the relay didn't answer")?
+            .map_err(|_| anyhow!("the relay session ended"))?
     }
 
     /// Replaces the phone set; the relay gets it at once if connected, or on reconnect.
