@@ -2617,6 +2617,107 @@ describe("Switch orchestrator's effort", () => {
   });
 });
 
+/* Choosing the first orchestrator (a new workspace's): the form starts from the configured
+ * one, its model and effort as well as its runtime, and once chosen it is final: the form
+ * does not offer to switch again. */
+describe("Choosing the first orchestrator", () => {
+  const used: Json[] = [];
+  const configured = {
+    runtime: "fake",
+    model: "m2",
+    effort: "high",
+    explicit: true,
+  };
+  beforeEach(async () => {
+    vi.resetModules();
+    used.length = 0;
+    const info = {
+      thread: null,
+      runtime: "fake",
+      model: "m2",
+      effort: "high",
+      runtimes: ["fake"],
+      configured,
+      models: {
+        fake: {
+          models: [{ id: "m1" }, { id: "m2" }],
+          efforts: ["low", "high"],
+        },
+      },
+    };
+    mounted = await mount({
+      rpc: (method, params) => {
+        if (method === "hub.info")
+          return Promise.resolve({ workspace: "default", orchestrator: info });
+        if (method === "orchestrator.show") return Promise.resolve(info);
+        if (method === "orchestrator.use") {
+          used.push(params);
+          return Promise.resolve({
+            thread: "orch",
+            runtime: params.runtime,
+            model: params.model ?? null,
+            effort: params.effort ?? null,
+          });
+        }
+        if (method === "desktop.parse_slash" && params.line.trim() === "/orch")
+          return Promise.resolve({ kind: "OrchPick" });
+        return undefined;
+      },
+    });
+    await app().wait(50);
+  });
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+  const form = () => app().find("[role=dialog]", "Switch orchestrator");
+  const submit = async () => {
+    await app().act(async () => {
+      app()
+        .find("[role=dialog] form", "Switch orchestrator")
+        .dispatchEvent(
+          new FakeEvent("submit", { bubbles: true, cancelable: true }),
+        );
+    });
+    await app().settle();
+  };
+
+  it("starts from the configured runtime, model and effort", async () => {
+    await app().type("/orch");
+    await app().press("Enter");
+    /** What a field holds: a select's chosen option, else its value. */
+    const shown = (id: string) => {
+      const field = form().querySelector(`#field-${id}`) as any;
+      const picked = field
+        ?.querySelectorAll?.("option")
+        .find((o: any) => o.selected) as any;
+      return picked?.value ?? field?.value;
+    };
+    expect(shown("runtime")).toBe("fake");
+    expect(shown("model")).toBe("m2");
+    expect(shown("effort")).toBe("high");
+    await submit();
+    expect(used).toHaveLength(1);
+    expect(used[0]).toMatchObject({
+      runtime: "fake",
+      model: "m2",
+      effort: "high",
+    });
+  });
+
+  it("does not offer to switch again once one is chosen", async () => {
+    await app().type("/orch");
+    await app().press("Enter");
+    const primary = () =>
+      form().querySelector("footer button.primary") as FakeElement | null;
+    expect(primary()?.textContent).toContain("Switch orchestrator");
+    await submit();
+    expect(used).toHaveLength(1);
+    expect(primary()).toBeNull();
+    expect(form().textContent).not.toContain("Switch orchestrator again");
+    expect(form().querySelector("footer button")?.textContent).toBe("Close");
+  });
+});
+
 /* `/access [limited|full]` (docs/orchestrator.md › Full access): the shared slash table's
  * command opens the palette's Orchestrator access form on the level named, and Full still
  * asks before anything reaches the hub. */
