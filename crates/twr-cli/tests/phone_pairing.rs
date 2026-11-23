@@ -289,7 +289,7 @@ fn a_phone_pairs_by_typed_code_with_a_pinned_gateway() {
         line["invitation"]
     );
     assert_eq!(invitation.pin, info["pin"].as_str().unwrap());
-    assert_eq!(invitation.routes, [route.clone()]);
+    assert_eq!(invitation.routes, std::slice::from_ref(&route));
     assert_eq!(invitation.id, info["gateway_id"].as_str().unwrap());
     assert_eq!(
         invitation.expires_at,
@@ -385,4 +385,35 @@ fn a_phone_pairs_by_typed_code_with_a_pinned_gateway() {
         gateway.0.try_wait().ok().flatten().map(|_| ())
     });
     let _ = twr(home, &["hub", "stop"]);
+}
+
+/// Asking about the gateway, as the desktop app does with no certificate named, writes no
+/// settings: only `twr phone` or a pinned gateway that serves turns autostart on. `twr phone
+/// off` keeps it off. Neither needs a hub.
+#[test]
+fn administration_alone_never_turns_autostart_on() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let out = twr(home, &["gateway", "--gateway-info"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let info: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(info["running"], false);
+    assert!(info.get("pin").is_none(), "no identity yet");
+    let settings = home.join("mobile").join("gateway-settings.json");
+    assert!(!settings.exists());
+    let out = twr(home, &["phone", "off"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let saved: Value = serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(saved["autostart"], false);
+    let out = twr(home, &["phone"]);
+    assert!(!out.status.success(), "no terminal and no --json");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("terminal"));
 }

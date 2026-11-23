@@ -2522,9 +2522,20 @@ pub async fn run(args: Args, programs: Programs) -> Result<()> {
     let (binary, companion) = programs.resolve(args.binary_dir.as_deref())?;
     let paths = twr_core::paths::Paths::from_env_in(Some("default"))?;
     let mobile_dir = paths.config_file.with_file_name("mobile");
-    // Pinned mode keeps its settings: `--address` is saved for later runs.
+    // A pinned gateway that serves keeps its settings, and `--address` is saved for later runs.
+    // Administration alone (the desktop app's `--gateway-info`, `--pair-only`, …, which name no
+    // certificate) writes none: settings turn autostart on.
+    let administration = args.pair_only
+        || args.list_devices
+        || args.gateway_info
+        || args.stop_gateway
+        || args.cancel_invitation
+        || args.revoke.is_some();
     let settings = match mode {
-        Mode::Pinned => Some(settings_with(&mobile_dir, args.address.as_deref())?),
+        Mode::Pinned if !administration || args.address.is_some() => {
+            Some(settings_with(&mobile_dir, args.address.as_deref())?)
+        }
+        Mode::Pinned => Some(settings::Settings::load(&mobile_dir)?.unwrap_or_default()),
         _ => None,
     };
     if args.gateway_info {
