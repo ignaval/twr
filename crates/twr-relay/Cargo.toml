@@ -69,3 +69,7 @@ required-features = ["server"]
 [[test]]
 name = "parse_fuzz"
 required-features = ["server"]
+
+[[test]]
+name = "acme"
+required-features = ["server"]
