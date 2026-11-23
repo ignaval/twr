@@ -154,14 +154,20 @@ impl Route {
             return Ok(Route::Other(text.to_owned()));
         }
         let (host, port) = rest.rsplit_once(':').context("tls route needs a port")?;
+        // ASCII digits only: `u16::from_str` would also take a leading `+`.
+        ensure!(
+            (1..=5).contains(&port.len()) && port.bytes().all(|b| b.is_ascii_digit()),
+            "bad port"
+        );
         let port: u16 = port.parse().context("bad port")?;
         ensure!(port != 0, "bad port");
         let host = if let Some(inner) = host.strip_prefix('[') {
             let inner = inner.strip_suffix(']').context("bad IPv6 literal")?;
+            // RFC 5952 text (lowercase, compressed): one address, one spelling.
             inner
                 .parse::<std::net::Ipv6Addr>()
-                .context("bad IPv6 literal")?;
-            inner.to_owned()
+                .context("bad IPv6 literal")?
+                .to_string()
         } else if host.parse::<std::net::Ipv4Addr>().is_ok() {
             host.to_owned()
         } else {
@@ -412,6 +418,7 @@ mod tests {
             "tls:12345:1",
             ":x",
             "TLS:1.2.3.4:1",
+            "tls:1.2.3.4:+80",
         ] {
             assert!(Route::parse(bad).is_err(), "{bad}");
         }
@@ -521,7 +528,7 @@ mod tests {
                     ["tls:Box.Tail1234.ts.net:443", {"kind": "tls", "host": "box.tail1234.ts.net", "port": 443}],
                     ["relay:anything", {"kind": "other"}]
                 ],
-                "invalid": ["tls:1.2.3.4", "tls:1.2.3.4:0", "tls:[::1:47321", "tls:-bad-.example:1", "tls:12345:1", ":x", "TLS:1.2.3.4:1"]
+                "invalid": ["tls:1.2.3.4", "tls:1.2.3.4:0", "tls:[::1:47321", "tls:-bad-.example:1", "tls:12345:1", ":x", "TLS:1.2.3.4:1", "tls:1.2.3.4:+80"]
             }
         })
     }
