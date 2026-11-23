@@ -25,6 +25,16 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
+            <!-- A tapped pairing invitation, twr://pair#<base64url JSON> (docs/design/phone-pairing.md).
+                 Capacitor's App plugin hands the URL to the web layer (appUrlOpen, getLaunchUrl);
+                 it carries the code, never a credential, and pairing still checks the pin. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="twr" android:host="pair" />
+            </intent-filter>
+
         </activity>
 
         <activity android:name="com.journeyapps.barcodescanner.CaptureActivity"
@@ -44,6 +54,8 @@
     <!-- Permissions -->
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- The transport's network event: reconnect at once when the default network changes. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CAMERA" />
     <!-- Voice mode: the platform's recognizer hears the user (docs/mobile.md, Voice). -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
