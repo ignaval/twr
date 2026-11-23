@@ -216,6 +216,8 @@ pub struct Invitation {
 }
 
 impl Invitation {
+    /// Every field an invitation carries; the hub has each at hand when it opens one.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         gateway_id: &str,
         name: &str,
