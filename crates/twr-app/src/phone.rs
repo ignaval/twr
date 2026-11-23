@@ -282,7 +282,11 @@ pub async fn wait(
             .find(|d| d["id"].as_str().is_some_and(|id| !known.contains(id)));
         return Ok(match paired {
             Some(device) => Outcome::Paired(device.clone()),
-            None => Outcome::Expired,
+            None => {
+                // Expired or used up: nothing of it (its proof key) stays behind.
+                auth.cancel_pairing(code)?;
+                Outcome::Expired
+            }
         });
     }
 }
@@ -381,5 +385,17 @@ mod tests {
         let outcome = wait(dir.path(), &code, &known, std::future::pending()).await;
         assert_eq!(outcome.unwrap(), Outcome::Expired);
         assert_eq!(Outcome::Expired.json(), json!({"expired": true}));
+        // Expired: the wait says so, and the invitation's proof key is gone from the store.
+        let code = auth.begin(vec!["read".into()]).unwrap();
+        let path = dir.path().join("devices.json");
+        let key = hex::encode(twr_core::phone_pairing::proof_key(&code).unwrap());
+        let mut db: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(db.to_string().contains(&key));
+        db["pairing"]["expires"] = json!(twr_core::devices::now() - 1);
+        std::fs::write(&path, db.to_string()).unwrap();
+        let outcome = wait(dir.path(), &code, &known, std::future::pending()).await;
+        assert_eq!(outcome.unwrap(), Outcome::Expired);
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert!(!stored.contains(&key) && !stored.contains("\"pairing\":{"));
     }
 }

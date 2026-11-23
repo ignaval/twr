@@ -79,6 +79,14 @@ pub enum InvitationState {
 fn code_hash(code: &str) -> String {
     digest(&crate::phone_pairing::normalize_code(code).unwrap_or_else(|| code.to_owned()))
 }
+/// Removes `db`'s invitation if it is closed (expired, or out of attempts); whether it did.
+fn close(db: &mut Database) -> bool {
+    let closed = db.pairing.as_ref().is_some_and(|p| !p.open());
+    if closed {
+        db.pairing = None;
+    }
+    closed
+}
 pub struct Auth {
     path: PathBuf,
 }
@@ -111,6 +119,8 @@ impl Auth {
     /// Deriving `K_proof` takes Argon2id's time (64 MiB): call it off an async runtime's
     /// threads.
     pub fn begin(&self, scopes: Vec<String>) -> Result<String> {
+        // An expired invitation's key goes now, whether or not the new one can be made.
+        self.read_open()?;
         anyhow::ensure!(
             scopes
                 .iter()
@@ -146,7 +156,7 @@ impl Auth {
         nonce: &[u8],
         gateway_id: &str,
     ) -> Result<Option<[u8; 32]>> {
-        let db = self.read()?;
+        let db = self.read_open()?;
         let Some(pairing) = db.pairing.as_ref().filter(|p| p.open()) else {
             return Ok(None);
         };
@@ -162,15 +172,19 @@ impl Auth {
     /// What became of the invitation of `code`.
     pub fn invitation(&self, code: &str) -> Result<InvitationState> {
         let hash = code_hash(code);
-        Ok(match self.read()?.pairing {
+        let state = match self.read()?.pairing {
             Some(p) if p.hash == hash && p.open() => InvitationState::Open,
             Some(p) if p.hash != hash => InvitationState::Replaced,
             _ => InvitationState::Gone,
-        })
+        };
+        if state != InvitationState::Open {
+            self.read_open()?;
+        }
+        Ok(state)
     }
     /// How many devices are paired, and whether an invitation is open.
     pub fn summary(&self) -> Result<(usize, bool)> {
-        let db = self.read()?;
+        let db = self.read_open()?;
         Ok((
             db.devices.len(),
             db.pairing.as_ref().is_some_and(Pairing::open),
@@ -197,9 +211,27 @@ impl Auth {
             .is_some_and(|pairing| pairing.hash == code_hash(code));
         if cancelled {
             db.pairing = None;
+        }
+        // Another, expired, invitation goes too.
+        let closed = close(&mut db);
+        if cancelled || closed {
             self.save(&db)?;
         }
         Ok(cancelled)
+    }
+    /// The store, with a closed invitation (expired, or out of attempts) removed first, and its
+    /// `K_proof` with it: a proof key never outlives its code in `devices.json`.
+    fn read_open(&self) -> Result<Database> {
+        let db = self.read()?;
+        if !db.pairing.as_ref().is_some_and(|p| !p.open()) {
+            return Ok(db);
+        }
+        let _lock = self.lock()?;
+        let mut db = self.read()?;
+        if close(&mut db) {
+            self.save(&db)?;
+        }
+        Ok(db)
     }
     fn read(&self) -> Result<Database> {
         use std::os::unix::fs::MetadataExt;
@@ -243,14 +275,9 @@ impl Auth {
             false
         };
         if !valid {
+            // Its attempt counted; closed (expired or out of attempts), it goes, key and all.
             let had_pairing = db.pairing.is_some();
-            if db
-                .pairing
-                .as_ref()
-                .is_some_and(|p| p.attempts >= MAX_ATTEMPTS || now() >= p.expires)
-            {
-                db.pairing = None;
-            }
+            close(&mut db);
             if had_pairing {
                 self.save(&db)?;
             }
@@ -636,6 +663,78 @@ mod tests {
         assert!(auth.pair(&code, "phone").is_err());
         assert_eq!(auth.revoke_all().unwrap(), 1);
         assert_eq!(auth.summary().unwrap(), (0, false));
+    }
+    /// An expired invitation leaves `devices.json`, its `K_proof` with it, as soon as the store
+    /// reads it: to begin another, prove, pair, ask about it, count or cancel.
+    #[test]
+    fn an_expired_invitation_takes_its_proof_key_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = Auth::open(dir.path()).unwrap();
+        let path = dir.path().join("devices.json");
+        let stored = || std::fs::read_to_string(&path).unwrap();
+        let expire = || {
+            let mut db: serde_json::Value = serde_json::from_str(&stored()).unwrap();
+            db["pairing"]["expires"] = serde_json::json!(now() - 1);
+            std::fs::write(&path, db.to_string()).unwrap();
+        };
+        let pin = crate::phone_pairing::pin_bytes(b"spki");
+        type Read = Box<dyn Fn(&Auth, &str)>;
+        let reads: [(&str, Read); 6] = [
+            (
+                "proof",
+                Box::new(move |a, _| assert!(a.proof(&pin, &[0u8; 32], "gw").unwrap().is_none())),
+            ),
+            (
+                "invitation",
+                Box::new(|a, c| assert_eq!(a.invitation(c).unwrap(), InvitationState::Gone)),
+            ),
+            (
+                "invitation of another code",
+                Box::new(|a, _| {
+                    assert_eq!(
+                        a.invitation("ABCDEFGHJK23").unwrap(),
+                        InvitationState::Replaced
+                    )
+                }),
+            ),
+            (
+                "summary",
+                Box::new(|a, _| assert_eq!(a.summary().unwrap(), (0, false))),
+            ),
+            (
+                "cancel of another code",
+                Box::new(|a, _| assert!(!a.cancel_pairing("ABCDEFGHJK23").unwrap())),
+            ),
+            (
+                "pair",
+                Box::new(|a, c| assert!(a.pair(c, "phone").is_err())),
+            ),
+        ];
+        for (what, read) in reads {
+            let code = auth.begin(vec!["read".into()]).unwrap();
+            let key = hex::encode(crate::phone_pairing::proof_key(&code).unwrap());
+            assert!(stored().contains(&key), "{what}");
+            expire();
+            read(&auth, &code);
+            assert!(!stored().contains(&key), "{what} left the key");
+            assert!(
+                !stored().contains("\"pairing\":{"),
+                "{what} left the pairing"
+            );
+        }
+        // Beginning another removes the expired one even when it then fails.
+        let code = auth.begin(vec!["read".into()]).unwrap();
+        let key = hex::encode(crate::phone_pairing::proof_key(&code).unwrap());
+        expire();
+        assert!(auth.begin(vec!["admin".into()]).is_err());
+        assert!(!stored().contains(&key));
+        let code = auth.begin(vec!["read".into()]).unwrap();
+        let key = hex::encode(crate::phone_pairing::proof_key(&code).unwrap());
+        expire();
+        auth.begin(vec!["read".into()]).unwrap();
+        assert!(!stored().contains(&key));
+        // An open one stays.
+        assert_eq!(auth.summary().unwrap(), (0, true));
     }
     /// An invitation an older twr began, without a proof key, still pairs; it gives no proof.
     #[test]

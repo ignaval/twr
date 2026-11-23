@@ -49,7 +49,7 @@ proof     = HMAC-SHA256(K_proof, "twr-mobile-pin-v2" || 0x00 || pin (32 raw byte
                                   || nonce (32 bytes) || gateway_id (UTF-8, as served by /health))
 ```
 
-- The hub derives `K_proof` once, when it creates the code (`device.pair_begin`), and keeps it with the pairing state, never the code itself. The state lives in `devices.json`, 0600, and is removed with the pairing.
+- The hub derives `K_proof` once, when it creates the code (`device.pair_begin`), and keeps it with the pairing state, never the code itself. The state lives in `devices.json`, 0600, and is removed with the pairing: when it is used, cancelled or replaced, and once it has expired or run out of attempts, the next time the store reads it (to begin, prove, pair, report or cancel an invitation). `twr phone` cancels an invitation it reports as expired.
 - The gateway asks the hub for proofs over the owner socket. Neither ever logs a code, `K_proof` or a proof.
 
 ## Gateway endpoints
