@@ -112,6 +112,31 @@ final class PairingLogicTests: XCTestCase {
         }
     }
 
+    /// What Rust's Ipv6Addr prints for each (checked with rustc); the TypeScript and Android
+    /// tests carry the same list.
+    func testIPv6HostsAreSpelledAsTheHubSpellsThem() {
+        let spellings = [
+            ("2001:DB8::5", "2001:db8::5"),
+            ("2001:0db8:0000:0000:0000:0000:0000:0005", "2001:db8::5"),
+            ("2001:db8:0:0:1:0:0:1", "2001:db8::1:0:0:1"),
+            ("2001:db8:0:1:1:1:1:1", "2001:db8:0:1:1:1:1:1"),
+            ("0:0:0:0:0:0:0:0", "::"),
+            ("0:0:0:0:0:0:0:1", "::1"),
+            ("::FFFF:192.168.1.20", "::ffff:192.168.1.20"),
+            ("::ffff:c0a8:114", "::ffff:192.168.1.20"),
+            ("::1.2.3.4", "::102:304"),
+            ("fe80:0:0:0:0:0:0:1", "fe80::1"),
+            ("1:0:0:2:0:0:0:3", "1:0:0:2::3"),
+            ("::ffff:0:0", "::ffff:0.0.0.0"),
+            ("0:0:0:0:ffff::", "::ffff:0:0:0"),
+        ]
+        for (input, expected) in spellings {
+            XCTAssertEqual(PairingRoute("tls:[\(input)]:1"), .tls(host: expected, port: 1), input)
+            XCTAssertEqual(PairingRoute("tls:[\(input)]:1")?.text, "tls:[\(expected)]:1", input)
+            XCTAssertEqual(Pairing.typedAddress(input), .tls(host: expected, port: 47321), input)
+        }
+    }
+
     func testTypedAddresses() {
         XCTAssertEqual(Pairing.typedAddress("box.example"), .tls(host: "box.example", port: 47321))
         XCTAssertEqual(Pairing.typedAddress(" 192.168.1.20:8443 "), .tls(host: "192.168.1.20", port: 8443))

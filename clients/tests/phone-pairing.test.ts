@@ -8,6 +8,7 @@ import {
   RouteError,
   base64UrlDecode,
   base64UrlEncode,
+  canonicalRoute,
   displayCode,
   displayPin,
   encodeInvitationJson,
@@ -66,6 +67,31 @@ describe("phone pairing vectors: routes", () => {
   it("refuses the invalid ones", () => {
     for (const input of vectors.routes.invalid)
       expect(() => parseRoute(input), input).toThrow();
+  });
+  // What Rust's Ipv6Addr prints for each (checked with rustc); Android's RoutesTest and
+  // iOS's PairingLogicTests carry the same list.
+  it.each([
+    ["2001:DB8::5", "2001:db8::5"],
+    ["2001:0db8:0000:0000:0000:0000:0000:0005", "2001:db8::5"],
+    ["2001:db8:0:0:1:0:0:1", "2001:db8::1:0:0:1"],
+    ["2001:db8:0:1:1:1:1:1", "2001:db8:0:1:1:1:1:1"],
+    ["0:0:0:0:0:0:0:0", "::"],
+    ["0:0:0:0:0:0:0:1", "::1"],
+    ["::FFFF:192.168.1.20", "::ffff:192.168.1.20"],
+    ["::ffff:c0a8:114", "::ffff:192.168.1.20"],
+    ["::1.2.3.4", "::102:304"],
+    ["fe80:0:0:0:0:0:0:1", "fe80::1"],
+    ["1:0:0:2:0:0:0:3", "1:0:0:2::3"],
+    ["::ffff:0:0", "::ffff:0.0.0.0"],
+    ["0:0:0:0:ffff::", "::ffff:0:0:0"],
+  ])("spells [%s] as the hub does, [%s]", (input, expected) => {
+    expect(parseRoute(`tls:[${input}]:1`)).toEqual({
+      kind: "tls",
+      host: expected,
+      port: 1,
+    });
+    expect(canonicalRoute(`tls:[${input}]:1`)).toBe(`tls:[${expected}]:1`);
+    expect(parseAddress(input)?.route).toBe(`tls:[${expected}]:47321`);
   });
   it("reads typed addresses with the default port, brackets and bare IPv6", () => {
     expect(parseAddress("192.168.1.20")).toMatchObject({

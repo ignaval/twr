@@ -106,6 +106,32 @@ public class RoutesTest {
         assertNull(saved.lastRoute());
     }
 
+    /** What Rust's Ipv6Addr prints for each (checked with rustc); the TypeScript and iOS tests carry the same list. */
+    private static final String[][] IPV6_SPELLINGS = {
+        {"2001:DB8::5", "2001:db8::5"},
+        {"2001:0db8:0000:0000:0000:0000:0000:0005", "2001:db8::5"},
+        {"2001:db8:0:0:1:0:0:1", "2001:db8::1:0:0:1"},
+        {"2001:db8:0:1:1:1:1:1", "2001:db8:0:1:1:1:1:1"},
+        {"0:0:0:0:0:0:0:0", "::"},
+        {"0:0:0:0:0:0:0:1", "::1"},
+        {"::FFFF:192.168.1.20", "::ffff:192.168.1.20"},
+        {"::ffff:c0a8:114", "::ffff:192.168.1.20"},
+        {"::1.2.3.4", "::102:304"},
+        {"fe80:0:0:0:0:0:0:1", "fe80::1"},
+        {"1:0:0:2:0:0:0:3", "1:0:0:2::3"},
+        {"::ffff:0:0", "::ffff:0.0.0.0"},
+        {"0:0:0:0:ffff::", "::ffff:0:0:0"},
+    };
+
+    @Test
+    public void ipv6HostsAreSpelledAsTheHubSpellsThem() {
+        for (String[] pair : IPV6_SPELLINGS) {
+            assertEquals(pair[0], "tls:[" + pair[1] + "]:1", Route.parse("tls:[" + pair[0] + "]:1").toString());
+            assertEquals(pair[0], pair[1], Route.parse("tls:[" + pair[0] + "]:1").host);
+            assertEquals(pair[0], "tls:[" + pair[1] + "]:47321", Route.fromAddress(pair[0]).toString());
+        }
+    }
+
     @Test
     public void aConnectionAfterAMonthAwayKeepsTheOtherRoutes() {
         SavedRoutes saved = new SavedRoutes();

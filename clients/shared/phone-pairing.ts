@@ -116,6 +116,17 @@ export function isIPv6(host: string) {
   }
 }
 
+/** An IPv6 literal in RFC 5952 form, as the hub's Rust `Ipv6Addr` prints it: lowercase,
+ * no leading zeros, the first longest run of zero groups as `::`, and an IPv4-mapped
+ * address as `::ffff:a.b.c.d` (where the URL parser prints hex). */
+export function canonicalIPv6(host: string): string {
+  const text = new URL(`http://[${host}]/`).hostname.slice(1, -1);
+  const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(text);
+  if (!mapped) return text;
+  const [high, low] = [parseInt(mapped[1], 16), parseInt(mapped[2], 16)];
+  return `::ffff:${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`;
+}
+
 function isDnsName(name: string) {
   return (
     name.length <= 253 &&
@@ -155,6 +166,8 @@ export function parseRoute(text: string): Route {
     if (!host.endsWith("]")) throw new Error("Bad IPv6 literal");
     host = host.slice(1, -1);
     if (!isIPv6(host)) throw new Error("Bad IPv6 literal");
+    // One address, one spelling: the hub's.
+    host = canonicalIPv6(host);
   } else if (!isIPv4(host)) {
     if (!isDnsName(host)) throw new Error("Bad host");
     host = host.toLowerCase();
