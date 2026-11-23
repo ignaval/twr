@@ -162,7 +162,7 @@ An IPv6 address counts as its /64.
 
 ## Monitoring
 
-- `twr relay probe <relay URL>` checks a relay end to end and exits 1 if anything fails. `--json` prints one object, `--connect <address>` checks one server before DNS points at it, and `--state <dir>` keeps the probe's keys between runs. Use `--state` for a probe every minute: the relay then sees one hub and one admitted pair rather than a new one each time, which its per-address limits would refuse. Also list the monitoring hosts in `limits.exempt_addresses`.
+- `twr relay probe <relay URL>` checks a relay end to end and exits 1 if anything fails. `--json` prints one object, `--connect <address>` checks one server before DNS points at it, and `--state <dir>` keeps the probe's keys between runs. Use `--state` for a probe every minute: the relay then sees one hub and one admitted pair rather than a new one each time, which its per-address limits would refuse. With `--state` the probe posts its admission again only when it has under a day left; the iroh check still uses it on every run, and posts it again if the relay has lost it. Also list the monitoring hosts in `limits.exempt_addresses`.
 - `curl -s 127.0.0.1:9469/metrics` gives the counters: `twr_relay_hubs_connected`, `twr_relay_phone_connections_active` and `_total`, `twr_relay_bytes_total{direction}`, `twr_relay_refusals_total{reason}`, `twr_relay_records_stored`, `twr_relay_iroh_admitted`, `twr_relay_iroh_denied_total`, `twr_relay_cert_expiry_seconds` (-1 before the first certificate), `twr_relay_up` and `twr_relay_build_info{version}`.
 
 ## What the relay keeps

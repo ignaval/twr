@@ -828,8 +828,11 @@ async fn slow_and_pending_connections() {
 
 #[tokio::test]
 async fn a_probe_every_minute_stays_within_the_limits() {
-    // Tight limits: one new hub name and one pair admission per address per hour.
-    let r = dnsless("[limits]\nnew_hubs_per_ip_per_hour = 1\npair_admissions_per_ip_per_hour = 3\npairing_admissions_per_ip_per_hour = 1\n").await;
+    // Tight limits: one new hub name and one admission of each kind per address per hour.
+    let r = dnsless(
+        "[limits]\nnew_hubs_per_ip_per_hour = 1\npair_admissions_per_ip_per_hour = 1\npairing_admissions_per_ip_per_hour = 1\n",
+    )
+    .await;
     let dir = tempfile::tempdir().unwrap();
     let opts = probe::ProbeOptions {
         target: r.t(),
@@ -837,25 +840,65 @@ async fn a_probe_every_minute_stays_within_the_limits() {
         timeout: Duration::from_secs(10),
         state: Some(dir.path().to_path_buf()),
     };
-    for _ in 0..3 {
+    // With kept keys, one hub and one pair admission serve every run.
+    for _ in 0..5 {
         let report = probe::probe(&opts).await;
         assert!(report.ok, "{report:#?}");
     }
-    // A fourth pair admission from this address is over the limit, unless exempt.
-    let report = probe::probe(&opts).await;
-    assert!(!report.ok);
+    // Without the kept admission, a second post is over this address's limit.
+    for f in std::fs::read_dir(dir.path()).unwrap() {
+        let f = f.unwrap().path();
+        if f.file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("probe-admitted-")
+        {
+            std::fs::remove_file(f).unwrap();
+        }
+    }
+    assert!(!probe::probe(&opts).await.ok);
     r.stop().await;
-    let r = dnsless(
-        "[limits]\npair_admissions_per_ip_per_hour = 1\nexempt_addresses = [\"127.0.0.0/8\"]\n",
-    )
-    .await;
+
+    // Exempt addresses skip the per-address limits.
+    let r = dnsless("[limits]\npair_admissions_per_ip_per_hour = 1\nnew_hubs_per_ip_per_hour = 1\nexempt_addresses = [\"127.0.0.0/8\"]\n").await;
+    for _ in 0..3 {
+        let fresh = probe::ProbeOptions {
+            target: r.t(),
+            state: None,
+            ..opts.clone()
+        };
+        assert!(probe::probe(&fresh).await.ok);
+    }
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn a_probe_recovers_from_a_relay_that_lost_its_admissions() {
+    let r = dnsless("").await;
+    let dir = tempfile::tempdir().unwrap();
     let opts = probe::ProbeOptions {
         target: r.t(),
-        ..opts
+        client: "t".into(),
+        timeout: Duration::from_secs(10),
+        state: Some(dir.path().to_path_buf()),
     };
-    for _ in 0..3 {
-        assert!(probe::probe(&opts).await.ok);
-    }
+    // A kept admission the relay never saw (its state was lost, say).
+    let id = names::pin(r.url.to_string().as_bytes());
+    let path = dir
+        .path()
+        .join(format!("probe-admitted-{}", &hex::encode(id)[..16]));
+    std::fs::write(&path, (twr_relay::now_unix() + 10 * 86400).to_string()).unwrap();
+    let report = probe::probe(&opts).await;
+    assert!(report.ok, "{report:#?}");
+    let until: u64 = std::fs::read_to_string(&path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        until < twr_relay::now_unix() + 3 * 86400,
+        "the real admission replaced the bogus one"
+    );
     r.stop().await;
 }
 

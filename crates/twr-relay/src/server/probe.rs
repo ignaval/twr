@@ -272,9 +272,75 @@ pub async fn probe(o: &ProbeOptions) -> Report {
         .and_then(|u| u.as_str())
         .map(String::from);
     let seed = keys.a;
-    let admitted = timed(&mut checks, "iroh_admission", o.timeout, async {
+    // With --state, the pair admission is posted again only when it has under a day left, so
+    // a probe every minute stays far below the per-address admission limit. The iroh handshake
+    // still checks the admission on every run; if it fails on a kept admission (a relay that
+    // lost its state), the admission is posted again and the handshake retried once.
+    let cache = o.state.as_ref().map(|d| {
+        let id = names::pin(t.url.to_string().as_bytes());
+        d.join(format!("probe-admitted-{}", &hex::encode(id)[..16]))
+    });
+    let now = crate::now_unix();
+    let kept = cache
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .is_some_and(|until| until > now + 86400);
+    let admitted = if kept {
+        checks.push(Check {
+            name: "iroh_admission",
+            ok: true,
+            ms: 0,
+            error: None,
+        });
+        true
+    } else {
+        admit_check(&mut checks, t, seed, keys.b, cache.as_deref(), o.timeout).await
+    };
+    if let (Some(url), true) = (iroh_url, admitted) {
+        let first = timed(
+            &mut checks,
+            "iroh_relay",
+            o.timeout,
+            iroh_handshake(url.clone(), seed, t.url.pin, t.extra_roots.clone()),
+        )
+        .await;
+        if first.is_none() && kept {
+            checks.pop();
+            checks.pop();
+            if admit_check(&mut checks, t, seed, keys.b, cache.as_deref(), o.timeout).await {
+                timed(
+                    &mut checks,
+                    "iroh_relay",
+                    o.timeout,
+                    iroh_handshake(url, seed, t.url.pin, t.extra_roots.clone()),
+                )
+                .await;
+            }
+        }
+    }
+
+    let ok = checks.iter().all(|c| c.ok);
+    Report {
+        ok,
+        relay: t.url.to_string(),
+        checks,
+    }
+}
+
+/// Posts the probe's admission: a pairing one without state, the pair one with it (whose
+/// expiry then goes to `cache`).
+async fn admit_check(
+    checks: &mut Vec<Check>,
+    t: &Target,
+    seed: [u8; 32],
+    b: Option<[u8; 32]>,
+    cache: Option<&std::path::Path>,
+    timeout: Duration,
+) -> bool {
+    let fut = async {
         let key = IdentityKey::ed25519_from_seed(&seed)?;
-        let a = match keys.b {
+        let a = match b {
             None => admit::sign_pairing(&key, crate::now_unix())?,
             Some(b) => {
                 let other = IdentityKey::ed25519_from_seed(&b)?;
@@ -290,25 +356,15 @@ pub async fn probe(o: &ProbeOptions) -> Report {
                 )
             }
         };
-        client::post_admission(t, &a).await
-    })
-    .await;
-    if let (Some(url), Some(_)) = (iroh_url, admitted) {
-        timed(
-            &mut checks,
-            "iroh_relay",
-            o.timeout,
-            iroh_handshake(url, seed, t.url.pin, t.extra_roots.clone()),
-        )
-        .await;
-    }
-
-    let ok = checks.iter().all(|c| c.ok);
-    Report {
-        ok,
-        relay: t.url.to_string(),
-        checks,
-    }
+        let answer = client::post_admission(t, &a).await?;
+        if let (Some(path), Some(_)) = (cache, b) {
+            let _ = super::certs::write_private(path, answer.until.to_string().as_bytes());
+        }
+        Ok(answer)
+    };
+    timed(checks, "iroh_admission", timeout, fut)
+        .await
+        .is_some()
 }
 
 async fn iroh_handshake(
