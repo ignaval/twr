@@ -5778,6 +5778,7 @@ name = "twr-relay"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.23.1",
  "bytes",
  "futures",
@@ -5787,6 +5788,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "iroh-base",
+ "iroh-dns",
  "iroh-relay",
  "libc",
  "rcgen",

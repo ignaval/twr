@@ -40,6 +40,9 @@ tokio-rustls-acme = { version = "0.9.1", default-features = false, features = ["
 # iroh's relay server for linked runners, at twr-link's iroh version (§10).
 iroh-relay = { version = "=1.4.1", default-features = false, features = ["server", "tls-ring"], optional = true }
 iroh-base = { version = "=1.4.1", default-features = false, optional = true }
+async-trait = { version = "0.1", optional = true }
+# `twr relay probe`'s iroh check: the iroh relay client needs a resolver, unused for IP URLs.
+iroh-dns = { version = "=1.4.1", default-features = false, optional = true }
 
 [features]
 default = []
@@ -48,6 +51,8 @@ server = [
     "dep:tokio-rustls-acme",
     "dep:iroh-relay",
     "dep:iroh-base",
+    "dep:async-trait",
+    "dep:iroh-dns",
     "hyper/server",
     "hyper/http2",
     "hyper-util/server",
@@ -56,3 +61,7 @@ server = [
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[test]]
+name = "conformance"
+required-features = ["server"]

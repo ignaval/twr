@@ -10,6 +10,8 @@ pub mod keys;
 pub mod mux;
 pub mod names;
 pub mod proto;
+#[cfg(feature = "server")]
+pub mod server;
 pub mod tls;
 pub mod url;
 

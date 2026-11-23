@@ -22,19 +22,44 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_EVERY: Duration = Duration::from_secs(30);
 const SILENT_LIMIT: Duration = Duration::from_secs(90);
 
-/// How a hub reaches one relay.
+/// One relay as a client reaches it: its URL, and optionally an address to connect to instead
+/// of resolving the URL's host (to check one server before DNS points at it, or in tests).
 #[derive(Debug, Clone)]
-pub struct HubConfig {
+pub struct Target {
     pub url: RelayUrl,
-    /// Shown to the relay in `hello` (§5.3), for example `twr 0.7.0`.
-    pub client: String,
+    pub connect: Option<std::net::SocketAddr>,
     /// Extra roots for a relay under a private CA; empty in normal use.
     pub extra_roots: Vec<CertificateDer<'static>>,
 }
 
+impl Target {
+    pub fn new(url: RelayUrl) -> Self {
+        Self { url, connect: None, extra_roots: Vec::new() }
+    }
+
+    pub fn connect_to(mut self, addr: std::net::SocketAddr) -> Self {
+        self.connect = Some(addr);
+        self
+    }
+}
+
+impl From<RelayUrl> for Target {
+    fn from(url: RelayUrl) -> Self {
+        Self::new(url)
+    }
+}
+
+/// How a hub reaches one relay.
+#[derive(Debug, Clone)]
+pub struct HubConfig {
+    pub target: Target,
+    /// Shown to the relay in `hello` (§5.3), for example `twr 0.7.0`.
+    pub client: String,
+}
+
 impl HubConfig {
-    pub fn new(url: RelayUrl, client: impl Into<String>) -> Self {
-        Self { url, client: client.into(), extra_roots: Vec::new() }
+    pub fn new(target: impl Into<Target>, client: impl Into<String>) -> Self {
+        Self { target: target.into(), client: client.into() }
     }
 }
 
@@ -84,8 +109,16 @@ impl Drop for HubSession {
     }
 }
 
-async fn dial(url: &RelayUrl, cfg: rustls::ClientConfig) -> Result<TlsStream<TcpStream>> {
-    let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(url.authority()))
+async fn dial(target: &Target, alpn: &[&[u8]]) -> Result<TlsStream<TcpStream>> {
+    let url = &target.url;
+    let cfg = relay_tls(url, &target.extra_roots, alpn);
+    let connect = async {
+        match target.connect {
+            Some(a) => TcpStream::connect(a).await,
+            None => TcpStream::connect(url.authority()).await,
+        }
+    };
+    let tcp = tokio::time::timeout(CONNECT_TIMEOUT, connect)
         .await
         .context("connecting to the relay timed out")?
         .with_context(|| format!("connecting to {}", url.authority()))?;
@@ -112,8 +145,7 @@ fn relay_tls(url: &RelayUrl, extra_roots: &[CertificateDer<'static>], alpn: &[&[
 impl HubSession {
     /// Connects, authenticates with `key` and waits for `welcome` (§5.1-§5.4).
     pub async fn connect(cfg: &HubConfig, key: &IdentityKey) -> Result<Self> {
-        let tls_cfg = relay_tls(&cfg.url, &cfg.extra_roots, proto::HUB_ALPNS);
-        let tls = dial(&cfg.url, tls_cfg).await?;
+        let tls = dial(&cfg.target, proto::HUB_ALPNS).await?;
         let conn = tls.get_ref().1;
         let alpn = conn.alpn_protocol().map(|a| a.to_vec());
         if alpn.as_deref() != Some(proto::ALPN_V1) {
@@ -137,6 +169,9 @@ impl HubSession {
                 Ok(()) => Closed::Lost("the relay closed the connection".into()),
                 Err(e) => Closed::Lost(format!("connection error: {e}")),
             };
+            // The control stream's reader still holds what arrived before the close (a fatal
+            // error or a drain, which say more): let it report first.
+            tokio::time::sleep(Duration::from_millis(500)).await;
             ctx.send_if_modified(|c| {
                 if c.is_none() {
                     *c = Some(why);
@@ -525,14 +560,14 @@ impl HubClient {
 
 /// A minimal HTTPS/1.1 request to a relay's API, checking the relay as its URL says (§3.4).
 pub async fn https(
-    url: &RelayUrl,
-    extra_roots: &[CertificateDer<'static>],
+    target: &Target,
     method: &str,
     path: &str,
     body: Option<Vec<u8>>,
 ) -> Result<(u16, Vec<u8>)> {
     use http_body_util::{BodyExt, Full};
-    let tls = dial(url, relay_tls(url, extra_roots, &[b"http/1.1"])).await?;
+    let url = &target.url;
+    let tls = dial(target, &[b"http/1.1"]).await?;
     let (mut sender, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls)).await?;
     tokio::spawn(conn);
     let host = match url.port {
@@ -557,8 +592,8 @@ pub async fn https(
 }
 
 /// `/v1/info` (§8.1).
-pub async fn info(url: &RelayUrl, extra_roots: &[CertificateDer<'static>]) -> Result<serde_json::Value> {
-    let (status, body) = https(url, extra_roots, "GET", "/v1/info", None).await?;
+pub async fn info(target: &Target) -> Result<serde_json::Value> {
+    let (status, body) = https(target, "GET", "/v1/info", None).await?;
     if status != 200 {
         bail!("/v1/info answered {status}");
     }
@@ -566,12 +601,8 @@ pub async fn info(url: &RelayUrl, extra_roots: &[CertificateDer<'static>]) -> Re
 }
 
 /// Posts an admission (§10.2) and returns what the relay admitted.
-pub async fn post_admission(
-    url: &RelayUrl,
-    extra_roots: &[CertificateDer<'static>],
-    admission: &admit::Admission,
-) -> Result<admit::AdmitAnswer> {
-    let (status, body) = https(url, extra_roots, "POST", "/v1/iroh/admit", Some(serde_json::to_vec(admission)?)).await?;
+pub async fn post_admission(target: &Target, admission: &admit::Admission) -> Result<admit::AdmitAnswer> {
+    let (status, body) = https(target, "POST", "/v1/iroh/admit", Some(serde_json::to_vec(admission)?)).await?;
     if status != 200 {
         let err = serde_json::from_slice::<serde_json::Value>(&body)
             .ok()
@@ -585,14 +616,13 @@ pub async fn post_admission(
 /// A phone's status-page check (§8.2): `Some(connected)` if the relay knows this credential,
 /// `None` if it answers "unknown".
 pub async fn hub_status(
-    url: &RelayUrl,
-    extra_roots: &[CertificateDer<'static>],
+    target: &Target,
     hub_name: &str,
     relay_key: &[u8; 32],
 ) -> Result<Option<bool>> {
     let tag = names::tag(relay_key, hub_name, names::window(crate::now_unix()));
     let path = format!("/v1/hubs/{}", names::label(hub_name, &tag));
-    let (status, body) = https(url, extra_roots, "GET", &path, None).await?;
+    let (status, body) = https(target, "GET", &path, None).await?;
     match status {
         200 => Ok(serde_json::from_slice::<serde_json::Value>(&body)?.get("connected").and_then(|c| c.as_bool())),
         404 => Ok(None),
