@@ -12,6 +12,7 @@ repository = "https://github.com/ignaval/twr"
 [workspace.dependencies]
 twr-core = { path = "crates/twr-core" }
 twr-link = { path = "crates/twr-link" }
+twr-relay = { path = "crates/twr-relay" }
 twr-source = { path = "crates/twr-source" }
 twr-adapters = { path = "crates/twr-adapters" }
 twr-decisions = { path = "crates/twr-decisions" }
