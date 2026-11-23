@@ -1553,6 +1553,8 @@ fn compact_needs_rows(state: &AppState, width: usize) -> CompactRows {
         let name = compact_name(state, &id);
         let kind = if item.proposal {
             "confirm"
+        } else if item.offline_since.is_some() {
+            "offline"
         } else {
             match item.reason {
                 AttentionReason::Permission => "permission",
@@ -3487,6 +3489,26 @@ pub(crate) fn cut_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'st
     out
 }
 
+/// The badge of `item`: a loop's ([`crate::loops::item_badge`]), `OFFLINE` for the hub's items
+/// about its internet connection ([`AttentionItem::offline_since`]: the hub's notice, a stall
+/// while the connection was down), else its reason's ([`badge`]).
+fn item_badge(item: &AttentionItem) -> Span<'static> {
+    if let Some(b) = crate::loops::item_badge(item) {
+        return b;
+    }
+    if item.offline_since.is_none() {
+        return badge(item.reason);
+    }
+    let fill = Color::Yellow;
+    Span::styled(
+        " OFFLINE ",
+        Style::default()
+            .fg(crate::color::text_on(fill))
+            .bg(fill)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
 /// The badge span for an attention reason: its label in bold on its fill, in black or white,
 /// whichever reads better ([`crate::color::text_on`]: white on the `PERMISSION` red, black on
 /// the others), at 4.5:1 at least with 256 colors and 16.
@@ -3826,7 +3848,7 @@ fn attention_rows_of(
         Vec::new()
     } else {
         vec![
-            crate::loops::item_badge(top).unwrap_or_else(|| badge(top.reason)),
+            item_badge(top),
             Span::raw(" "),
             Span::raw(top.summary.clone()),
         ]
@@ -4159,7 +4181,7 @@ fn render_grid(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
         .and_then(|o| state.top_attention(&o.id))
     {
         head.push(Span::raw(" · "));
-        head.push(badge(item.reason));
+        head.push(item_badge(item));
         head.push(Span::styled(
             " the orchestrator needs you (Ctrl-G: back to the conversation)",
             Style::default().fg(WARN),
@@ -6893,7 +6915,7 @@ fn card_detail_rows_of(item: &AttentionItem, more: usize, width: usize) -> Detai
         // A stuck loop's item: its badge and its text.
         wrap_line(
             Line::from(vec![
-                crate::loops::item_badge(item).unwrap_or_else(|| badge(item.reason)),
+                item_badge(item),
                 Span::raw(" "),
                 Span::raw(item.summary.clone()),
             ]),
@@ -6906,7 +6928,7 @@ fn card_detail_rows_of(item: &AttentionItem, more: usize, width: usize) -> Detai
         };
         let mut rows = wrap_line(
             Line::from(vec![
-                badge(item.reason),
+                item_badge(item),
                 Span::raw(" "),
                 Span::raw(head.to_string()),
             ]),
@@ -6998,6 +7020,7 @@ fn render_card_detail(
                     state.registry.get(orch).map_or(orch, |t| t.name.as_str())
                 };
                 let label = crate::loops::item_label(item)
+                    .or(item.offline_since.map(|_| "offline"))
                     .map_or_else(|| reason_label(item.reason).to_lowercase(), str::to_string);
                 format!(" {name} · {label} · Esc returns ")
             },
@@ -19793,6 +19816,33 @@ mod tests {
             assert!(head.contains("running (1 bg) · imp"), "{w}:\n{text}");
             assert!(text.contains(" STALLED "), "{w}:\n{text}");
         }
+    }
+
+    /// A stall the hub raised while its machine had no internet connection
+    /// (`ext.twr.offline`) is badged `OFFLINE`, not `STALLED`: the cause is the connection.
+    #[test]
+    fn a_stall_while_offline_is_badged_offline() {
+        use crate::app::tests::control;
+        let mut st = AppState::new();
+        let mut s = ThreadScript::new("t-run");
+        let mut stall = s.raise("a1", AttentionReason::Stalled);
+        stall.source = twr_core::event::Source::Hub;
+        if let EventBody::AttentionRaised(p) = &mut stall.body {
+            p.summary = "No internet connection since 14:02: no activity for 10 min".into();
+            p.ext = serde_json::json!({"twr": {"offline": {"since": "2026-11-23T14:02:00Z"}}})
+                .as_object()
+                .cloned();
+        }
+        control(&mut st, &[s.created("run"), s.turn_started("go"), stall]);
+        st.set_focus(Some("t-run".into()));
+        let lines = draw_panes(&mut st, 100, 40);
+        let text = pane_text(&st, &lines, &card("t-run"));
+        assert!(text.contains(" OFFLINE "), "{text}");
+        assert!(!text.contains(" STALLED "), "{text}");
+        assert!(
+            card_words(&text).contains("No internet connection since 14:02"),
+            "{text}"
+        );
     }
 
     /// A long-named thread on a box not simply online, its title left no room for the box's

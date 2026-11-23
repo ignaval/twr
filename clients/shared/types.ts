@@ -56,6 +56,10 @@ export interface Attention {
   loop_setup?: boolean;
   /** A stuck loop's item: only the user answers it (resume, stop); never dismissed. */
   loop_stuck?: boolean;
+  /** The hub raised it because its machine has no internet connection (twr-core
+   * `AttentionItem::offline_since`, RFC 3339): its notice on the hub's thread, or a thread's
+   * stall while the connection was down. */
+  offline_since?: string;
 }
 export interface ViewState {
   threads: Thread[];
@@ -243,9 +247,11 @@ export interface AttentionSummaryItem {
   /**
    * The hub's own cards, which only the user answers: `confirm`, what the orchestrator
    * proposed from your message; `delete`, a deletion of threads; `loop_setup`, the settings
-   * a loop starts on; `loop_stuck`, a loop that waits for you to resume or stop it.
+   * a loop starts on; `loop_stuck`, a loop that waits for you to resume or stop it;
+   * `offline`, the hub's machine has no internet connection (its notice, or a thread's stall
+   * while it is down).
    */
-  card?: "confirm" | "delete" | "loop_setup" | "loop_stuck";
+  card?: "confirm" | "delete" | "loop_setup" | "loop_stuck" | "offline";
   /** Still being raised: not notified until it is complete. */
   incomplete?: boolean;
 }

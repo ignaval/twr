@@ -25,6 +25,9 @@
 //! # A non-loopback `listen` is refused unless one of these is set:
 //! tls = { cert = "/etc/twr/hub.pem", key = "/etc/twr/hub.key" }   # serve wss:// (PEM files)
 //! allow_insecure_remote = false            # plain ws:// on the network (events in clear text)
+//! connectivity_check_secs = 30             # how often the hub checks it reaches the internet; 0 = off
+//! connectivity_targets = ["api.anthropic.com:443"]   # host:port it connects to; unset = the
+//!                                          # proxy of HTTPS_PROXY / ALL_PROXY, else the model APIs
 //!
 //! # A box the hub reaches over ssh: it runs twr there itself (`twr box add gpu me@gpu.lan`
 //! # writes this table to boxes.toml).
@@ -973,6 +976,64 @@ pub struct HubConfig {
     /// Allow a plain `ws://` listener on a non-loopback address (the whole event stream and
     /// the hub's commands cross the network unencrypted; the token itself never does).
     pub allow_insecure_remote: bool,
+    /// How often, in seconds, the hub checks that its machine reaches the internet (`twr-hub`
+    /// `hub::net`: a TCP connection to [`HubConfig::connectivity_targets`], more often while it
+    /// fails). `None`: [`CONNECTIVITY_CHECK_SECS`]; `0`: never (no offline notice, and stalls
+    /// are judged as if the connection were always up).
+    pub connectivity_check_secs: Option<u64>,
+    /// What that check connects to, each `host:port`; reachable means any one answers. `None`:
+    /// the proxy in `HTTPS_PROXY` / `ALL_PROXY` when set (behind a proxy only it can be
+    /// reached), else [`CONNECTIVITY_TARGETS`], the model APIs the built-in runtimes use.
+    pub connectivity_targets: Option<Vec<String>>,
+}
+
+/// Default `[hub] connectivity_check_secs`.
+pub const CONNECTIVITY_CHECK_SECS: u64 = 30;
+
+/// Default `[hub] connectivity_targets` (without a proxy): the model APIs of the built-in
+/// runtimes, on HTTPS.
+pub const CONNECTIVITY_TARGETS: &[&str] = &[
+    "api.anthropic.com:443",
+    "api.openai.com:443",
+    "api.x.ai:443",
+];
+
+impl HubConfig {
+    /// How often the connectivity check runs ([`HubConfig::connectivity_check_secs`]); zero:
+    /// never.
+    pub fn connectivity_check(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.connectivity_check_secs
+                .unwrap_or(CONNECTIVITY_CHECK_SECS),
+        )
+    }
+
+    /// Refuses a [`HubConfig::connectivity_targets`] entry that is not `host:port`, or an empty
+    /// list (nothing to check: set `connectivity_check_secs = 0` instead).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let Some(targets) = &self.connectivity_targets else {
+            return Ok(());
+        };
+        if targets.is_empty() {
+            anyhow::bail!(
+                "hub.connectivity_targets: empty; set hub.connectivity_check_secs = 0 to turn \
+                 the check off"
+            );
+        }
+        for t in targets {
+            let ok = t.rsplit_once(':').is_some_and(|(host, port)| {
+                !host.trim().is_empty()
+                    && !host.contains(char::is_whitespace)
+                    && port.parse::<u16>().is_ok_and(|p| p > 0)
+            });
+            if !ok {
+                anyhow::bail!(
+                    "hub.connectivity_targets: {t:?} is not host:port (api.example.com:443)"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `[hub.tls]`: PEM files.
@@ -2020,6 +2081,7 @@ impl Config {
         for (name, b) in &self.boxes {
             b.check(name)?;
         }
+        self.hub.validate()?;
         self.speech.validate()?;
         self.voice.validate()?;
         self.loops.validate()?;
@@ -3908,6 +3970,38 @@ account = "gpu-work"
 
         std::fs::write(&paths.config_file, "stall_after_secs = \"soon\"\n").unwrap();
         assert!(Config::load_from(&paths).is_err());
+    }
+
+    #[test]
+    fn the_connectivity_check_defaults_on_and_takes_host_port_targets() {
+        let c = Config::default();
+        assert_eq!(
+            c.hub.connectivity_check(),
+            std::time::Duration::from_secs(CONNECTIVITY_CHECK_SECS)
+        );
+        let c = Config::from_toml_str(
+            "[hub]\nconnectivity_check_secs = 0\nconnectivity_targets = [\"gw.lan:443\", \"[::1]:8080\"]\n",
+        )
+        .unwrap();
+        assert!(c.hub.connectivity_check().is_zero());
+        assert_eq!(
+            c.hub.connectivity_targets.as_deref(),
+            Some(&["gw.lan:443".to_string(), "[::1]:8080".to_string()][..])
+        );
+        for bad in [
+            "[\"gw.lan\"]",
+            "[\"gw.lan:http\"]",
+            "[\":443\"]",
+            "[\"gw.lan:0\"]",
+            "[]",
+        ] {
+            let e = Config::from_toml_str(&format!("[hub]\nconnectivity_targets = {bad}\n"))
+                .unwrap_err();
+            assert!(
+                format!("{e:#}").contains("hub.connectivity_targets"),
+                "{bad}: {e:#}"
+            );
+        }
     }
 
     #[test]

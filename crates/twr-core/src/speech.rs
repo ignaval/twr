@@ -1024,7 +1024,10 @@ pub const ANNOUNCE_NAME_MAX: usize = 64;
 pub fn announcement(what: crate::notify::NotifyEvent, who: &str, hub: bool) -> String {
     use crate::notify::NotifyEvent as N;
     if hub {
-        return "twr has a question for you".into();
+        return match what {
+            N::Offline => "twr has no internet connection".into(),
+            _ => "twr has a question for you".into(),
+        };
     }
     let name: String = clean(who).trim().chars().take(ANNOUNCE_NAME_MAX).collect();
     let name = if name.trim().is_empty() {
@@ -1038,6 +1041,7 @@ pub fn announcement(what: crate::notify::NotifyEvent, who: &str, hub: bool) -> S
         N::Error => "failed",
         N::Review => "needs your review",
         N::Hung => "seems hung",
+        N::Offline => "has no internet connection",
         N::Stalled => "is stalled",
         N::Report => "finished",
         N::Reply => "replied",
@@ -1582,6 +1586,14 @@ mod tests {
     #[test]
     fn announcements_are_fixed_sentences_naming_the_thread() {
         use crate::notify::NotifyEvent as N;
+        assert_eq!(
+            announcement(N::Offline, "twr", true),
+            "twr has no internet connection"
+        );
+        assert_eq!(
+            announcement(N::Question, "twr", true),
+            "twr has a question for you"
+        );
         assert_eq!(
             announcement(N::Permission, "api", false),
             "api needs your permission"

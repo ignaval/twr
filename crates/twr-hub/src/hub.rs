@@ -153,6 +153,7 @@ pub mod memory;
 pub use memory::DIR as MEMORY_DIR;
 mod mode;
 mod model;
+mod net;
 mod one_shot;
 mod orch;
 pub mod orch_access;
@@ -225,6 +226,7 @@ pub use jobs::{AgentJobBy, JobStart, ShellJob, SlotPool};
 pub(crate) use lifecycle::lock_data_dir;
 pub use lifecycle::lock_opened;
 pub use model::ModelRequest;
+pub use net::{own_net_probe, probe_targets, NetProbe, NetTiming, Probed};
 pub use project_read::{ReadParams, Tool as ReadTool};
 pub use retry::RETRY_PROMPT;
 pub use runners::SealedEnd;
@@ -521,6 +523,10 @@ pub struct HubOptions {
     /// When the hub asks the remote boxes for their agent CLIs, and probes its own again
     /// ([`AgentsPoll::default`]; tests shorten it).
     pub agents_poll: AgentsPoll,
+    /// How the hub checks that its machine reaches the internet (`hub::net`, every `[hub]
+    /// connectivity_check_secs`; [`own_net_probe`] for `twr hub`); `None` (the default, and
+    /// tests): it never checks, and judges stalls as if the connection were always up.
+    pub net_probe: Option<NetProbe>,
     /// Where named accounts declared without a directory live (`<root>/<runtime>/<name>`,
     /// [`twr_core::account::default_dir`]): `twr` passes the home's root's
     /// [`twr_core::paths::Paths::accounts_dir`]; `None` = `accounts` beside the database.
@@ -621,6 +627,7 @@ impl HubOptions {
             socket_removed_hook: None,
             agent_probe: None,
             agents_poll: AgentsPoll::default(),
+            net_probe: None,
             accounts_root: None,
             account_probe: None,
             native_dir: None,
@@ -857,6 +864,10 @@ struct Inner {
     local_agents: Arc<box_agents::LocalAgents>,
     /// [`HubOptions::agents_poll`].
     agents_poll: AgentsPoll,
+    /// [`HubOptions::net_probe`].
+    net_probe: Option<NetProbe>,
+    /// Runs a check of the connection soon (`hub::net`).
+    net_nudge: Arc<tokio::sync::Notify>,
     /// The account probe, the accounts root and the native directories (`hub::accounts`).
     accounts: accounts::AccountsRt,
     /// [`HubOptions::worktree_namespace`]: the branch namespace of the hub's own box, also the
@@ -1759,6 +1770,8 @@ struct Core {
     wake: wake::WakeState,
     /// Hung-turn cards (`hub::stall`).
     hung: stall::HungState,
+    /// The hub's internet connection (`hub::net`): memory only.
+    net: net::NetWatch,
     /// The stalls each thread went on from (`hub::stall`): what a summary's basis reads past.
     went_on: stall::WentOn,
     /// What each thread is doing now (`hub::activity`).
@@ -2402,6 +2415,10 @@ impl Core {
         if let Some(turn) = self.start_retry(hub, thread)? {
             return Ok(Some((turn, None)));
         }
+        // Its retry waits for the internet connection (`hub::net`): nothing goes before it.
+        if self.retry_held_for_net(thread) {
+            return Ok(None);
+        }
         if self.rt.get(thread).is_some_and(|r| r.queue_held) {
             return Ok(None);
         }
@@ -3041,6 +3058,8 @@ impl Hub {
             "suggest": {"unavailable": suggest_unavailable},
             // Every runtime's accounts, without their directories (`hub::accounts`).
             "accounts": core.accounts.to_json(false),
+            // Whether the hub's machine reaches the internet (`hub::net`).
+            "connectivity": core.net_json(),
         })
     }
 

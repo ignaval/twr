@@ -173,6 +173,8 @@ impl Hub {
             link_program: opts.link_program,
             local_agents: Arc::new(super::box_agents::LocalAgents::new(opts.agent_probe)),
             agents_poll: opts.agents_poll,
+            net_probe: opts.net_probe,
+            net_nudge: Default::default(),
             accounts: super::accounts::AccountsRt::new(
                 opts.account_probe,
                 accounts_root,
@@ -756,6 +758,7 @@ impl Core {
             stalled: HashMap::new(),
             wake: Default::default(),
             hung: Default::default(),
+            net: Default::default(),
             loops: Default::default(),
             went_on: Default::default(),
             activity: HashMap::new(),
@@ -865,6 +868,17 @@ fn spawn_tasks(inner: &Arc<Inner>, notify_rx: mpsc::UnboundedReceiver<()>) {
         Arc::downgrade(inner),
         Arc::clone(&inner.loop_kick),
     ));
+    // The hub's internet connection (`hub::net`).
+    if let Some(probe) = inner.net_probe.clone() {
+        let every = probe
+            .timing
+            .every
+            .unwrap_or_else(|| inner.config.hub.connectivity_check());
+        inner.core().net = super::net::NetWatch::new(every, probe.timing, probe.targets.clone());
+        if !every.is_zero() {
+            tokio::spawn(super::net::net_ticker(Arc::downgrade(inner), probe));
+        }
+    }
     if !inner.stall_after.is_zero() {
         tokio::spawn(stall::stall_ticker(
             Arc::downgrade(inner),

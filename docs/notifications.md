@@ -1,11 +1,11 @@
 # Notifications
 
-The TUI can alert the terminal it runs in ([tui.md](tui.md#notifications)), but only while it's open. The hub can also run a command of yours when something needs you, whether or not a TUI is open. That command can push to your phone, post to a chat or show a desktop notification. twr makes no network calls of its own: the command does. The desktop app notifies on its own while it runs ([below](#the-desktop-app)).
+The TUI can alert the terminal it runs in ([tui.md](tui.md#notifications)), but only while it's open. The hub can also run a command of yours when something needs you, whether or not a TUI is open. That command can push to your phone, post to a chat or show a desktop notification. twr sends no notification over the network itself: the command does. The desktop app notifies on its own while it runs ([below](#the-desktop-app)).
 
 ```toml
 [notify]
 command = ["notify-send", "--app-name=twr", "{title}", "{body}"]
-# events = ["permission", "question", "confirm", "error", "review", "hung", "report", "reply"]  # add "stalled" for stalls
+# events = ["permission", "question", "confirm", "error", "review", "hung", "offline", "report", "reply"]  # add "stalled" for stalls
 # detail = false        # true: the text of what's asked or reported goes along
 # timeout_secs = 30     # the command is ended after this long
 ```
@@ -21,6 +21,7 @@ The hub decides what's worth telling you by the same rules the TUI uses, and `ev
 - a new permission, question or confirm card, or a delete card the orchestrator asked for;
 - a failure left for you, after any automatic retry;
 - a turn that seems hung: open and silent while something waits to start the next one (`hung`);
+- the hub's machine lost its internet connection (`offline`), once per outage ([usage.md](usage.md#no-internet-connection)); a thread's stall while it is down is a stall;
 - a turn to review, a worker that finished a turn, and the orchestrator's reply to your message;
 - a stall, if you add `stalled`.
 
