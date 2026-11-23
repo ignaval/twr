@@ -27,7 +27,7 @@ enum RouteError: Error, Equatable {
         case .unreachable(let detail): return "unreachable (\(detail))"
         case .timedOut: return "timed out"
         case .pinMismatch: return "this is another device, not \(hubName) (PIN_MISMATCH)"
-        case .unsupportedKey: return "the device there has no P-256 key, so it is not a twr hub"
+        case .unsupportedKey: return "the device there presents no twr hub key (a hub with its own certificate pairs by its https:// address)"
         case .closed: return "the connection closed before an answer"
         case .tooLarge: return "the answer was too large"
         case .badResponse(let detail): return detail
@@ -267,6 +267,8 @@ enum HubProbe {
     struct Found {
         let route: PairingRoute
         let gatewayID: String
+        /// The pin `/health` reports; absent when the gateway runs in certificate mode.
+        let advertisedPin: String?
     }
 
     /// `GET /health`: a twr gateway, and the expected one when `expectedGateway` is set.
@@ -277,7 +279,7 @@ enum HubProbe {
             throw RouteError.badResponse("not a twr gateway (\(response.status))")
         }
         if let expectedGateway, !expectedGateway.isEmpty, gatewayID != expectedGateway { throw RouteError.otherHub }
-        return Found(route: route, gatewayID: gatewayID)
+        return Found(route: route, gatewayID: gatewayID, advertisedPin: health["pin"] as? String)
     }
 }
 

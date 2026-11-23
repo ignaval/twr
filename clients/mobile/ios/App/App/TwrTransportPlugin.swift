@@ -231,6 +231,9 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
                 do { found = try await HubProbe.health(route, check: capture, expectedGateway: nil, timeout: 30) }
                 catch let error as RouteError { throw RaceFailure(failures: [(route: route.text, error: error)], hubName: hubName) }
                 guard let presented = capture.presented else { throw RaceFailure(failures: [(route: route.text, error: .unsupportedKey)], hubName: hubName) }
+                guard found.advertisedPin != nil else {
+                    throw Failure("\(route.text): this hub uses its own certificate. Pair it with its https:// address instead.")
+                }
                 try ensureNotPaired(found.gatewayID)
                 var nonce = [UInt8](repeating: 0, count: Pairing.nonceLength)
                 guard SecRandomCopyBytes(kSecRandomDefault, nonce.count, &nonce) == errSecSuccess else { throw Failure("Could not make a pairing nonce") }
@@ -409,7 +412,6 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
     }
     private func openPinned(_ call: CAPPluginCall, route: PairingRoute, pin: Data, token: String, hubName: String, generation: Int) {
         guard let socket = PinnedSocket(route: route, pin: pin, token: token) else { call.reject("This hub's saved credentials are unreadable. Forget it and pair again."); return }
-        guard install(socket, generation: generation) else { call.reject("Connection was superseded"); return }
         let attempt = PinnedConnectAttempt(call)
         let via = route.text
         socket.onText = { [weak self] socket, text in
@@ -446,6 +448,7 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
                 self.notifyListeners("message", data: ["message": ["type": "transport-closed", "connected": false, "error": message]])
             }
         }
+        guard install(socket, generation: generation) else { call.reject("Connection was superseded"); return }
         socket.start()
     }
     @objc public func send(_ call: CAPPluginCall) {
