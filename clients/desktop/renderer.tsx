@@ -176,6 +176,9 @@ function Desktop() {
                     [
                       "menu-new",
                       "menu-palette",
+                      "menu-text-larger",
+                      "menu-text-smaller",
+                      "menu-text-reset",
                       "menu-attention",
                       "menu-settings",
                       "inbox-poll",

@@ -1475,9 +1475,31 @@ else {
             submenu: [
               { role: "reload" },
               { role: "togglefullscreen" },
-              { role: "resetZoom" },
-              { role: "zoomIn" },
-              { role: "zoomOut" },
+              // Text size, not page zoom: these step Settings › Layout & text's sizes
+              // (shared/layoutPreferences.ts), which persist and scale the terminal too.
+              {
+                label: "Actual Text Size",
+                accelerator: "CmdOrCtrl+0",
+                click: () => emit({ type: "menu-text-reset" }),
+              },
+              {
+                label: "Larger Text",
+                accelerator: "CmdOrCtrl+Plus",
+                click: () => emit({ type: "menu-text-larger" }),
+              },
+              // + needs Shift on most layouts: = is the same key without it.
+              {
+                label: "Larger Text",
+                accelerator: "CmdOrCtrl+=",
+                visible: false,
+                acceleratorWorksWhenHidden: true,
+                click: () => emit({ type: "menu-text-larger" }),
+              },
+              {
+                label: "Smaller Text",
+                accelerator: "CmdOrCtrl+-",
+                click: () => emit({ type: "menu-text-smaller" }),
+              },
               ...(!app.isPackaged ? [{ role: "toggleDevTools" as const }] : []),
             ],
           },

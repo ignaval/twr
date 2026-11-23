@@ -6,6 +6,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ### Added
 
+- Keyboard shortcuts for the text size in the desktop and phone apps: Ctrl/⌘ with + (or =, the same key without Shift) makes the interface and code text a pixel larger, Ctrl/⌘ with - a pixel smaller, and Ctrl/⌘+0 returns them to the defaults, within Settings › General › Layout & text's bounds (12 to 22 px, 11 to 24 px for code) and saved on this device like the setting. On the desktop the View menu's **Larger Text**, **Smaller Text** and **Actual Text Size** take these keys in place of page zoom ([desktop.md](docs/desktop.md#layout-and-offline-recovery)).
 - A working cursor in the desktop and phone apps' conversation, the TUI's: a `_` that breathes up to a block and back where the orchestrator's, or the open thread's, next text will appear, at the end of a reply streaming in or under the last message. It shows from the moment you send, before the turn starts or the first text arrives, and goes when the turn ends or the thread waits on you; only while the conversation is at its bottom, and without moving it. Reduced motion and `[tui] animate = false` keep it still ([desktop.md](docs/desktop.md#workflows-and-cli-coverage)).
 
 ## [0.6.0] - 2026-11-22
