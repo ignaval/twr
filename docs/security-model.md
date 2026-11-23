@@ -52,8 +52,34 @@ images. Embedded terminals run commands with your authority. Closing the client 
 the hub and its agents running.
 
 The optional mobile gateway adds a network trust boundary. Production connections require
-HTTPS/WSS with a certificate the device trusts. A local owner grants a short-lived,
-one-use pairing code and chooses device capabilities: read and operate, with terminal and
+HTTPS/WSS authenticated in one of two ways, fixed at pairing:
+
+- **The hub's own key (the default).** The gateway makes a P-256 identity key once, 0600 in
+  its `mobile` directory, and serves a self-signed certificate for it. Invitations carry the
+  SHA-256 of its SubjectPublicKeyInfo, and devices accept a connection on any address only
+  when the server's key has that hash, sending nothing before the check: no code, token or
+  request line. A QR code shown through your own SSH session or screen carries the
+  fingerprint, so a QR pairing trusts no network. A typed pairing (address and code) first
+  asks the gateway for a proof: HMAC over the presented key's fingerprint, a fresh 32-byte
+  nonce and the gateway id, keyed from the code by Argon2id (64 MiB, three passes) and HKDF.
+  A server with another key can't make one without the code, so the code is sent only to
+  the key the hub holds. The hub keeps only that derived key, beside the code's hash, for
+  the invitation's five minutes. Anyone who reaches the gateway while a code is open can
+  get a proof and try to guess the code offline: 60 random bits behind Argon2id, valid for
+  five minutes and one use, is the bound. Processes of your user can read the identity key,
+  as they can the rest of twr's data; `twr phone rekey` replaces it and revokes every device,
+  which must pair again.
+- **A certificate the device trusts** (certificate mode, `--tls-cert`), checked against the
+  operating system's trust store, as before.
+
+A credential paired one way is never used the other way. The invitation's code is one use;
+its `twr://pair#` link can be received by any app that registers that scheme, so the
+pairing hub prints the name of the device that paired, and an unexpected one can be revoked.
+A pinned gateway that starts with the hub listens on all addresses (`0.0.0.0` and `[::]`,
+port 47321) while a device is paired or a code is open; without a code it pairs nobody and
+serves only paired devices' tokens. `twr phone off` stops it.
+
+A local owner grants a short-lived, one-use pairing code and chooses device capabilities: read and operate, with terminal and
 admin access separately granted. A bearer credential is checked before WebSocket upgrade,
 and connections that have not authenticated, pairing attempts and refused tokens are
 bounded per source address under a global ceiling ([mobile.md](mobile.md#local-development));

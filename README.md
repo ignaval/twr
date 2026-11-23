@@ -85,7 +85,8 @@ embedded terminals for agent attach, account login and interactive commands. See
 guide for building and running it from this repository.
 
 The [iOS and Android clients](docs/mobile.md) connect to remote hubs and reuse the same
-interface. The graphical clients live in `clients/`: `desktop/` owns the Electron shell,
+interface. `twr phone` on the hub's computer pairs one with a QR code: no certificate or
+domain needed. The graphical clients live in `clients/`: `desktop/` owns the Electron shell,
 `mobile/` owns the native phone shells, and `shared/` owns the common React interface.
 There is one frontend dependency set and build package. Dark is the default appearance.
 

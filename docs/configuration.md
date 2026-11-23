@@ -335,6 +335,7 @@ twr checks the thread's working tree before and after every ACP review run, and 
 |---|---|
 | `TWR_HOME` | put the config, the data directory and the socket under this directory |
 | `TWR_WORKSPACE` | the [workspace](workspaces.md) commands run in when `-w` doesn't say (default: `default`); a workspace's hub sets it for what it starts |
+| `TWR_GATEWAY_AUTOSTART` | `off` keeps a starting hub from starting the phone gateway ([mobile.md](mobile.md#pairing-a-phone)); `twr phone off` does the same, saved |
 | `TWR_RUNNER_TOKEN` | the runner's token when `twr runner` has no `--token-file` |
 | `TWR_CLAUDE_BIN`, `TWR_CODEX_BIN`, `TWR_GROK_BIN` | the agent binary to run instead of `claude`, `codex` or `grok` on `PATH` (on a remote box, the login shell's `PATH` and then the runner's: [runners.md](runners.md#the-login-shells-path)) |
 | `TWR_AGENT_PROBE` | `off` keeps the hub from checking its own box's agent CLIs: no `claude`, `codex` or `grok` runs for it, and `hub.info` reports the local box's agents as not reported (an empty list). Review loops then count every reviewer runtime as installed and logged in, not knowing (`loop.settings.get` says `probed: false`): no setting is refused or replaced for it, and a round whose CLI is missing fails as a failed run. Any other value, or none, leaves the check on. For tests and troubleshooting |

@@ -4,6 +4,24 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ## [Unreleased]
 
+Pair a phone with a hub on any computer, a server over SSH included, with no certificate or domain: `twr phone` shows a QR code, and the phone pins the hub's own key.
+
+Upgrading: a gateway started without `--tls-cert` no longer refuses to start; it serves its own key and listens on all addresses (`0.0.0.0:47321` and `[::]:47321`). Pairing codes have 12 characters, so a code from an older gateway doesn't pair with a new one (codes last five minutes anyway). Gateways with a certificate keep `/health` protocol 1, so released desktop apps keep working with them; pairing by key needs this release's apps.
+
+### Added
+
+- `twr phone` pairs a phone: it starts the phone gateway if needed and shows a QR code, a one-use code (`ABCD-EFGH-JK23`), the addresses it offers and the expiry, waits until the phone pairs and prints its name. `--read-only`, `--terminal` and `--admin` choose its access, `--address HOST[:PORT]` puts a DNS name or forwarded port first, `--json` prints JSON lines for launchers. `twr phone devices`, `revoke`, `off` and `rekey` manage the phones and the gateway. In the TUI, `/phone [access]` does the same in a panel ([mobile.md](docs/mobile.md#pairing-a-phone)).
+- The gateway's own identity: a P-256 key made once, with a self-signed certificate it renews itself. Invitations (QR codes and `twr://pair#…` links) carry the key's fingerprint and up to eight addresses (public, tailnet, LAN), and the apps accept only that key, on every address, sending nothing before checking it. No certificate, domain or trust setting is needed on the phone ([security-model.md](docs/security-model.md#graphical-clients-and-paired-devices)).
+- Typed pairing by address and code: before it sends the code, the app checks a proof the hub makes from it (Argon2id and HMAC over its key's fingerprint, `GET /v1/pair/proof`), so a code typed into the wrong server can't be used by it. The hub's `device.pair_proof` method is user-only.
+- The apps try a hub's addresses in parallel (the one that worked last on that network first), remember what worked, learn the hub's current addresses while connected, and reconnect at once when the network changes. On iOS a hub paired by key is reached over Network.framework, so no App Transport Security exception is needed, IP addresses included.
+- `twr gateway` is the gateway itself, part of every twr (the plain Linux install included); the desktop bundle's `twr-mobile-gateway` still works. A pinned gateway starts with the hub while a phone is paired or a code is open (`twr phone off` or `TWR_GATEWAY_AUTOSTART=off` stops that).
+
+### Changed
+
+- The desktop's **Let other devices connect** needs no certificate by default: it shows the gateway's key and addresses, and its invitation carries them. **Advanced › Use my own certificate** is the earlier flow, and settings saved by earlier versions keep it.
+- The apps' pairing forms take a **Hub address** (a host or IP, or an `https://` address for a hub with its own certificate) instead of an HTTPS URL, and a saved hub paired by key shows **Key and addresses**.
+- Pairing codes have 12 characters (60 bits), shown in groups of four and accepted in any case, with or without dashes.
+
 ## [0.6.0] - 2026-11-22
 
 Simpler desktop and phone apps: Settings in tabs, forms that pick from lists, fewer pages for the same thing and one menu per conversation. twr's own neural voices read aloud on your machine (Kokoro, Supertonic 3 and Piper), with a voice for each language picked in the apps, and whisper's `small` models make dictation more accurate. The model and effort change from the message box, the orchestrator's in place; the orchestrator can search the web, run with full access and change twr's configuration when you ask; the apps show usage limits; and a single review pass (`--once`) runs one round. Also many fixes to drafts and attached files in the apps.

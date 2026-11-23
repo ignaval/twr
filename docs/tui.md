@@ -780,6 +780,7 @@ Only an open TUI notifies this way, and each open TUI notifies on its own. For n
 | `/mode [thread] <mode>` | set a thread's permission mode; in a dive the thread is optional |
 | `/model <thread> [model] [--effort e] [--runtime r]` | show a thread's model and reasoning effort, set either, or move the thread to another runtime; in a dive, `/model [--effort e] [--runtime r]` is about that thread; alone in the stack view, the orchestrator's picker (`Alt-M`) |
 | `/account [thread] [account] [--outside-pin]` | show a thread's account, or move it to another account of its runtime (a new session with a handoff); in a dive the thread is optional. `/account add <runtime> <name>` shows the `twr account add` command to run in another terminal ([accounts.md](accounts.md)) |
+| `/phone [read-only\|operate\|terminal\|admin]` | pair a phone: a QR code, a one-use code and the addresses it offers, as `twr phone` shows them ([mobile.md](mobile.md#pairing-a-phone)); Esc cancels the code, `c` copies the invitation link; the code never goes into history or to the orchestrator |
 | `/accounts` | every runtime's accounts and their logins, in the status bar |
 | `/rename [thread] <name>` | rename a worker thread (its worktree and branch keep their names); in a dive the thread is optional |
 | `/clear` | fresh orchestrator session with no handoff; asks `y`; keeps history and workers |
