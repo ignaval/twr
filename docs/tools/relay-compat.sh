@@ -104,4 +104,4 @@ if [ "$fail" != 0 ]; then
     echo "relay compatibility: FAILED" >&2
     exit 1
 fi
-echo "relay compatibility: ok ($checked cross-release checks; releases: $(echo $tags))"
+echo "relay compatibility: ok ($checked cross-release checks; releases: $(printf '%s\n' "$tags" | tr '\n' ' '))"

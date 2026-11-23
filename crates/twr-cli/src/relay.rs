@@ -67,6 +67,11 @@ pub enum RelayCmd {
         #[arg(long, value_name = "DIR")]
         state: Option<PathBuf>,
     },
+    /// Check a configuration file as `serve` would read it, without starting anything.
+    CheckConfig {
+        #[arg(value_name = "PATH")]
+        config: PathBuf,
+    },
     /// Print the relay URL hubs use for this relay's configuration, with its pin when the
     /// relay's key is self-signed.
     Url {
@@ -226,6 +231,17 @@ pub async fn run(cmd: RelayCmd) -> anyhow::Result<ExitCode> {
             })
             .await;
             Ok(ExitCode::from(probe::print(&report, json) as u8))
+        }
+        RelayCmd::CheckConfig { config } => {
+            let cfg = Config::load(&config)?;
+            println!(
+                "{}: ok ({}, tls {:?}, iroh {})",
+                config.display(),
+                cfg.relay.hostname.as_deref().unwrap_or("no hostname"),
+                cfg.tls.mode,
+                if cfg.iroh.enabled { "on" } else { "off" }
+            );
+            Ok(ExitCode::SUCCESS)
         }
         RelayCmd::Url { config } => {
             let path = config.unwrap_or_else(|| PathBuf::from(install::CONFIG_PATH));

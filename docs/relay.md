@@ -99,7 +99,7 @@ A restart drains connected hubs first: they reconnect, to another relay if they 
 
 ## Configuration
 
-`/etc/twr-relay/relay.toml`. Every key is optional, apart from what the table marks. `twr relay serve --config <file>` runs with another file, and `twr relay serve --hostname … --public-host … --listen … --state-dir …` runs without one.
+`/etc/twr-relay/relay.toml`. Every key is optional, apart from what the table marks. `twr relay check-config <file>` reads a file as `serve` would, without starting anything. `twr relay serve --config <file>` runs with another file, and `twr relay serve --hostname … --public-host … --listen … --state-dir …` runs without one.
 
 **`[relay]`**
 
