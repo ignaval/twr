@@ -48,8 +48,9 @@ pub enum Autostart {
 
 /// What a starting hub does about the gateway: starts it when nothing forbids it
 /// (`forbidden`: a test's hub, [`AUTOSTART_ENV`]), `twr phone` set it up (`settings`, with
-/// autostart on: never for a desktop app's certificate-mode gateway, which keeps no
-/// settings), none runs (`running`), and a phone is paired or an invitation open.
+/// autostart on, which only `twr phone` turns on and `twr phone off` or `--stop-gateway`
+/// off), none runs (`running`), and a phone is paired or an invitation open. It then listens
+/// where the settings say.
 pub fn autostart_decision(
     forbidden: bool,
     settings: Option<&Settings>,
@@ -185,6 +186,33 @@ pub async fn ensure_running(program: &Path, dir: &Path) -> Result<(Value, bool)>
     }
 }
 
+/// What `twr phone` saves as the pinned gateway's `listen` when one runs on `running`:
+/// nothing (the default) when it listens on [`gateway::ALL_ADDRESSES`], else exactly those
+/// addresses, so a hub that starts it later listens where it does now.
+pub fn listen_to_save(running: &[std::net::SocketAddr]) -> Vec<std::net::SocketAddr> {
+    if running == gateway::ALL_ADDRESSES {
+        Vec::new()
+    } else {
+        running.to_vec()
+    }
+}
+
+/// `twr phone`: saves in `dir`'s settings where the pinned gateway whose record is `info`
+/// listens ([`listen_to_save`]), when it is a pinned one and that changed them.
+pub fn remember_listen(dir: &Path, info: &Value) -> Result<()> {
+    let running = gateway::listeners_of(info);
+    if info["mode"] != "pinned" || running.is_empty() {
+        return Ok(());
+    }
+    let saved = Settings::load(dir)?;
+    let mut settings = saved.clone().unwrap_or_default();
+    settings.listen = listen_to_save(&running);
+    if saved.as_ref() != Some(&settings) {
+        settings.save(dir)?;
+    }
+    Ok(())
+}
+
 /// The scopes of an access level: `read-only`, `operate` (the default), `terminal` or `admin`
 /// (which includes terminal).
 pub fn scopes_of(level: &str) -> Option<Vec<&'static str>> {
@@ -282,7 +310,11 @@ pub async fn wait(
             .find(|d| d["id"].as_str().is_some_and(|id| !known.contains(id)));
         return Ok(match paired {
             Some(device) => Outcome::Paired(device.clone()),
-            None => Outcome::Expired,
+            None => {
+                // Expired or used up: nothing of it (its proof key) stays behind.
+                auth.cancel_pairing(code)?;
+                Outcome::Expired
+            }
         });
     }
 }
@@ -325,6 +357,38 @@ mod tests {
         assert!(autostart_off(Some("0".as_ref())));
         assert!(!autostart_off(Some("on".as_ref())));
         assert!(!autostart_off(None));
+    }
+
+    /// `twr phone` saves where a pinned gateway listens, the default as nothing; a gateway in
+    /// another mode saves nothing.
+    #[test]
+    fn twr_phone_saves_where_the_pinned_gateway_listens() {
+        use std::os::unix::fs::PermissionsExt;
+        let all = gateway::ALL_ADDRESSES;
+        assert!(listen_to_save(&all).is_empty());
+        let narrow: Vec<std::net::SocketAddr> = vec!["192.168.1.5:47321".parse().unwrap()];
+        assert_eq!(listen_to_save(&narrow), narrow);
+        assert_eq!(listen_to_save(&all[..1]), all[..1]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let on = Settings {
+            autostart: true,
+            ..Default::default()
+        };
+        on.save(dir.path()).unwrap();
+        let certificate = json!({"mode": "certificate", "listen": "127.0.0.1:47321"});
+        remember_listen(dir.path(), &certificate).unwrap();
+        assert_eq!(Settings::load(dir.path()).unwrap(), Some(on.clone()));
+        let pinned = json!({"mode": "pinned", "listen": "192.168.1.5:47321",
+            "listens": ["192.168.1.5:47321"]});
+        remember_listen(dir.path(), &pinned).unwrap();
+        let saved = Settings::load(dir.path()).unwrap().unwrap();
+        assert_eq!(saved.listen, narrow);
+        assert!(saved.autostart);
+        let everywhere = json!({"mode": "pinned", "listen": "0.0.0.0:47321",
+            "listens": ["0.0.0.0:47321", "[::]:47321"]});
+        remember_listen(dir.path(), &everywhere).unwrap();
+        assert_eq!(Settings::load(dir.path()).unwrap(), Some(on));
     }
 
     #[test]
@@ -381,5 +445,17 @@ mod tests {
         let outcome = wait(dir.path(), &code, &known, std::future::pending()).await;
         assert_eq!(outcome.unwrap(), Outcome::Expired);
         assert_eq!(Outcome::Expired.json(), json!({"expired": true}));
+        // Expired: the wait says so, and the invitation's proof key is gone from the store.
+        let code = auth.begin(vec!["read".into()]).unwrap();
+        let path = dir.path().join("devices.json");
+        let key = hex::encode(twr_core::phone_pairing::proof_key(&code).unwrap());
+        let mut db: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(db.to_string().contains(&key));
+        db["pairing"]["expires"] = json!(twr_core::devices::now() - 1);
+        std::fs::write(&path, db.to_string()).unwrap();
+        let outcome = wait(dir.path(), &code, &known, std::future::pending()).await;
+        assert_eq!(outcome.unwrap(), Outcome::Expired);
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert!(!stored.contains(&key) && !stored.contains("\"pairing\":{"));
     }
 }

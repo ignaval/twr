@@ -1,7 +1,9 @@
 //! The pinned-mode gateway's saved settings, `gateway-settings.json` in its directory (0600):
 //! the address invitations offer first, where it listens, and whether a local hub starts it.
-//! `twr phone` writes them; the desktop app keeps its certificate-mode gateway's settings in its
-//! own settings file, and this one plays no part there.
+//! `twr phone` writes them all, and alone turns autostart on; a pinned gateway given
+//! `--address` saves that, and `--stop-gateway` turns autostart off. The desktop app keeps its
+//! certificate-mode gateway's settings in its own settings file, and this one plays no part
+//! there.
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, path::Path};
@@ -13,11 +15,13 @@ pub struct Settings {
     /// What invitations offer first: a DNS name or a forwarded `host:port` (`--address`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
-    /// Where the gateway listens; empty for `0.0.0.0:47321` and `[::]:47321`.
+    /// Where the gateway listens when no `--listen` is given, as the hub's autostart starts
+    /// it; empty for `0.0.0.0:47321` and `[::]:47321`. `twr phone` saves where the gateway it
+    /// pairs through listens.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub listen: Vec<SocketAddr>,
     /// Whether a local hub that starts runs the gateway, when phones are paired with it
-    /// (`twr phone` turns it on, `twr phone off` off).
+    /// (`twr phone` alone turns it on; `twr phone off` and `--stop-gateway` off).
     #[serde(default)]
     pub autostart: bool,
 }

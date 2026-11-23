@@ -354,6 +354,15 @@ mod tests {
             panic!()
         };
         assert!(note.contains("no hub"));
+        // `twr phone`'s word on a hub from an older twr reaches the view whole.
+        let older = "the twr hub that runs is from an older twr, which can't pair phones with \
+                     this one: restart it (`twr hub stop`, then run twr again)";
+        let Some(PhonePanel::Note(note)) =
+            apply(&preparing, &serde_json::json!({"error": older})).0
+        else {
+            panic!()
+        };
+        assert!(note.ends_with(older), "{note}");
         assert_eq!(arguments("admin"), ["phone", "--json", "--admin"]);
         assert_eq!(arguments("operate"), ["phone", "--json"]);
     }

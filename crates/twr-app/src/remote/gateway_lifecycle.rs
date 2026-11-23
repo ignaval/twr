@@ -61,7 +61,12 @@ pub struct Info {
     pub instance: String,
     pub version: String,
     pub executable: String,
+    /// The first address it listens on, `host:port` (a gateway before `listens` joined them
+    /// all with commas here).
     pub listen: String,
+    /// Every address it listens on, `host:port`, `listen` first.
+    #[serde(default)]
+    pub listens: Vec<String>,
     pub tls_cert: String,
     pub tls_key: String,
     #[serde(default)]
@@ -99,6 +104,7 @@ impl Info {
                 .canonicalize()?
                 .to_string_lossy()
                 .into_owned(),
+            listens: vec![listen.clone()],
             listen,
             tls_cert: canonical(cert)?,
             tls_key: canonical(key)?,

@@ -49,7 +49,7 @@ proof     = HMAC-SHA256(K_proof, "twr-mobile-pin-v2" || 0x00 || pin (32 raw byte
                                   || nonce (32 bytes) || gateway_id (UTF-8, as served by /health))
 ```
 
-- The hub derives `K_proof` once, when it creates the code (`device.pair_begin`), and keeps it with the pairing state, never the code itself. The state lives in `devices.json`, 0600, and is removed with the pairing.
+- The hub derives `K_proof` once, when it creates the code (`device.pair_begin`), and keeps it with the pairing state, never the code itself. The state lives in `devices.json`, 0600, and is removed with the pairing: when it is used, cancelled or replaced, and once it has expired or run out of attempts, the next time the store reads it (to begin, prove, pair, report or cancel an invitation). `twr phone` cancels an invitation it reports as expired.
 - The gateway asks the hub for proofs over the owner socket. Neither ever logs a code, `K_proof` or a proof.
 
 ## Gateway endpoints
@@ -65,7 +65,7 @@ In certificate mode, `pin` is absent and `protocol` stays `1`: released desktop 
 **`GET /v1/pair/proof?nonce=<base64url-nopad of 32 bytes>`, unauthenticated.**
 
 - `200 {"proof":"<base64url-nopad of 32 bytes>"}` while an invitation is open.
-- `404` when none is.
+- `404` when none is. That includes a hub from a twr older than this contract, which has no `device.pair_proof` (`method_not_found`): its `error` says the hub is from an older twr and to restart it, and the gateway logs that. Never `503` for it.
 - `400` for a malformed nonce.
 - It shares `/v1/pair`'s rate limits, per address and global, and its 35-second deadline.
 - A proof request doesn't count as a failed attempt. Every proof for the open code is derived from the same key, so a second one tells an attacker nothing new.
@@ -117,13 +117,23 @@ Hubs print IPv6 hosts in RFC 5952 form (lowercase, compressed), so one address h
 **How the hub builds the list:**
 
 1. The configured `address` first, if set: a DNS name or a forwarded `host:port`.
-2. Then addresses from the interfaces that are up and not loopback or link-local, in this order:
-   - global IPv4 and IPv6;
-   - tailnet addresses (100.64.0.0/10, fd7a:115c:a1e0::/48);
-   - private LAN addresses (RFC 1918, fc00::/7 outside the tailnet range).
-3. Cut the list off at 8.
+2. Then addresses from the interfaces that are up, each class up to its quota, in this order:
+   - at most 2 global IPv4;
+   - at most 2 global IPv6;
+   - at most 2 tailnet addresses (100.64.0.0/10, fd7a:115c:a1e0::/48);
+   - at most 3 private LAN addresses (RFC 1918, fc00::/7 outside the tailnet range).
+3. Then the addresses the quotas left out, in the same order, while there is room.
+4. Cut the list off at 8.
 
-Interface addresses come only for a listener on all addresses (`0.0.0.0` gives IPv4 ones, `[::]` IPv6 ones). A listener on one address offers that address, a loopback one included. Within each class, IPv4 comes before IPv6. When there is no route at all, the gateway opens no invitation and asks for `--address`.
+The quotas keep one class, such as a host's many global IPv6 addresses, from pushing the others out. Duplicates are dropped before they count.
+
+**Left out:**
+
+- loopback interfaces, and loopback, link-local, unspecified and multicast addresses;
+- virtual bridges of containers and virtual machines, by interface name: `docker*`, `br-*`, `veth*`, `virbr*`, `cni*`, `podman*`, `lxcbr*`, `flannel*`;
+- IPv6 addresses the system marks temporary (privacy addresses, which change daily), deprecated, tentative or failed duplicate address detection. Linux reads the flags column of `/proc/net/if_inet6` (`IFA_F_TEMPORARY` 0x01, `IFA_F_DADFAILED` 0x08, `IFA_F_DEPRECATED` 0x20, `IFA_F_TENTATIVE` 0x40). macOS asks `ioctl(SIOCGIFAFLAG_IN6)` (`IN6_IFF_TEMPORARY`, `IN6_IFF_DEPRECATED`, `IN6_IFF_TENTATIVE`, `IN6_IFF_DUPLICATED`, `IN6_IFF_DETACHED`). When neither answers, every address is offered.
+
+Interface addresses come only for a listener on all addresses (`0.0.0.0` gives IPv4 ones, `[::]` IPv6 ones). A listener on one address offers that address, a loopback one included. Within the tailnet and private classes, IPv4 comes before IPv6. When there is no route at all, the gateway opens no invitation and asks for `--address`.
 
 **Saved settings.** The pinned gateway keeps `address`, `listen` and `autostart` in `gateway-settings.json` in its directory (0600). The desktop app keeps its certificate-mode gateway's settings in its own settings file, which the gateway cannot read, so `--address` is saved only in pinned mode.
 
@@ -216,6 +226,8 @@ In pinned mode, `twr gateway --pair --json` (and `--pair --pair-only --json`, wh
 
 `expires_at` is seconds, as today; the invitation's `expiresAt` is milliseconds. In certificate mode the output is unchanged, with no `invitation` and no `link`.
 
+**A hub from an older twr.** A hub that still runs from a twr before 12-character codes answers `device.pair_begin` with a 10-character code. In either mode, the gateway, `twr phone` and the TUI's `/phone` then cancel that code and print no invitation. They fail with one line saying the running hub is from an older twr and to restart it (`twr hub stop`, then run twr again), never a generic "not a pairing code".
+
 **Terminal QR codes.** `twr phone` and the TUI's `/phone` draw a QR code of the invitation JSON without its optional `iroh` and `scopes`, which every scanner accepts. They print the `twr://pair#` link beside it as text, for copy, paste and tap. Base64 makes the link a third larger. At low error correction, with a 2-module quiet zone, a three-route invitation takes:
 
 | Payload | Bytes | QR version | Columns |
@@ -228,13 +240,21 @@ When the drawn code doesn't fit the terminal, they say so and show the link, the
 
 **Starting with the hub.** When the default workspace's hub starts and answers, it starts the pinned gateway, detached, if all of these hold:
 
-- the saved settings have `autostart` on (`twr phone` turns it on, `twr phone off` off; a pinned gateway that starts with no settings writes them with it on);
+- the saved settings have `autostart` on;
 - no gateway runs;
 - a device is paired, or an invitation is open.
 
-Without saved settings it never starts one, so a desktop user whose certificate-mode gateway keeps no settings never gets a pinned gateway they didn't ask for. A test's hub (a debug build under `TWR_HOME`) and `TWR_GATEWAY_AUTOSTART=off` never start one.
+It starts the gateway with no `--listen`, so it listens where the saved `listen` says, or on `0.0.0.0:47321` and `[::]:47321` when that is empty.
 
-`--gateway-info` adds `"pin"` (absent in certificate mode) and `"routes"`, the list the gateway would put in an invitation now. Both are absent while a certificate-mode gateway runs. When no gateway runs, they describe the pinned gateway that would start, if its identity exists. A running gateway's record also carries `"mode"`: `pinned`, `certificate` or `development`. A pinned gateway's `tls_cert` and `tls_key` are its `identity-cert.pem` and `identity-key.pem`, so the desktop app's checks still read the record.
+**Autostart is opt-in, through `twr phone` alone:**
+
+- `twr phone` turns it on. It also saves the `listen` of the pinned gateway it pairs through, the one it started or the one it found running, so a later autostart listens there too: the default pair (`0.0.0.0:47321` and `[::]:47321`) is saved as an empty `listen`, any other set as itself.
+- `twr phone off` turns it off, and so does `--stop-gateway` (the desktop app's "Stop gateway") whenever settings exist: a gateway someone stopped stays stopped.
+- A gateway started any other way, by the desktop app or a bare `twr gateway`, never turns it on. With no settings it writes none, unless it is given `--address`, which it saves with autostart off.
+
+So a desktop user who never ran `twr phone` never gets a gateway started for them. A test's hub (a debug build under `TWR_HOME`) and `TWR_GATEWAY_AUTOSTART=off` never start one.
+
+`--gateway-info` adds `"pin"` (absent in certificate mode) and `"routes"`, the list the gateway would put in an invitation now. Both are absent while a certificate-mode gateway runs. When no gateway runs, they describe the pinned gateway that would start, if its identity exists. A running gateway's record also carries `"mode"`: `pinned`, `certificate` or `development`. Its `"listen"` is the first address it listens on, one `host:port`, and `"listens"` lists every one, `listen` first: a pinned gateway on all addresses has `"listen":"0.0.0.0:47321","listens":["0.0.0.0:47321","[::]:47321"]`. A gateway older than `listens` joined them all in `listen` with commas, so readers take `listens` when it is there and split `listen` on commas when it isn't. A pinned gateway's `tls_cert` and `tls_key` are its `identity-cert.pem` and `identity-key.pem`, so the desktop app's checks still read the record.
 
 ## Client rules settled in implementation (2026-11-23)
 

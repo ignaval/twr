@@ -525,8 +525,11 @@ mod socket_tests {
         assert_eq!(attempt("[2001:db8:1::1]:1").await, StatusCode::BAD_REQUEST);
     }
     /// A hub that answers a gateway's owner calls from the device store in `dir`, as the hub
-    /// does: `hello` as the user, `device.pair_proof` from the open invitation.
-    async fn proof_hub(dir: &Path) -> twr_core::client::Client {
+    /// does: `hello` as the user, `device.pair_proof` from the open invitation. An `older` one
+    /// answers as a twr before 12-symbol codes: `device.pair_begin` with a 10-symbol code,
+    /// `device.pair_cancel` (noting the code in `dir`'s `cancelled`), and no
+    /// `device.pair_proof`.
+    async fn proof_hub(dir: &Path, older: bool) -> twr_core::client::Client {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use twr_core::phone_pairing::{b64url_decode, b64url_encode, decode_pin};
         let path = dir.join("hub.sock");
@@ -543,6 +546,17 @@ mod socket_tests {
                         let (id, p) = (&request["id"], &request["params"]);
                         let reply = match request["method"].as_str().unwrap() {
                             "hello" => json!({"id":id,"result":{"identity":"user:local"}}),
+                            "device.pair_begin" if older => {
+                                json!({"id":id,"result":{"code":"ABCDEFGHJK","expires_in":300}})
+                            }
+                            "device.pair_cancel" if older => {
+                                let code = p["code"].as_str().unwrap();
+                                std::fs::write(store.join("cancelled"), code).unwrap();
+                                json!({"id":id,"result":{"cancelled":true}})
+                            }
+                            "device.pair_proof" if older => json!({"id":id,"error":{
+                                "code":"method_not_found",
+                                "message":"unknown method device.pair_proof"}}),
                             "device.pair_proof" => {
                                 let pin = decode_pin(p["pin"].as_str().unwrap()).unwrap();
                                 let nonce = b64url_decode(p["nonce"].as_str().unwrap()).unwrap();
@@ -575,6 +589,10 @@ mod socket_tests {
     }
     /// A pinned gateway over the device store in `dir`, with [`proof_hub`] as its hub.
     async fn pinned_server(dir: &Path) -> (Shared, identity::Identity) {
+        pinned_server_of(dir, false).await
+    }
+    /// [`pinned_server`], its hub an `older` one or not ([`proof_hub`]).
+    async fn pinned_server_of(dir: &Path, older: bool) -> (Shared, identity::Identity) {
         use std::os::unix::fs::PermissionsExt;
         let _ = rustls::crypto::ring::default_provider().install_default();
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -583,7 +601,7 @@ mod socket_tests {
             Auth::open(dir).unwrap(),
             remote::push::Push::new(dir, None, None).unwrap(),
             remote::receipts::Receipts::new(dir).unwrap(),
-            Some(proof_hub(dir).await),
+            Some(proof_hub(dir, older).await),
             (
                 dir.join("twr"),
                 remote::companion::Command::program(dir.join("twr-desktop-bridge")),
@@ -686,6 +704,38 @@ mod socket_tests {
             StatusCode::NOT_FOUND
         );
     }
+    /// A hub from a twr before 12-symbol codes and typed pairing: its code is cancelled and
+    /// the gateway says to restart it, both when it begins an invitation and when a phone asks
+    /// for a proof (404, as for no invitation, never 503 or "not a pairing code").
+    #[tokio::test]
+    async fn an_older_hub_is_named_as_such() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _) = pinned_server_of(dir.path(), true).await;
+        let nonce = twr_core::phone_pairing::b64url_encode(&[5u8; 32]);
+        let (status, body) = ask_proof(&server, "192.0.2.1:1", &nonce).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let error = body["error"].as_str().unwrap();
+        assert!(
+            error.contains("older twr") && error.contains("twr hub stop"),
+            "{error}"
+        );
+        let mut owner = server.owner.lock().await.take().unwrap();
+        let pinned = PinnedInvitation {
+            pin: "p".repeat(43),
+            iroh: String::new(),
+            routes: vec![routes::configured("192.0.2.4", 47321).unwrap()],
+        };
+        for pinned in [Some(&pinned), None] {
+            let _ = std::fs::remove_file(dir.path().join("cancelled"));
+            let error = begin_invitation(&mut owner, &["read"], dir.path(), pinned)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, OLDER_HUB);
+            let cancelled = std::fs::read_to_string(dir.path().join("cancelled")).unwrap();
+            assert_eq!(cancelled, "ABCDEFGHJK");
+        }
+    }
     /// `/health` says protocol 2 and the pin in pinned mode only; certificate mode stays 1.
     #[tokio::test]
     async fn health_carries_the_pin_in_pinned_mode() {
@@ -700,6 +750,27 @@ mod socket_tests {
         let Json(plain) = health(State(test_server(plain.path()))).await;
         assert_eq!(plain["protocol"], 1, "released desktop clients require 1");
         assert!(plain.get("pin").is_none());
+    }
+    /// A running gateway's record names its listeners in `listens`, `listen` being the first
+    /// alone; a gateway before `listens` joined them all in `listen` with commas.
+    #[test]
+    fn the_record_names_every_listener() {
+        let both: Vec<SocketAddr> = vec![
+            "0.0.0.0:47321".parse().unwrap(),
+            "[::]:47321".parse().unwrap(),
+        ];
+        let record = remote::gateway_lifecycle::Info {
+            listens: both.iter().map(ToString::to_string).collect(),
+            ..remote::gateway_lifecycle::Info::new("g".into(), both[0].to_string(), None, None)
+                .unwrap()
+        };
+        let record = serde_json::to_value(&record).unwrap();
+        assert_eq!(record["listen"], "0.0.0.0:47321");
+        assert_eq!(record["listens"], json!(["0.0.0.0:47321", "[::]:47321"]));
+        assert_eq!(listeners_of(&record), both);
+        let older = json!({"listen": "0.0.0.0:47321,[::]:47321"});
+        assert_eq!(listeners_of(&older), both);
+        assert!(listeners_of(&json!({})).is_empty());
     }
     /// `--pair --json` in pinned mode: today's fields, the version 2 invitation and its link;
     /// in certificate mode today's fields alone.
@@ -1308,6 +1379,16 @@ async fn pair_proof(
                 .is_some_and(|e| e.code == twr_core::proto::codes::NOT_FOUND) =>
         {
             none_open()
+        }
+        // A hub older than typed pairing has no invitation this twr made, and no proofs.
+        Err(error)
+            if error
+                .downcast_ref::<twr_core::proto::RpcError>()
+                .is_some_and(|e| e.code == twr_core::proto::codes::METHOD_NOT_FOUND) =>
+        {
+            crate::gateway_log!("Typed pairing refused: {OLDER_HUB}");
+            let message = format!("No pairing invitation is open: {OLDER_HUB}");
+            (StatusCode::NOT_FOUND, Json(json!({ "error": message })))
         }
         _ => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2522,20 +2603,11 @@ pub async fn run(args: Args, programs: Programs) -> Result<()> {
     let (binary, companion) = programs.resolve(args.binary_dir.as_deref())?;
     let paths = twr_core::paths::Paths::from_env_in(Some("default"))?;
     let mobile_dir = paths.config_file.with_file_name("mobile");
-    // A pinned gateway that serves keeps its settings, and `--address` is saved for later runs.
-    // Administration alone (the desktop app's `--gateway-info`, `--pair-only`, …, which name no
-    // certificate) writes none: settings turn autostart on.
-    let administration = args.pair_only
-        || args.list_devices
-        || args.gateway_info
-        || args.stop_gateway
-        || args.cancel_invitation
-        || args.revoke.is_some();
+    // A pinned gateway's saved settings, with `--address` saved for later runs. Only `twr
+    // phone` turns autostart on: a gateway started any other way (the desktop app, a bare
+    // `twr gateway`) never does.
     let settings = match mode {
-        Mode::Pinned if !administration || args.address.is_some() => {
-            Some(settings_with(&mobile_dir, args.address.as_deref())?)
-        }
-        Mode::Pinned => Some(settings::Settings::load(&mobile_dir)?.unwrap_or_default()),
+        Mode::Pinned => Some(settings_with(&mobile_dir, args.address.as_deref())?),
         _ => None,
     };
     if args.gateway_info {
@@ -2543,6 +2615,13 @@ pub async fn run(args: Args, programs: Programs) -> Result<()> {
         return Ok(());
     }
     if args.stop_gateway {
+        // Stopped is stopped: a hub that starts doesn't bring it back (`twr phone` does).
+        if let Some(mut saved) = settings::Settings::load(&mobile_dir)? {
+            if saved.autostart {
+                saved.autostart = false;
+                saved.save(&mobile_dir)?;
+            }
+        }
         remote::gateway_lifecycle::stop(
             &mobile_dir,
             args.expected_instance
@@ -2618,25 +2697,18 @@ pub async fn run(args: Args, programs: Programs) -> Result<()> {
         Mode::Pinned => Some(identity::Identity::ensure(&mobile_dir)?),
         _ => None,
     };
-    let default_port = |ip: IpAddr| SocketAddr::new(ip, DEFAULT_PORT);
     let wanted: Vec<(SocketAddr, bool)> = match (args.listen, &settings) {
         (Some(listen), _) => vec![(listen, true)],
         (None, Some(settings)) if !settings.listen.is_empty() => {
             settings.listen.iter().map(|l| (*l, true)).collect()
         }
         // Every IPv4 address, and IPv6's too where it binds.
-        (None, Some(_)) => vec![
-            (
-                default_port(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
-                true,
-            ),
-            (
-                default_port(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)),
-                false,
-            ),
-        ],
+        (None, Some(_)) => {
+            let [v4, v6] = ALL_ADDRESSES;
+            vec![(v4, true), (v6, false)]
+        }
         (None, None) => vec![(
-            default_port(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), DEFAULT_PORT),
             true,
         )],
     };
@@ -2654,11 +2726,7 @@ pub async fn run(args: Args, programs: Programs) -> Result<()> {
         .iter()
         .map(std::net::TcpListener::local_addr)
         .collect::<std::io::Result<_>>()?;
-    let listen = bound
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
+    let listens: Vec<String> = bound.iter().map(ToString::to_string).collect();
     let (cert_path, key_path) = match (&identity, &args.tls_cert, &args.tls_key) {
         (Some(_), _, _) => (
             Some(mobile_dir.join(identity::CERT_FILE)),
@@ -2666,12 +2734,15 @@ pub async fn run(args: Args, programs: Programs) -> Result<()> {
         ),
         (None, cert, key) => (cert.clone(), key.clone()),
     };
+    // `listen` is the first address alone, as older readers of the record parse it; `listens`
+    // has them all.
     let mut info = remote::gateway_lifecycle::Info::new(
         push.gateway_id.clone(),
-        listen.clone(),
+        listens.first().cloned().unwrap_or_default(),
         cert_path.as_deref(),
         key_path.as_deref(),
     )?;
+    info.listens = listens.clone();
     info.mode = mode.name().into();
     info.pin = identity.as_ref().map(|i| i.pin.clone());
     let mut lifecycle = remote::gateway_lifecycle::Lifecycle::acquire(&mobile_dir, info)?;
@@ -2726,7 +2797,8 @@ pub async fn run(args: Args, programs: Programs) -> Result<()> {
     let connections = server.connections.clone();
     let app = router(server).into_make_service_with_connect_info::<SocketAddr>();
     crate::gateway_log!(
-        "twr mobile gateway listening on {listen} ({} mode)",
+        "twr mobile gateway listening on {} ({} mode)",
+        listens.join(", "),
         mode.name()
     );
     // Every listener serves, until one fails or the gateway is asked to stop.
@@ -2885,6 +2957,12 @@ pub async fn run(args: Args, programs: Programs) -> Result<()> {
 
 /// The gateway's port when none is given.
 pub const DEFAULT_PORT: u16 = 47321;
+/// Where a pinned gateway listens when its settings name nowhere: every IPv4 address, and
+/// every IPv6 one where IPv6 binds.
+pub const ALL_ADDRESSES: [SocketAddr; 2] = [
+    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), DEFAULT_PORT),
+    SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), DEFAULT_PORT),
+];
 
 /// How a gateway serves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2924,17 +3002,15 @@ fn bind(address: SocketAddr) -> std::io::Result<std::net::TcpListener> {
     Ok(socket.into())
 }
 
-/// The pinned gateway's saved settings in `dir`, made (with autostart on) if there were none,
-/// with `address` saved when given.
+/// The pinned gateway's saved settings in `dir` (the defaults, autostart off, when there are
+/// none), with `address` saved when given. Nothing is written without one.
 fn settings_with(dir: &Path, address: Option<&str>) -> Result<settings::Settings> {
     let saved = settings::Settings::load(dir)?;
-    let mut settings = saved.clone().unwrap_or(settings::Settings {
-        autostart: true,
-        ..Default::default()
-    });
-    if let Some(address) = address {
-        settings.set_address(address)?;
-    }
+    let mut settings = saved.clone().unwrap_or_default();
+    let Some(address) = address else {
+        return Ok(settings);
+    };
+    settings.set_address(address)?;
     if saved.as_ref() != Some(&settings) {
         settings.save(dir)?;
     }
@@ -2948,10 +3024,15 @@ pub struct PinnedInvitation {
     pub routes: Vec<twr_core::phone_pairing::Route>,
 }
 
-/// The listeners `listen` names (`Info::listen`: comma-separated).
-fn listeners_of(listen: &str) -> Vec<SocketAddr> {
-    listen
-        .split(',')
+/// The listeners a running gateway's record `info` names: its `listens`, or from a gateway
+/// before them, its `listen` (which joined them with commas).
+pub fn listeners_of(info: &Value) -> Vec<SocketAddr> {
+    let listens: Vec<&str> = match info["listens"].as_array() {
+        Some(listens) => listens.iter().filter_map(Value::as_str).collect(),
+        None => info["listen"].as_str().unwrap_or("").split(',').collect(),
+    };
+    listens
+        .iter()
         .filter_map(|l| l.trim().parse().ok())
         .collect()
 }
@@ -2968,7 +3049,7 @@ pub async fn running_pinned(dir: &Path) -> Result<Option<PinnedInvitation>> {
         info["pin"] == identity.pin.as_str(),
         "the running gateway serves another key than its directory holds: restart it"
     );
-    let listeners = listeners_of(info["listen"].as_str().unwrap_or(""));
+    let listeners = listeners_of(&info);
     Ok(Some(PinnedInvitation {
         pin: identity.pin,
         iroh: identity.iroh,
@@ -2985,14 +3066,11 @@ pub async fn gateway_info(dir: &Path) -> Result<Value> {
         return Ok(info);
     }
     let listeners = if running {
-        listeners_of(info["listen"].as_str().unwrap_or(""))
+        listeners_of(&info)
     } else {
         match settings::Settings::load(dir)? {
             Some(settings) if !settings.listen.is_empty() => settings.listen,
-            _ => vec![
-                SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), DEFAULT_PORT),
-                SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), DEFAULT_PORT),
-            ],
+            _ => ALL_ADDRESSES.to_vec(),
         }
     };
     if let Some(identity) = identity::Identity::load(dir)? {
@@ -3080,14 +3158,22 @@ pub async fn begin_invitation(
             .unwrap_or(300)
             .min(twr_core::devices::PAIRING_SECONDS);
     let gateway_id = std::fs::read_to_string(dir.join("gateway-id")).unwrap_or_default();
-    match pair_json(code, expires_at, scopes, gateway_id.trim(), pinned) {
-        Ok(line) => Ok(line),
-        Err(error) => {
-            let _ = owner.call("device.pair_cancel", json!({"code":code})).await;
-            Err(error)
-        }
+    // A hub older than 12-symbol codes makes 10-symbol ones, which nothing of this twr takes.
+    let line = match twr_core::phone_pairing::normalize_code(code) {
+        Some(_) => pair_json(code, expires_at, scopes, gateway_id.trim(), pinned),
+        None => Err(anyhow::anyhow!(OLDER_HUB)),
+    };
+    if line.is_err() {
+        let _ = owner.call("device.pair_cancel", json!({"code":code})).await;
     }
+    line
 }
+
+/// What the gateway, `twr phone` and the TUI say when the hub that runs is from a twr older
+/// than 12-symbol pairing codes and `device.pair_proof`.
+pub const OLDER_HUB: &str = "the twr hub that runs is from an older twr, which can't pair \
+                             phones with this one: restart it (`twr hub stop`, then run twr \
+                             again)";
 /// [`begin_invitation`], printed: as its JSON line with `json`, else as lines.
 async fn announce_pairing(
     owner: &mut twr_core::client::Client,

@@ -260,6 +260,12 @@ fn a_phone_pairs_by_typed_code_with_a_pinned_gateway() {
     });
     assert_eq!(info["mode"], "pinned");
     let address: SocketAddr = info["listen"].as_str().unwrap().parse().unwrap();
+    assert_eq!(info["listens"], json!([address.to_string()]));
+    let settings = home.join("mobile").join("gateway-settings.json");
+    assert!(
+        !settings.exists(),
+        "a gateway started without `twr phone` turns no autostart on"
+    );
     let pin = twr_core::phone_pairing::decode_pin(info["pin"].as_str().unwrap()).unwrap();
     let route = format!("tls:{address}");
     assert_eq!(info["routes"], json!([route]));
@@ -371,6 +377,32 @@ fn a_phone_pairs_by_typed_code_with_a_pinned_gateway() {
     let devices: Value = serde_json::from_slice(&devices.stdout).unwrap();
     assert_eq!(devices[0]["name"], "Test phone");
 
+    // `twr phone` through the gateway that runs: it turns autostart on and saves where that
+    // gateway listens. Told to stop, it cancels its invitation.
+    let mut phone = Killed(
+        command(home, &["phone", "--json"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut lines = std::io::BufReader::new(phone.0.stdout.take().unwrap());
+    let mut read_line = || {
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut lines, &mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap_or(Value::Null)
+    };
+    let opened = read_line();
+    assert_eq!(opened["code"].as_str().map(str::len), Some(12), "{opened}");
+    let saved: Value = serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(saved["autostart"], true);
+    assert_eq!(saved["listen"], json!([address.to_string()]));
+    // SAFETY: a signal to our own, unreaped child.
+    unsafe { libc::kill(phone.0.id() as i32, libc::SIGTERM) };
+    assert_eq!(read_line(), json!({"cancelled": true}));
+
+    // The desktop's "Stop gateway": it stays stopped, a hub that starts won't start it.
     let instance = info["instance"].as_str().unwrap();
     let out = twr(
         home,
@@ -384,6 +416,9 @@ fn a_phone_pairs_by_typed_code_with_a_pinned_gateway() {
     poll("the gateway to stop", || {
         gateway.0.try_wait().ok().flatten().map(|_| ())
     });
+    let saved: Value = serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(saved["autostart"], false);
+    assert_eq!(saved["listen"], json!([address.to_string()]));
     let _ = twr(home, &["hub", "stop"]);
 }
 

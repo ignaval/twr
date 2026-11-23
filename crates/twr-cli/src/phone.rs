@@ -62,7 +62,7 @@ pub async fn pair(level: &str, address: Option<&str>, json: bool) -> anyhow::Res
     }
     let scopes = phone::scopes_of(level).context("unknown access level")?;
     let dir = phone::gateway_dir()?;
-    // `twr phone` turns autostart (back) on, and saves `--address`.
+    // `twr phone` alone turns autostart (back) on, and saves `--address`.
     let saved = gateway::settings::Settings::load(&dir)?;
     let mut settings = saved.clone().unwrap_or_default();
     settings.autostart = true;
@@ -73,7 +73,9 @@ pub async fn pair(level: &str, address: Option<&str>, json: bool) -> anyhow::Res
         settings.save(&dir)?;
     }
     let program = phone::this_program()?;
-    let started = phone::ensure_running(&program, &dir).await?.1;
+    let (info, started) = phone::ensure_running(&program, &dir).await?;
+    // Where it listens now is where a hub that starts it later has it listen.
+    phone::remember_listen(&dir, &info)?;
     if started && !json {
         outln!("Started the phone gateway: it runs on its own now.");
     }
