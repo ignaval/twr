@@ -35,8 +35,6 @@ import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.net.SocketFactory;
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.TrustManager;
 import okhttp3.*;
 import org.json.*;
 import tools.twr.mobile.dev.pairing.Base64Url;
@@ -45,8 +43,6 @@ import tools.twr.mobile.dev.pairing.HubMismatchException;
 import tools.twr.mobile.dev.pairing.NetworkType;
 import tools.twr.mobile.dev.pairing.PairingProof;
 import tools.twr.mobile.dev.pairing.PinCapture;
-import tools.twr.mobile.dev.pairing.PinnedHostnameVerifier;
-import tools.twr.mobile.dev.pairing.PinnedTrustManager;
 import tools.twr.mobile.dev.pairing.Pins;
 import tools.twr.mobile.dev.pairing.Route;
 import tools.twr.mobile.dev.pairing.RouteRace;
@@ -247,11 +243,7 @@ public class TwrTransportPlugin extends Plugin {
     private synchronized OkHttpClient pinnedClient(String pin) throws java.security.GeneralSecurityException {
         OkHttpClient client=pinnedClients.get(pin);
         if(client!=null)return client;
-        PinnedTrustManager trust=new PinnedTrustManager(pin);
-        SSLContext context=SSLContext.getInstance("TLS");
-        context.init(null,new TrustManager[]{trust},null);
-        ConnectionSpec spec=new ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS).tlsVersions(TlsVersion.TLS_1_3,TlsVersion.TLS_1_2).build();
-        client=http.newBuilder().sslSocketFactory(context.getSocketFactory(),trust).hostnameVerifier(new PinnedHostnameVerifier(trust)).connectionSpecs(Collections.singletonList(spec)).connectTimeout(PROBE_TIMEOUT_SECONDS,TimeUnit.SECONDS).build();
+        client=PinnedHttp.client(http,pin,PROBE_TIMEOUT_SECONDS);
         pinnedClients.put(pin,client);
         return client;
     }

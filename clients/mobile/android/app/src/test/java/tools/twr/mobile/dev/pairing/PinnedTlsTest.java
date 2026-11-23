@@ -49,8 +49,8 @@ public class PinnedTlsTest {
     @BeforeClass
     public static void certificates() throws Exception {
         dir = Files.createTempDirectory("twr-pinned-tls").toFile();
-        current = new Server(certificate("current", false));
-        expired = new Server(certificate("expired", true));
+        current = new Server(certificate(dir, "current", false));
+        expired = new Server(certificate(dir, "expired", true));
     }
 
     @AfterClass
@@ -195,7 +195,7 @@ public class PinnedTlsTest {
     }
 
     /** A PKCS#12 keystore holding a self-signed P-256 certificate like the gateway's identity. */
-    private static File certificate(String name, boolean expired) throws Exception {
+    static File certificate(File dir, String name, boolean expired) throws Exception {
         File store = new File(dir, name + ".p12");
         String keytool = new File(System.getProperty("java.home"), "bin/keytool").getPath();
         List<String> command = new ArrayList<>(Arrays.asList(keytool, "-genkeypair", "-alias", "hub", "-keyalg", "EC",
@@ -204,7 +204,7 @@ public class PinnedTlsTest {
                 "-storetype", "PKCS12", "-storepass", "changeit", "-keypass", "changeit"));
         if (expired) command.addAll(Arrays.asList("-startdate", "-10d", "-validity", "1"));
         else command.addAll(Arrays.asList("-validity", "800"));
-        if (new File(keytool).canExecute() && run(command)) return store;
+        if (new File(keytool).canExecute() && run(dir, command)) return store;
         // No keytool beside this JVM: the openssl CLI.
         File key = new File(dir, name + "-key.pem");
         File cert = new File(dir, name + "-cert.pem");
@@ -214,15 +214,15 @@ public class PinnedTlsTest {
                 "-addext", "extendedKeyUsage=serverAuth", "-sha256"));
         if (expired) request.addAll(Arrays.asList("-not_before", "20200101000000Z", "-not_after", "20200102000000Z"));
         else request.addAll(Arrays.asList("-days", "800"));
-        if (!run(request)) throw new IOException("neither keytool nor openssl could make a certificate");
-        if (!run(Arrays.asList("openssl", "pkcs12", "-export", "-in", cert.getPath(), "-inkey", key.getPath(),
+        if (!run(dir, request)) throw new IOException("neither keytool nor openssl could make a certificate");
+        if (!run(dir, Arrays.asList("openssl", "pkcs12", "-export", "-in", cert.getPath(), "-inkey", key.getPath(),
                 "-name", "hub", "-out", store.getPath(), "-passout", "pass:changeit"))) {
             throw new IOException("openssl pkcs12 failed");
         }
         return store;
     }
 
-    private static boolean run(List<String> command) throws Exception {
+    private static boolean run(File dir, List<String> command) throws Exception {
         Process process;
         try {
             process = new ProcessBuilder(command).redirectErrorStream(true).redirectOutput(new File(dir, "tool.log")).start();
