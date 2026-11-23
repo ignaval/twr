@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds the iOS app's vendored Argon2id (App/TwrArgon2) with the host C compiler and checks
 # it against the phone-pairing test vector, then checks the rest of the proof derivation
-# (HKDF-SHA256, HMAC-SHA256, the pin) from that output with Python's standard library.
+# (HKDF-SHA256, HMAC-SHA256, the pin) from that output with Python's standard library, and
+# that AppTests/PairingLogicTests.swift still carries the fixture's values.
 # Runs anywhere with cc and python3; no Xcode needed.
 set -euo pipefail
 
@@ -63,4 +64,15 @@ message = b"twr-mobile-pin-v2\x00" + pin + nonce + f["gateway_id"].encode()
 proof = hmac.new(key, message, hashlib.sha256).digest()
 assert b64url(proof) == f["proof_b64url"], ("proof", b64url(proof), f["proof_b64url"])
 print("HKDF proof key, pin and proof match the fixture")
+PY
+
+# AppTests can't read the repository, so PairingLogicTests.swift carries copies of the vectors.
+python3 -I - "$fixture" "$here/../App/AppTests/PairingLogicTests.swift" <<'PY'
+import json, sys
+f = json.load(open(sys.argv[1]))
+tests = open(sys.argv[2]).read()
+names = ["code", "spki_hex", "pin", "stretched_hex", "proof_key_hex", "nonce_b64url", "gateway_id", "proof_b64url"]
+stale = [name for name in names if f'"{f[name]}"' not in tests]
+assert not stale, f"PairingLogicTests.swift is out of date with the fixture: {stale}"
+print("PairingLogicTests.swift carries the fixture's vectors")
 PY
