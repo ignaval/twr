@@ -191,6 +191,9 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
                     throw Failure(String((detail ?? "Pairing failed. Check the code and hub URL.").prefix(240)))
                 }
                 guard (response as? HTTPURLResponse)?.statusCode == 200, var record = try JSONSerialization.jsonObject(with: data) as? [String: Any], let token = record["token"] as? String, token.count == 64 else { throw Failure("Pairing failed. Check the code and hub URL.") }
+                // The mode is how it was paired: a field in the answer never makes this a pinned
+                // hub, so a credential never crosses modes.
+                for pinned in ["pin", "iroh", "routes", "last", "route"] { record.removeValue(forKey: pinned) }
                 let id = UUID().uuidString; record["url"] = url.absoluteString; record["name"] = call.getString("hubName") ?? "My hub"
                 try insertHub(id, record)
                 call.resolve(metadata(id, record))

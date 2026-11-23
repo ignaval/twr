@@ -293,11 +293,24 @@ export class DesktopTransport {
           ? data.error.slice(0, 240)
           : "Pairing failed. Check the code and hub URL.",
       );
-    const hub = record.parse({
-      ...data,
+    // The mode is how it was paired: a field in the answer never makes this a pinned hub,
+    // so a credential never crosses modes.
+    const {
+      pin: _pin,
+      iroh: _iroh,
+      routes: _routes,
+      last: _last,
+      route: _route,
+      ...answer
+    } = data && typeof data === "object" ? data : ({} as any);
+    const parsedHub = record.safeParse({
+      ...answer,
       url: checked.url,
       name: request.hubName,
     });
+    if (!parsedHub.success)
+      throw new Error("Pairing failed. Check the code and hub URL.");
+    const hub = parsedHub.data;
     if (checked.gatewayId && hub.gateway_id !== checked.gatewayId)
       throw new Error("Gateway identity changed during pairing");
     return this.save(all, hub);

@@ -10,7 +10,9 @@ const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => {
   for (const close of cleanup.splice(0)) await close();
 });
-async function fixture(options: { legacy?: boolean; mismatch?: boolean } = {}) {
+async function fixture(
+  options: { legacy?: boolean; mismatch?: boolean; answer?: object } = {},
+) {
   let paired = false;
   let rejectStatus = 0;
   let authenticate = true;
@@ -38,6 +40,7 @@ async function fixture(options: { legacy?: boolean; mismatch?: boolean } = {}) {
             JSON.stringify({
               token,
               scopes: ["read"],
+              ...options.answer,
               ...(options.legacy
                 ? {}
                 : { gateway_id: options.mismatch ? "other-gateway" : gateway }),
@@ -123,6 +126,33 @@ describe("native desktop gateway adapter", () => {
         hubName: "Legacy",
       }),
     ).rejects.toThrow("already paired");
+  });
+  it("never keeps pinned fields from a certificate-mode answer", async () => {
+    const f = await fixture({
+      answer: {
+        pin: "A".repeat(43),
+        iroh: "endpoint",
+        routes: [{ route: "tls:203.0.113.4:47321", seen: 1 }],
+        last: { wifi: "tls:203.0.113.4:47321" },
+        route: "tls:203.0.113.4:47321",
+      },
+    });
+    const hub = await f.native.pair({
+      url: f.url,
+      code: "code",
+      name: "Desktop",
+      hubName: "Cert",
+    });
+    for (const field of ["pin", "routes", "route"])
+      expect(hub).not.toHaveProperty(field);
+    const saved = Object.values(JSON.parse(f.data.get("remote-hubs")!))[0];
+    expect(Object.keys(saved as object).sort()).toEqual([
+      "gateway_id",
+      "name",
+      "scopes",
+      "token",
+      "url",
+    ]);
   });
   it("rejects a known identity mismatch without persisting credentials", async () => {
     const f = await fixture({ mismatch: true });
