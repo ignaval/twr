@@ -28,6 +28,9 @@ pub enum CompactPane {
 pub enum Slash {
     /// Show a private one-time code to use this terminal host as a runner.
     Runner,
+    /// Pair a phone: a private invitation (QR code, link, code) with this access level
+    /// (`read-only`, `operate`, `terminal`, `admin`), or a choice of one when `None`.
+    Phone { level: Option<String> },
     /// `/clear`: reset the orchestrator without carrying the conversation over.
     Clear,
     /// `/open [thread]`: talk to a worker thread directly (dive in); default: the selected card.
@@ -922,6 +925,12 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
         &[],
     ),
     (
+        "/phone",
+        "/phone [read-only|operate|terminal|admin]",
+        "pair a phone: shows a private QR code and one-use code",
+        &[],
+    ),
+    (
         "/accounts",
         "/accounts",
         "every runtime's accounts and their logins",
@@ -1167,6 +1176,9 @@ pub const ACCESS_LEVELS: &[(&str, &str)] = &[
     ("full", "every tool, its shell included, without asking"),
 ];
 
+/// The access levels `/phone` offers, narrowest first.
+pub const PHONE_LEVELS: &[&str] = &["read-only", "operate", "terminal", "admin"];
+
 /// Whether command `name` (canonical) takes arguments at all.
 pub fn takes_args(name: &str) -> bool {
     COMMANDS
@@ -1364,6 +1376,13 @@ pub fn parse(line: &str) -> Result<Slash, String> {
             })
         }
         "/runner" if args.is_empty() => Ok(Slash::Runner),
+        "/phone" => match args {
+            [] => Ok(Slash::Phone { level: None }),
+            [level] if PHONE_LEVELS.contains(&level.as_str()) => Ok(Slash::Phone {
+                level: Some(level.to_string()),
+            }),
+            _ => bad(),
+        },
         "/accounts" if args.is_empty() => Ok(Slash::Accounts),
         "/new" => {
             let mut project = None;
@@ -3212,6 +3231,7 @@ mod tests {
                 "/mode",
                 "/model",
                 "/account",
+                "/phone",
                 "/accounts",
                 "/loop",
                 "/compact-context",
@@ -3228,6 +3248,7 @@ mod tests {
         assert_eq!(
             names("/P", &pools),
             [
+                "/phone",
                 "/park",
                 "/pin",
                 "/parked",

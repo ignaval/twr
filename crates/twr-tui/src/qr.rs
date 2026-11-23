@@ -51,13 +51,31 @@ pub fn half_blocks(text: &str) -> Option<Vec<String>> {
     )
 }
 
-/// What to put in an invitation's code for a terminal `columns` wide: its `link` when that
-/// fits (a phone's camera opens the app with it), else its `json` (the app's scanner reads that
-/// too), else nothing.
-pub fn pick<'a>(link: &'a str, json: &'a str, columns: usize) -> Option<&'a str> {
-    [link, json]
-        .into_iter()
-        .find(|text| width(text).is_some_and(|w| w <= columns))
+/// What a terminal's QR code of version 2 invitation `invitation` carries: its JSON without
+/// the optional `iroh` and `scopes` (phones learn `iroh` over the connection), which keeps a
+/// typical invitation within 80 columns. Every scanner reads the JSON; the `twr://pair#` link,
+/// a third larger in base64, goes beside the code as text.
+pub fn invitation_text(invitation: &serde_json::Value) -> String {
+    let mut slim = invitation.clone();
+    if let Some(object) = slim.as_object_mut() {
+        object.remove("iroh");
+        object.remove("scopes");
+    }
+    slim.to_string()
+}
+
+/// The QR version of `text`'s code (1 to 40).
+pub fn version(text: &str) -> Option<i16> {
+    let code =
+        qrcode::QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::L).ok()?;
+    match code.version() {
+        qrcode::Version::Normal(v) | qrcode::Version::Micro(v) => Some(v),
+    }
+}
+
+/// Whether `text`'s code fits `columns`.
+pub fn fits(text: &str, columns: usize) -> bool {
+    width(text).is_some_and(|w| w <= columns)
 }
 
 /// `lines` for a terminal: each black on white, the colours reset at its end.
@@ -98,20 +116,37 @@ mod tests {
         );
     }
 
-    /// An invitation's link, three routes and an iroh id with it, takes more than 80 columns;
-    /// its JSON fits.
+    /// A three-route invitation, without `iroh` and `scopes`, fits 80 columns: 282 bytes, version
+    /// 11 at low error correction, 61 modules and 65 columns with the quiet zone (in full: 384
+    /// bytes, version 13, 73 columns). Its link would not (version 16, 85 columns).
     #[test]
-    fn an_invitation_falls_back_to_its_json_in_80_columns() {
+    fn a_three_route_invitation_fits_80_columns() {
         let json = r#"{"type":"twr-pair","version":2,"id":"8b0f5c7e-2a44-4b8e-9d21-6a4e1c3f7b90","name":"box","pin":"m5zL1y2tJm0W4cTGsl3xn0Hc6aM1yhsAa0Tq3hdyKdM","iroh":"ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6","code":"ABCDEFGHJK23","expiresAt":1763900000000,"routes":["tls:192.168.1.20:47321","tls:[2001:db8::5]:47321","tls:box.tail1234.ts.net:47321"],"scopes":["read","operate"]}"#;
+        let invitation: serde_json::Value = serde_json::from_str(json).unwrap();
+        let text = invitation_text(&invitation);
+        assert!(!text.contains("iroh") && !text.contains("scopes"));
+        let parsed = twr_core::phone_pairing::Invitation::parse(&text).unwrap();
+        assert_eq!(parsed.iroh, None);
+        assert_eq!(parsed.routes.len(), 3);
+        assert_eq!(
+            (text.len(), version(&text), width(&text)),
+            (282, Some(11), Some(65))
+        );
+        assert!(fits(&text, 80) && !fits(&text, 64));
+        // In full, and as a link, for comparison.
+        assert_eq!(
+            (json.len(), version(json), width(json)),
+            (384, Some(13), Some(73))
+        );
         let link = format!(
             "twr://pair#{}",
             twr_core::phone_pairing::b64url_encode(json.as_bytes())
         );
-        assert!(width(&link).unwrap() > 80);
-        assert!(width(json).unwrap() <= 80);
-        assert_eq!(pick(&link, json, 80), Some(json));
-        assert_eq!(pick(&link, json, 200), Some(link.as_str()));
-        assert_eq!(pick(&link, json, 40), None);
+        assert_eq!(
+            (link.len(), version(&link), width(&link)),
+            (523, Some(16), Some(85))
+        );
+        assert!(!fits(&link, 80));
         assert!(modules(&"x".repeat(4000)).is_none());
     }
 }

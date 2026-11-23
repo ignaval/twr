@@ -214,4 +214,22 @@ In pinned mode, `--pair --pair-json`, and `twr gateway --pair --pair-json` once 
 
 `expires_at` is seconds, as today; the invitation's `expiresAt` is milliseconds. In certificate mode the output is unchanged, with no `invitation` and no `link`.
 
+**Terminal QR codes.** `twr phone` and the TUI's `/phone` draw a QR code of the invitation JSON without its optional `iroh` and `scopes`, which every scanner accepts. They print the `twr://pair#` link beside it as text, for copy, paste and tap. Base64 makes the link a third larger. At low error correction, with a 2-module quiet zone, a three-route invitation takes:
+
+| Payload | Bytes | QR version | Columns |
+|---|---|---|---|
+| JSON without `iroh` and `scopes` (drawn) | 282 | 11 | 65 |
+| Full JSON | 384 | 13 | 73 |
+| Link | 523 | 16 | 85 |
+
+When the drawn code doesn't fit the terminal, they say so and show the link, the code and the addresses to type.
+
+**Starting with the hub.** When the default workspace's hub starts and answers, it starts the pinned gateway, detached, if all of these hold:
+
+- the saved settings have `autostart` on (`twr phone` turns it on, `twr phone off` off; a pinned gateway that starts with no settings writes them with it on);
+- no gateway runs;
+- a device is paired, or an invitation is open.
+
+Without saved settings it never starts one, so a desktop user whose certificate-mode gateway keeps no settings never gets a pinned gateway they didn't ask for. A test's hub (a debug build under `TWR_HOME`) and `TWR_GATEWAY_AUTOSTART=off` never start one.
+
 `--gateway-info` adds `"pin"` (absent in certificate mode) and `"routes"`, the list the gateway would put in an invitation now. Both are absent while a certificate-mode gateway runs. When no gateway runs, they describe the pinned gateway that would start, if its identity exists. A running gateway's record also carries `"mode"`: `pinned`, `certificate` or `development`. A pinned gateway's `tls_cert` and `tls_key` are its `identity-cert.pem` and `identity-key.pem`, so the desktop app's checks still read the record.

@@ -141,28 +141,24 @@ fn addresses(line: &Value) -> Vec<String> {
         .collect()
 }
 
-/// The invitation, for this terminal: its QR code (the link's, else the JSON's, when the
-/// terminal is wide enough), the link, the code, the addresses and the expiry.
+/// The invitation, for this terminal: its QR code when the terminal is wide enough (of the
+/// invitation's JSON without `iroh` and `scopes`, [`twr_tui::qr::invitation_text`]), the link,
+/// the code, the addresses and the expiry.
 fn show(line: &Value, level: &str) {
     let link = line["link"].as_str().unwrap_or("");
-    let invitation = line["invitation"].to_string();
+    let qr = twr_tui::qr::invitation_text(&line["invitation"]);
     let columns = columns().unwrap_or(80);
     outln!();
-    match twr_tui::qr::pick(link, &invitation, columns) {
-        Some(text) => {
-            let lines = twr_tui::qr::half_blocks(text).unwrap_or_default();
-            print!("{}", twr_tui::qr::ansi(&lines));
-            if text == link {
-                outln!("\nScan it with the phone's camera, or in the twr app: Pair a hub › Scan QR code.");
-            } else {
-                outln!("\nScan it in the twr app: Pair a hub › Scan QR code.");
-            }
-        }
-        None => outln!(
-            "This terminal is too narrow for the QR code ({} columns would do): widen it, or \
-             open the link on the phone.",
-            twr_tui::qr::width(&invitation).unwrap_or(0)
-        ),
+    if twr_tui::qr::fits(&qr, columns) {
+        let lines = twr_tui::qr::half_blocks(&qr).unwrap_or_default();
+        print!("{}", twr_tui::qr::ansi(&lines));
+        outln!("\nScan it in the twr app: Pair a hub › Scan QR code.");
+    } else {
+        outln!(
+            "This terminal is too narrow for the QR code ({} columns would do). Open the link \
+             on the phone, or type the code and one of the addresses in the twr app.",
+            twr_tui::qr::width(&qr).unwrap_or(0)
+        );
     }
     outln!("\nLink: {link}");
     outln!(
