@@ -46,6 +46,7 @@ pub mod loops;
 pub mod notify;
 pub mod palette;
 pub mod paths;
+pub mod phone_pairing;
 pub mod project_lookup;
 pub mod proto;
 pub mod reduce;
