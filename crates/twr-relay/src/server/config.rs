@@ -49,6 +49,9 @@ pub struct RelaySection {
     /// Phone suffixes; the default is `hostname`, or `relay.invalid` without one.
     #[serde(default)]
     pub phone_suffixes: Vec<String>,
+    /// How long a drain (on shutdown) asks hubs to wait before coming back (§5.8).
+    #[serde(default = "d_drain")]
+    pub drain_retry_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -215,6 +218,9 @@ fn d_rate() -> u64 {
 }
 fn d_burst() -> u64 {
     32_000_000
+}
+fn d_drain() -> u64 {
+    30
 }
 fn d_idle() -> u64 {
     600

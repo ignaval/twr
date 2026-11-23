@@ -932,3 +932,103 @@ async fn record_store_takes_pkarr_packets() {
     assert_eq!(back.as_bytes(), packet.as_bytes());
     r.stop().await;
 }
+
+#[tokio::test]
+async fn hub_client_reconnects_and_follows_its_phone_set() {
+    // A fixed port, so the relay can come back where it was.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let dir = tempfile::tempdir().unwrap();
+    let text = format!(
+        "[relay]\nhostname = \"relay.test\"\npublic_host = \"127.0.0.1\"\nlisten = [\"127.0.0.1:{port}\"]\nmetrics_listen = \"127.0.0.1:0\"\ndrain_retry_seconds = 1\n[tls]\nmode = \"self-signed\"\n[iroh]\nenabled = false\n"
+    );
+    let mut cfg: Config = toml::from_str(&text).unwrap();
+    cfg.relay.state_dir = dir.path().to_path_buf();
+    let run = server::start(cfg.clone(), "t").await.unwrap();
+    let target = client::Target::new(run.relay_url()).connect_to(run.addrs[0]);
+
+    let key = Arc::new(IdentityKey::generate_p256().unwrap());
+    let (cred, relay_key) = client::new_phone_credential().unwrap();
+    let (hub, mut streams) =
+        client::HubClient::spawn(HubConfig::new(target.clone(), "t"), key.clone(), vec![cred]);
+    let mut status = hub.status();
+    let wait_connected = |want: bool| {
+        let mut status = hub.status();
+        async move {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                status.wait_for(|s| s.connected == want),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .clone()
+        }
+    };
+    let st = wait_connected(true).await;
+    let route = st.welcome.unwrap().phone_routes[0].clone();
+    let pin = key.pin();
+
+    // The phone set given at spawn was sent: a phone gets through, as a stream on `streams`.
+    let tls = Arc::new(probe::identity_tls(&key, &[b"t"]).unwrap());
+    let hub_side = {
+        let tls = tls.clone();
+        async move {
+            let s = streams.recv().await.unwrap();
+            let mut t = tokio_rustls::TlsAcceptor::from(tls)
+                .accept(s.io)
+                .await
+                .unwrap();
+            let mut b = [0u8; 2];
+            t.read_exact(&mut b).await.unwrap();
+            t.write_all(&b).await.unwrap();
+            t.flush().await.unwrap();
+            (streams, t)
+        }
+    };
+    let phone_side = async {
+        let mut t = client::phone_connect(&route, &pin, &relay_key, &[b"t"])
+            .await
+            .unwrap();
+        t.write_all(b"hi").await.unwrap();
+        t.flush().await.unwrap();
+        let mut b = [0u8; 2];
+        t.read_exact(&mut b).await.unwrap();
+        assert_eq!(&b, b"hi");
+    };
+    let ((streams, _t), ()) = tokio::join!(hub_side, phone_side);
+    let _keep = streams;
+
+    // Emptying the set reaches the relay: the phone is refused.
+    hub.set_phones(vec![]);
+    let mut refused = false;
+    for _ in 0..50 {
+        if client::phone_connect(&route, &pin, &relay_key, &[b"t"])
+            .await
+            .is_err()
+        {
+            refused = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(refused);
+
+    // The relay restarts on the same port: the client sees the drain and comes back.
+    run.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(5), status.wait_for(|s| !s.connected))
+        .await
+        .unwrap()
+        .unwrap();
+    let run = server::start(cfg, "t").await.unwrap();
+    // The drain asked for 1 s here; the client waits that long, then reconnects.
+    tokio::time::timeout(Duration::from_secs(10), status.wait_for(|s| s.connected))
+        .await
+        .unwrap()
+        .unwrap();
+    hub.shutdown();
+    run.shutdown().await;
+}

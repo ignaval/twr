@@ -551,26 +551,31 @@ impl HubClient {
         tokio::spawn(async move {
             let mut failures = 0u32;
             loop {
-                let wait =
-                    match Self::run_once(&cfg, &key, phones_rx.clone(), &status_tx, &stream_tx, &c)
-                        .await
-                    {
-                        Ok(Closed::Local) => return,
-                        Ok(Closed::Drain(secs)) => {
-                            failures = 0;
-                            Duration::from_secs(secs.clamp(1, 3600))
-                        }
-                        Ok(Closed::Refused(code)) if code == "denied" => Duration::from_secs(3600),
-                        Ok(Closed::Refused(code)) if code == "replaced" => {
-                            // Another process holds this hub's key and took over: don't fight it.
-                            failures = failures.saturating_add(1);
-                            backoff(failures.max(6))
-                        }
-                        Ok(_) | Err(_) => {
-                            failures = failures.saturating_add(1);
-                            backoff(failures - 1)
-                        }
-                    };
+                let started = std::time::Instant::now();
+                let result =
+                    Self::run_once(&cfg, &key, phones_rx.clone(), &status_tx, &stream_tx, &c).await;
+                // A session that held for a minute ends a run of failures; one that drops at
+                // once doesn't, so a relay that accepts and then drops isn't hammered.
+                if result.is_ok() && started.elapsed() >= Duration::from_secs(60) {
+                    failures = 0;
+                }
+                let wait = match result {
+                    Ok(Closed::Local) => return,
+                    Ok(Closed::Drain(secs)) => {
+                        failures = 0;
+                        Duration::from_secs(secs.clamp(1, 3600))
+                    }
+                    Ok(Closed::Refused(code)) if code == "denied" => Duration::from_secs(3600),
+                    Ok(Closed::Refused(code)) if code == "replaced" => {
+                        // Another process holds this hub's key and took over: don't fight it.
+                        failures = failures.saturating_add(1);
+                        backoff(failures.max(6))
+                    }
+                    Ok(_) | Err(_) => {
+                        failures = failures.saturating_add(1);
+                        backoff(failures - 1)
+                    }
+                };
                 tokio::select! {
                     _ = c.cancelled() => return,
                     _ = tokio::time::sleep(wait) => {}

@@ -252,7 +252,7 @@ impl Running {
         for (out, _) in &sessions {
             let _ = out.try_send(proto::Msg::Drain {
                 reason: "restart".into(),
-                retry_after_seconds: 30,
+                retry_after_seconds: self.shared.cfg.relay.drain_retry_seconds,
             });
         }
         if !sessions.is_empty() {

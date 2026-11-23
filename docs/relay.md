@@ -113,6 +113,7 @@ A restart drains connected hubs first: they reconnect, to another relay if they 
 | `state_dir` | `/var/lib/twr-relay` | The key, the ACME cache and `state.json` |
 | `metrics_listen` | `127.0.0.1:9469` | Counters in Prometheus text at `/metrics`. Must be loopback unless `metrics_public = true`. |
 | `phone_suffixes` | `[hostname]`, or `["relay.invalid"]` | The suffixes of phone server names |
+| `drain_retry_seconds` | 30 | How long a shutdown's drain asks hubs to wait before reconnecting |
 
 **`[tls]`**
 
