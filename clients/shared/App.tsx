@@ -112,10 +112,12 @@ import {
   type Command,
 } from "./commands";
 import { accessLevel, accessOutcome } from "./orchestrator-access";
+import { engineNotice } from "./engineHubs";
 import type {
   Attention,
   InboxSource,
   DesktopEvent,
+  EngineHub,
   HubEvent,
   Json,
   OperationOptions,
@@ -363,6 +365,8 @@ export default function App({
   const [homePath, setHomePath] = useState("");
   const [workspaces, setWorkspaces] = useState<Json[]>([]);
   const [paths, setPaths] = useState<Json>();
+  // Other running workspaces' hubs whose engine is not the app's (desktop only).
+  const [staleHubs, setStaleHubs] = useState<EngineHub[]>([]);
   const [info, setInfo] = useState<Json>();
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(true);
@@ -1081,6 +1085,7 @@ export default function App({
       setInfo(undefined);
       setQueued([]);
       setPaths(undefined);
+      setStaleHubs([]);
       setShellCwd(undefined);
       setShellJobs([]);
       setSection("chat");
@@ -1089,6 +1094,13 @@ export default function App({
         const value = await hostApi.connect(name);
         if (generation !== connectGeneration.current) return;
         setPaths(value);
+        // In the background: one `hub.info` per running workspace, at most a few seconds.
+        void hostApi
+          .engineHubs?.()
+          .then((hubs) => {
+            if (generation === connectGeneration.current) setStaleHubs(hubs);
+          })
+          .catch(() => {});
         await refreshInfo();
         await refreshWorkspaces();
         setRefresh((n) => n + 1);
@@ -3221,6 +3233,26 @@ export default function App({
   const noInternet = hubOffline(view.attention);
   // The host reconnecting on its own (its error names the hub's socket): news, not alarm.
   const reconnecting = !connecting && !!connectionWords(connectionError).detail;
+  // The app's engine against this hub's (`desktop.paths`, `hub.info`) and the other running
+  // workspaces' hubs (`engineHubs`): after an upgrade each keeps its engine until stopped.
+  const appEngine = {
+    version: String(paths?.version ?? ""),
+    build: paths?.build,
+  };
+  const currentStale: EngineHub | undefined = paths?.versionMismatch
+    ? {
+        workspace,
+        difference: paths.engineDifference === "build" ? "build" : "version",
+        version: String(paths.hubVersion ?? ""),
+        build: paths.hubBuild,
+      }
+    : undefined;
+  const otherStale = staleHubs.filter((hub) => hub.workspace !== workspace);
+  const engineWords = engineNotice(
+    appEngine,
+    [...(currentStale ? [currentStale] : []), ...otherStale],
+    workspace,
+  );
   const notices: StripItem[] = [
     ...(connectionNotice
       ? [
@@ -3283,15 +3315,24 @@ export default function App({
           },
         ]
       : []),
-    ...(paths?.versionMismatch
+    ...(engineWords
       ? [
           {
             key: "version",
             tone: "warning" as const,
             icon: <AlertCircle size={15} />,
-            content: `The app bundles twr ${paths.version}; this hub still runs ${paths.hubVersion}. Stop and reconnect when you’re ready to use the new engine.`,
+            content: engineWords,
             actions: (
-              <button onClick={() => action("hub-stop")}>Stop hub…</button>
+              <>
+                {currentStale && (
+                  <button onClick={() => action("hub-stop")}>Stop hub…</button>
+                )}
+                {otherStale.length > 0 && (
+                  <button onClick={() => cliAction("hub stop", { all: true })}>
+                    Stop all hubs…
+                  </button>
+                )}
+              </>
             ),
           },
         ]

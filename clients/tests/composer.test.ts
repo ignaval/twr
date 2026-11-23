@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   DesktopEvent,
+  EngineHub,
   HubEvent,
   InboxSource,
   Json,
@@ -84,6 +85,12 @@ type HostOptions = {
   voiceStatus?: () => Promise<VoiceCaptureStatus>;
   voiceSetup?: () => Promise<VoiceCaptureStatus>;
   inboxSources?: InboxSource[];
+  /** What `connect` answers (`desktop.paths` and how the hub's engine compares). */
+  connect?: Json;
+  /** The running workspaces' hubs on another engine (`engineHubs`). */
+  engineHubs?: EngineHub[];
+  /** The CLI's commands (`catalog`). */
+  catalog?: Json[];
 };
 
 function fakeHost(options: HostOptions = {}) {
@@ -149,7 +156,10 @@ function fakeHost(options: HostOptions = {}) {
       theme: null,
       terminals: [],
     }),
-    connect: async () => ({}),
+    connect: async () => options.connect || {},
+    engineHubs: options.engineHubs
+      ? async () => options.engineHubs || []
+      : undefined,
     inboxSources: async () => options.inboxSources || [],
     rpc: async (method: string, params: Json = {}) => {
       const answer = options.rpc?.(method, params);
@@ -178,7 +188,7 @@ function fakeHost(options: HostOptions = {}) {
       args.join(" ") === "ws list --json"
         ? { stdout: JSON.stringify(Object.keys(views)), stderr: "", code: 0 }
         : { stdout: "", stderr: "", code: 0 },
-    catalog: async () => [],
+    catalog: async () => options.catalog || [],
     configRead: async () => ({
       content: "",
       hash: "",
@@ -3224,5 +3234,107 @@ describe("the working cursor in the conversation", () => {
       data: { key: "tui.animate", value: true, before: false },
     });
     expect(still()).toBe(false);
+  });
+});
+
+describe("the notice for a hub on another engine", () => {
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+  const start = async (options: HostOptions = {}) => {
+    vi.resetModules();
+    mounted = await mount(options);
+  };
+  const notice = () => app().all('[data-notice="version"]');
+  const buttons = () =>
+    notice()[0]
+      .querySelectorAll("button")
+      .map((b: FakeElement) => b.textContent);
+  const paths = {
+    version: "0.6.0",
+    build: "463a2ed0aaaaaaaa",
+    hubVersion: "0.6.0",
+    hubBuild: "85ab7b43eecbe2ec",
+  };
+
+  it("shows for a rebuild of the same version, in words about the build", async () => {
+    await start({
+      connect: { ...paths, engineDifference: "build", versionMismatch: true },
+    });
+    expect(notice()).toHaveLength(1);
+    expect(notice()[0].textContent).toContain(
+      "The app bundles a different build of twr 0.6.0 (463a2ed0) than this hub runs (85ab7b43).",
+    );
+    expect(buttons()).toEqual(["Stop hub…"]);
+  });
+
+  it("keeps the version words when the versions differ", async () => {
+    await start({
+      connect: {
+        ...paths,
+        hubVersion: "0.5.2",
+        engineDifference: "version",
+        versionMismatch: true,
+      },
+    });
+    expect(notice()[0].textContent).toContain(
+      "The app bundles twr 0.6.0; this hub still runs 0.5.2.",
+    );
+  });
+
+  it("names the other workspaces whose hubs run another build, and stops them all", async () => {
+    await start({
+      connect: { ...paths, engineDifference: "build", versionMismatch: true },
+      engineHubs: [
+        {
+          workspace: "default",
+          difference: "build",
+          version: "0.6.0",
+          build: "85ab7b43eecbe2ec",
+        },
+        {
+          workspace: "twr",
+          difference: "build",
+          version: "0.6.0",
+          build: "85ab7b43eecbe2ec",
+        },
+      ],
+      catalog: [
+        {
+          id: "cli:hub stop",
+          title: "twr hub stop",
+          group: "CLI · hub",
+          cli: ["hub", "stop"],
+          fields: [{ key: "all", label: "all", type: "boolean" }],
+        },
+      ],
+    });
+    expect(notice()[0].textContent).toContain(
+      "The hub of workspace twr also runs a different build of twr than the app bundles. Stop them and reconnect",
+    );
+    expect(buttons()).toEqual(["Stop hub…", "Stop all hubs…"]);
+    await app().click(app().find('[data-notice="version"] button', "Stop all"));
+    expect(app().find(".dialog").textContent).toContain("twr hub stop");
+  });
+
+  it("shows for another workspace's hub while this one runs the app's engine", async () => {
+    await start({
+      connect: { ...paths, hubBuild: paths.build },
+      engineHubs: [
+        { workspace: "twr", difference: "version", version: "0.5.2" },
+      ],
+    });
+    expect(notice()[0].textContent).toContain(
+      "The hub of workspace twr runs a different twr version than the app bundles.",
+    );
+    expect(buttons()).toEqual(["Stop all hubs…"]);
+  });
+
+  it("does not show when every hub runs the app's engine", async () => {
+    await start({
+      connect: { ...paths, hubBuild: paths.build },
+      engineHubs: [],
+    });
+    expect(notice()).toHaveLength(0);
   });
 });

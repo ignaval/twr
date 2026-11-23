@@ -32,6 +32,10 @@ Upgrading: a gateway started without `--tls-cert` no longer refuses to start; it
 
 - In the desktop and phone apps' conversation, the working cursor on its own line and the shortcut to your preceding message start at the conversation's text column instead of the pane's left edge, and the shortcut row is as wide as that column. A line scrolled up under the shortcut row fades out instead of looking cut through by it ([desktop.md](docs/desktop.md)).
 
+### Fixed
+
+- The desktop app now notices a hub running another build of its own version, such as one left running from before a distribution package rebuilt from a later commit was installed: it compared versions only, so the notice with **Stop hub…** never showed. It compares `hub.info`'s `build` with the build id of the engine it bundles, says "a different build of twr 0.6.0 (463a2ed0) than this hub runs (85ab7b43)" when the versions are equal, and also names the other running workspaces whose hubs differ, with **Stop all hubs…** (`twr hub stop --all`) ([desktop.md](docs/desktop.md)).
+
 ## [0.6.0] - 2026-11-22
 
 Simpler desktop and phone apps: Settings in tabs, forms that pick from lists, fewer pages for the same thing and one menu per conversation. twr's own neural voices read aloud on your machine (Kokoro, Supertonic 3 and Piper), with a voice for each language picked in the apps, and whisper's `small` models make dictation more accurate. The model and effort change from the message box, the orchestrator's in place; the orchestrator can search the web, run with full access and change twr's configuration when you ask; the apps show usage limits; and a single review pass (`--once`) runs one round. Also many fixes to drafts and attached files in the apps.

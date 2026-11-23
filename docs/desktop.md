@@ -99,12 +99,21 @@ the command and clearing the text that came back.
 
 The app's notices share one strip under the header and show one at a time, the most
 pressing first: the connection (connecting, or why it dropped, with **Reconnect**, and
-what this device saved meanwhile), offline, an app whose engine is newer than the
-running hub (**Stop hub…**), the first-use notice for small-model suggestions and
-summaries (it asks you to decide), an update (**Restart to update**, **Download**,
+what this device saved meanwhile), offline, a hub running another engine than the
+app's (**Stop hub…**, and **Stop all hubs…** when other workspaces' hubs do too), the
+first-use notice for small-model suggestions and summaries (it asks you to decide), an update (**Restart to update**, **Download**,
 **Dismiss**), a problem with this device's encrypted storage (such as no unlocked keyring
 on Linux), then assistance errors. **+N** shows the others under it; dismissing the one shown
 brings up the next.
+
+A hub keeps the engine it started with when the app is upgraded. The app compares each
+running workspace's hub with the engine it bundles: by version, and for the same version by
+build (the `build` of `hub.info`, the first 16 hex digits of the engine's SHA-256), so a
+package rebuilt from a later commit with the same version is noticed too. The notice says
+which: "this hub still runs 0.5.2", or "a different build of twr 0.6.0 (463a2ed0) than this
+hub runs (85ab7b43)", and names the other workspaces whose hubs differ. **Stop hub…** stops
+this workspace's hub, and **Stop all hubs…** opens `twr hub stop --all`; reconnect to start
+the app's engine. A hub too old to report its build is compared by version alone.
 
 Above the history, the orchestrator and each thread's conversation show the first line
 of your preceding message, on desktop and phone, in a row of its own as wide as the
