@@ -33,6 +33,7 @@ import {
   withoutDroppedText,
 } from "./modelPick";
 import { MessageBody } from "./MessageBody";
+import { ThreadBox, aboutThread } from "./ThreadMessage";
 import { ConversationSearch, NeedsYouInbox } from "./InboxSearch";
 import { PaneResize } from "./LayoutOptions";
 import { stepTextSize, textSizeShortcut } from "./layoutPreferences";
@@ -6158,28 +6159,30 @@ const Conversation = memo(function Conversation({
                 />
               </div>
               {block.children ? (
-                <details
-                  className="routine-updates"
-                  open={opened.get("details:" + block.id) ?? false}
-                  onToggle={(event) =>
-                    setOpen("details:" + block.id, event.currentTarget.open)
-                  }
-                >
-                  <summary>
-                    {block.text}
-                    <span>
-                      {" "}
-                      · {block.children.length} update
-                      {block.children.length === 1 ? "" : "s"}
-                    </span>
-                  </summary>
-                  {block.children.map((entry) => (
-                    <div key={entry.id}>
-                      <time dateTime={entry.ts}>{messageTime(entry.ts)}</time>
-                      <Markdown text={entry.text} />
-                    </div>
-                  ))}
-                </details>
+                <ThreadBox thread={aboutThread(threads, block.about)}>
+                  <details
+                    className="routine-updates"
+                    open={opened.get("details:" + block.id) ?? false}
+                    onToggle={(event) =>
+                      setOpen("details:" + block.id, event.currentTarget.open)
+                    }
+                  >
+                    <summary>
+                      {block.text}
+                      <span>
+                        {" "}
+                        · {block.children.length} update
+                        {block.children.length === 1 ? "" : "s"}
+                      </span>
+                    </summary>
+                    {block.children.map((entry) => (
+                      <div key={entry.id}>
+                        <time dateTime={entry.ts}>{messageTime(entry.ts)}</time>
+                        <Markdown text={entry.text} />
+                      </div>
+                    ))}
+                  </details>
+                </ThreadBox>
               ) : block.kind === "tool" ? (
                 <details
                   open={opened.get("details:" + block.id) ?? false}
@@ -6200,12 +6203,21 @@ const Conversation = memo(function Conversation({
               ) : block.kind === "user" || block.kind === "notice" ? (
                 // A prompt the orchestrator forwarded is a notice: the files it names show as
                 // chips too, never their paths.
-                <SentMessage
-                  text={block.text}
-                  sentImage={sentImage}
-                  expanded={opened.get(block.id) ?? false}
-                  onExpandedChange={(open) => setOpen(block.id, open)}
-                />
+                // A hub update about a worker sits in that worker's box.
+                <ThreadBox
+                  thread={
+                    block.kind === "notice"
+                      ? aboutThread(threads, block.about)
+                      : undefined
+                  }
+                >
+                  <SentMessage
+                    text={block.text}
+                    sentImage={sentImage}
+                    expanded={opened.get(block.id) ?? false}
+                    onExpandedChange={(open) => setOpen(block.id, open)}
+                  />
+                </ThreadBox>
               ) : (
                 <MessageBody
                   text={block.text}

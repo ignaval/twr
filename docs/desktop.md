@@ -261,6 +261,11 @@ shows greyed as the empty message box's placeholder: `Tab` or `→` puts it in t
 it has been on screen 300 ms, so a key pressed as it appears isn't taken for it), typing
 types over it, and it is sent only when you press Enter. Only visible routine-update groups receive summaries; permission/question
 updates remain visible and summaries are bound to their conversation and covered update.
+In the orchestrator's conversation, an update the hub wrote about one worker (a report, a
+request, a run of routine updates) is drawn in that worker's box, as the orchestrator's own
+`<thread>` sections are: framed in its color and titled with its name. The thread is the one
+the hub names by id (`about_thread`), never by name; an update about no thread, or about one
+this client doesn't list, stays unboxed.
 
 Settings › Agents › Orchestrator shows the orchestrator's runtime, model and effort as
 lists. On the runtime it runs, **Apply** changes the model and effort in place, as the
