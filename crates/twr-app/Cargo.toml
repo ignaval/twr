@@ -37,9 +37,16 @@ jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_
 reqwest = { workspace = true, features = ["http2", "form"] }
 rustls.workspace = true
 webpki-roots.workspace = true
+# The gateway's own identity in pinned mode (`gateway::identity`): a P-256 key and its
+# self-signed certificate, with the ring that rustls already builds.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+time = { version = "0.3", default-features = false, features = ["std"] }
+# Identity files written whole or not at all (`gateway::identity`).
+tempfile.workspace = true
+# The gateway's IPv6 listener beside its IPv4 one (`IPV6_V6ONLY`).
+socket2 = "0.6"
 
 [dev-dependencies]
-tempfile.workspace = true
 # `tokio::time::pause`: the phone speaker's timeouts in virtual time.
 tokio = { workspace = true, features = ["test-util"] }
 

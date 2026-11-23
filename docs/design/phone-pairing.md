@@ -60,7 +60,7 @@ proof     = HMAC-SHA256(K_proof, "twr-mobile-pin-v2" || 0x00 || pin (32 raw byte
 {"service":"twr-mobile","protocol":2,"gateway_id":"<uuid>","pin":"<43 chars>"}
 ```
 
-In certificate mode, `pin` is absent. Protocol 1 clients ignore the new field.
+In certificate mode, `pin` is absent. Protocol 1 clients ignore the new field. A gateway without a pin (certificate or development mode) answers `/v1/pair/proof` with `404`.
 
 **`GET /v1/pair/proof?nonce=<base64url-nopad of 32 bytes>`, unauthenticated.**
 
@@ -121,6 +121,10 @@ The QR code and the copied link both carry this JSON:
    - private LAN addresses (RFC 1918, fc00::/7 outside the tailnet range).
 3. Cut the list off at 8.
 
+Interface addresses come only for a listener on all addresses (`0.0.0.0` gives IPv4 ones, `[::]` IPv6 ones). A listener on one address offers that address, a loopback one included. Within each class, IPv4 comes before IPv6. When there is no route at all, the gateway opens no invitation and asks for `--address`.
+
+**Saved settings.** The pinned gateway keeps `address`, `listen` and `autostart` in `gateway-settings.json` in its directory (0600). The desktop app keeps its certificate-mode gateway's settings in its own settings file, which the gateway cannot read, so `--address` is saved only in pinned mode.
+
 ## Client trust rule
 
 **For a hub paired by pin,** on every route and every connection: accept the TLS connection only if the leaf certificate's SPKI SHA-256 equals the saved pin. Ignore the chain, the name and the validity dates. Send nothing first: not the code, not the token, not the request line.
@@ -156,7 +160,7 @@ A man in the middle presenting its own key can't produce a valid proof for that 
 
 **Reconnect at once on a network change:** Android's `ConnectivityManager` callback, iOS's `NWPathMonitor`. Don't wait for a timeout.
 
-**While connected, the gateway reports its current routes** in the connection hello, as `routes`. The client merges them under the limits above.
+**While connected, the gateway reports its current routes** in the connection hello, as `routes`. The client merges them under the limits above. Only a pinned gateway does: the hello of a certificate-mode gateway has no `routes`.
 
 ## Client API (TypeScript ↔ native transport)
 
@@ -210,4 +214,4 @@ In pinned mode, `--pair --pair-json`, and `twr gateway --pair --pair-json` once 
 
 `expires_at` is seconds, as today; the invitation's `expiresAt` is milliseconds. In certificate mode the output is unchanged, with no `invitation` and no `link`.
 
-`--gateway-info` adds `"pin"` (absent in certificate mode) and `"routes"`, the list the gateway would put in an invitation now.
+`--gateway-info` adds `"pin"` (absent in certificate mode) and `"routes"`, the list the gateway would put in an invitation now. Both are absent while a certificate-mode gateway runs. When no gateway runs, they describe the pinned gateway that would start, if its identity exists. A running gateway's record also carries `"mode"`: `pinned`, `certificate` or `development`. A pinned gateway's `tls_cert` and `tls_key` are its `identity-cert.pem` and `identity-key.pem`, so the desktop app's checks still read the record.

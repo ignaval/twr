@@ -74,6 +74,13 @@ pub struct Info {
     #[serde(default)]
     pub renewal_error: Option<String>,
     pub started_at: u64,
+    /// How it serves: `pinned` (its own key, which phones pin), `certificate` (`--tls-cert`)
+    /// or `development` (cleartext loopback). Empty from a gateway older than pinned mode.
+    #[serde(default)]
+    pub mode: String,
+    /// The pin, in pinned mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<String>,
 }
 impl Info {
     pub fn new(
@@ -101,6 +108,8 @@ impl Info {
             renewal_state: "current".into(),
             renewal_error: None,
             started_at: super::auth::now(),
+            mode: String::new(),
+            pin: None,
         })
     }
 }
@@ -119,7 +128,9 @@ fn canonical(path: Option<&Path>) -> Result<String> {
 pub fn cert_digest(path: &Path) -> Result<String> {
     Ok(hex::encode(Sha256::digest(std::fs::read(path)?)))
 }
-fn private_dir(dir: &Path) -> Result<()> {
+/// `dir`, made private (0700) if missing, checked as this user's own directory, private, and
+/// no symbolic link.
+pub(crate) fn private_dir(dir: &Path) -> Result<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
