@@ -1991,7 +1991,7 @@ fn removing_default_refuses_while_anything_would_be_lost() {
     assert!(root.removed_marker().exists());
 }
 
-/// Two removals, renames or creations at once never both pass their checks: of four that
+/// Two renames, or a creation and a rename, at once never both pass their checks: of four that
 /// race to take one name, exactly one does.
 #[test]
 fn concurrent_workspace_changes_take_turns() {
@@ -2021,21 +2021,34 @@ fn concurrent_workspace_changes_take_turns() {
         .filter(|r| r["name"] == "same")
         .collect();
     assert_eq!(named.len(), 1);
-    let news: Vec<Child> = (0..4)
-        .map(|_| {
-            command(home, &["ws", "new", "t"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap()
-        })
-        .collect();
-    let made = news
+    // Creations racing renames into the same name: `mkdir` alone keeps two creations apart,
+    // but only the registry lock keeps a creation and a rename from both taking `t`.
+    let racing: Vec<Child> = [
+        vec!["ws", "new", "t"],
+        vec!["ws", "rename", "q", "t"],
+        vec!["ws", "new", "t"],
+        vec!["ws", "rename", "r", "t"],
+    ]
+    .iter()
+    .map(|args| {
+        command(home, args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    })
+    .collect();
+    let took = racing
         .into_iter()
         .map(|mut c| c.wait().unwrap().success())
         .filter(|ok| *ok)
         .count();
-    assert_eq!(made, 1);
+    assert_eq!(took, 1);
+    let t: Vec<Value> = workspaces(home)
+        .into_iter()
+        .filter(|r| r["name"] == "t" || r["id"] == "t")
+        .collect();
+    assert_eq!(t.len(), 1, "{t:?}");
 }
 
 /// An agent's `twr` reaches its own workspace whatever the user does meanwhile: its root

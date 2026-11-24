@@ -354,6 +354,20 @@ pub fn connect_existing(path: &Path) -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
+/// A connection to a database that must exist, as it is: no pragma that writes (not even the
+/// journal mode), for a look at its schema before anything else opens it
+/// ([`connect_existing`] sets WAL, which rewrites a database not in WAL mode).
+pub fn connect_as_is(path: &Path) -> anyhow::Result<Connection> {
+    use rusqlite::OpenFlags;
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags)
+        .with_context(|| format!("opening database {}", path.display()))?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    Ok(conn)
+}
+
 /// Creates or checks the schema.
 fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     let version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;

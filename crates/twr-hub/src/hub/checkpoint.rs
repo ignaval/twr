@@ -693,7 +693,8 @@ pub enum Prewarm {
 pub fn prewarm(db: &Path, notify: &NotifyConfig) -> anyhow::Result<Prewarm> {
     let found = {
         // Never made here: a log gone meanwhile (its workspace removed) stays gone.
-        let conn = store::connect_existing(db)?;
+        // Its schema looked at as it is: one of another twr's is left alone.
+        let conn = store::connect_as_is(db)?;
         conn.pragma_query_value(None, "user_version", |r| r.get::<_, i32>(0))?
     };
     // (Either of this build's: with account data or without, `store::is_own_schema`.)

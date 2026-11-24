@@ -9390,6 +9390,9 @@ fn check_removal(
     if log.queued {
         bail!(queued_why(&name));
     }
+    if log.spawning {
+        bail!(spawning_why(&name));
+    }
     let (removed, kept, after, goes) =
         removal_listing(&root, &ws, log.conversation, config.as_ref())?;
     Ok(CheckedRemoval {
@@ -9410,6 +9413,11 @@ fn check_removal(
 /// is then refused), and [`check_removal`] again under the locks. For `default`, a `twr runner`
 /// keeping its data in twr's data directory ([`runner_in_root_why`]).
 fn refusal_before_stopping(root: &Paths, ws: &Paths) -> Option<String> {
+    // Its log must be of this twr's schema: a newer twr's hub isn't stopped for a removal that
+    // then can't read it.
+    if let Some(why) = log_schema_why(ws) {
+        return Some(why);
+    }
     ws.workspace
         .is_none()
         .then(|| runner_in_root_why(root))
@@ -9608,6 +9616,8 @@ struct WsLog {
     trash: usize,
     /// Messages wait in its queue, which its next hub sends.
     queued: bool,
+    /// Threads were being made when its hub stopped (`spawn_operations` without a result).
+    spawning: bool,
 }
 
 /// What the stopped workspace's log says ([`WsLog`]).
@@ -9619,23 +9629,8 @@ fn ws_threads(ws: &Paths) -> anyhow::Result<WsLog> {
     }
     // Read as it is, never migrated: a preview, or a removal the user then declines, leaves
     // the log as it found it. One of another twr's schema can't be read so.
-    {
-        let conn = twr_hub::store::connect_existing(&db)?;
-        let version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if !twr_hub::store::is_own_schema(version) {
-            let id = ws.workspace_id();
-            if version > twr_hub::store::ACCOUNTS_SCHEMA_VERSION {
-                bail!(
-                    "the log of workspace {id} is from a newer twr (schema {version}): remove \
-                     the workspace with that twr"
-                );
-            }
-            bail!(
-                "the log of workspace {id} is from an older twr (schema {version}): open the \
-                 workspace once with this twr (`twr -w {id} thread list`, which starts its hub \
-                 and brings its log up to date), stop its hub, then remove the workspace"
-            );
-        }
+    if let Some(why) = log_schema_why(ws) {
+        bail!(why);
     }
     let store = twr_hub::store::Store::open_existing(&db)?;
     let events = store.load_all()?;
@@ -9666,6 +9661,13 @@ fn ws_threads(ws: &Paths) -> anyhow::Result<WsLog> {
     let (orchestrators, workers): (Vec<_>, Vec<_>) =
         views.into_iter().partition(|t| t.is_orchestrator());
     let queued = !store.threads_with_pending()?.is_empty();
+    // Threads being made when its hub stopped (a spawn the orchestrator asked for, never
+    // finished), as the running hub's own check counts them.
+    let spawning: i64 = store.conn().query_row(
+        "SELECT COUNT(*) FROM spawn_operations WHERE result IS NULL",
+        [],
+        |r| r.get(0),
+    )?;
     Ok(WsLog {
         threads: workers.into_iter().map(|t| t.name.clone()).collect(),
         conversation: (
@@ -9675,7 +9677,46 @@ fn ws_threads(ws: &Paths) -> anyhow::Result<WsLog> {
         unfinished,
         trash: items.len(),
         queued,
+        spawning: spawning > 0,
     })
+}
+
+/// Why the log of stopped workspace `ws` can't be read as it is: it is of another twr's
+/// schema (looked at without writing anything). `None`: it is this twr's, or there is none.
+fn log_schema_why(ws: &Paths) -> Option<String> {
+    let db = ws.db_file();
+    if !db.exists() {
+        return None;
+    }
+    let version: i32 = twr_hub::store::connect_as_is(&db)
+        .and_then(|c| Ok(c.pragma_query_value(None, "user_version", |r| r.get(0))?))
+        .ok()?;
+    if twr_hub::store::is_own_schema(version) {
+        return None;
+    }
+    let id = ws.workspace_id();
+    Some(if version > twr_hub::store::ACCOUNTS_SCHEMA_VERSION {
+        format!(
+            "the log of workspace {id} is from a newer twr (schema {version}): remove the \
+             workspace with that twr"
+        )
+    } else {
+        format!(
+            "the log of workspace {id} is from an older twr (schema {version}): start its hub \
+             once with this twr, which brings its log up to date (`twr -w {id} hub`, then \
+             Ctrl-C; or open it with `twr -w {id}`), then remove the workspace"
+        )
+    })
+}
+
+/// Why workspace `name` can't be removed while its log shows threads being made when its hub
+/// stopped, and how to end them.
+fn spawning_why(name: &str) -> String {
+    format!(
+        "the log of workspace {name} shows threads being made when its hub stopped (a spawn \
+         that never finished): start its hub (`twr -w {name} hub`, then Ctrl-C; or open it with \
+         `twr -w {name}`), which ends them and says what they left, then remove the workspace"
+    )
 }
 
 /// Why workspace `name` can't be removed while its log shows orchestrator work that never
@@ -9684,8 +9725,8 @@ fn unfinished_why(name: &str) -> String {
     format!(
         "the log of workspace {name} shows its orchestrator's work that never ended (its hub \
          stopped without ending it, a crash say), whose processes may still run: start its hub \
-         (`twr -w {name} thread list`), which finds and ends them, then stop it (`twr -w {name} \
-         hub stop`) and remove the workspace"
+         (`twr -w {name} hub`, then Ctrl-C; or open it with `twr -w {name}` and stop it with \
+         `twr -w {name} hub stop`), which finds and ends them, then remove the workspace"
     )
 }
 
@@ -10261,6 +10302,9 @@ async fn plan_removal_of(
                 }
                 if log.queued {
                     return refused(queued_why(&name));
+                }
+                if log.spawning {
+                    return refused(spawning_why(&name));
                 }
             }
             (log.threads, trash, false, log.conversation)
@@ -10993,15 +11037,57 @@ mod tests {
         version(Some(8));
         let plan = plan_removal_of(&root, "a", &Config::default())
             .await
-            .unwrap_err()
-            .to_string();
+            .unwrap()
+            .refused
+            .unwrap();
         assert!(plan.contains("from an older twr (schema 8)"), "{plan}");
+        // The command it names really starts the hub (`thread list` only connects).
+        assert!(plan.contains("`twr -w a hub`"), "{plan}");
         let e = remove_workspace(&root, RemovalOf::Selector("a"), None, Consent::Yes)
             .await
             .unwrap_err()
             .to_string();
         assert!(e.contains("older twr"), "{e}");
         assert_eq!(version(None), 8);
+        assert!(a.data_dir.is_dir());
+    }
+
+    /// A stopped workspace whose log shows threads being made when its hub stopped (a spawn
+    /// that never finished) is kept, as the running hub's idle check keeps it, in the plan and
+    /// in the removal.
+    #[tokio::test]
+    async fn an_unfinished_spawn_keeps_a_stopped_workspace() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        let a = twr_core::workspaces::create(&root, "a").unwrap().paths;
+        {
+            let hub = twr_hub::Hub::open(twr_hub::HubOptions::new(a.db_file(), Config::default()))
+                .await
+                .unwrap();
+            hub.shutdown().await;
+        }
+        twr_hub::store::connect(&a.db_file())
+            .unwrap()
+            .execute(
+                "INSERT INTO spawn_operations (operation_id, owner, request, result, created) \
+                 VALUES ('op1', 'o', '{}', NULL, '2026-11-24T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        let plan = plan_removal_of(&root, "a", &Config::default())
+            .await
+            .unwrap();
+        assert!(
+            plan.refused
+                .as_deref()
+                .is_some_and(|r| r.contains("threads being made")),
+            "{plan:?}"
+        );
+        let e = remove_workspace(&root, RemovalOf::Selector("a"), None, Consent::Yes)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("threads being made"), "{e}");
         assert!(a.data_dir.is_dir());
     }
 
