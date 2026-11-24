@@ -205,6 +205,8 @@ export interface DesktopAPI {
   copyText(text: string): Promise<void>;
   bootstrap(): Promise<{
     workspace: string;
+    /** `workspace` is a name a person gave (the desktop app's `TWR_WORKSPACE`), not an id. */
+    typed?: boolean;
     hostId?: string;
     scopes?: string[];
     allowed_methods?: string[];
@@ -214,7 +216,12 @@ export interface DesktopAPI {
     theme: Record<string, string> | null;
     terminals: TerminalSession[];
   }>;
-  connect(workspace: string): Promise<Json>;
+  /**
+   * Connects workspace `workspace`: a name or an id (`/ws`, a name typed), or with `byId` an id
+   * the app holds (from a listing, the bootstrap, a push, an inbox source), reached by that id
+   * alone: once it is gone, never another workspace renamed into it.
+   */
+  connect(workspace: string, options?: { byId?: boolean }): Promise<Json>;
   rpc(method: string, params?: Json): Promise<Json>;
   cli(
     args: string[],

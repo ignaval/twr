@@ -93,15 +93,22 @@ export class RemoteHost {
     } catch {}
     return undefined;
   }
+  /** The gateway session's workspace, an id: held as `connectedId`. */
+  private holdBootstrapId(workspace: unknown) {
+    if (typeof workspace === "string" && workspace)
+      this.connectedId = workspace;
+  }
   private async bootstrap() {
     if (!this.nativeConnected) {
       const cached = await this.cachedBootstrap();
+      this.holdBootstrapId(cached?.workspace);
       if (cached) return { ...cached, terminals: [] };
       throw new Error(
         "No saved history is available. Connect to this hub once first.",
       );
     }
     const value = await this.request("bootstrap", {}, 30_000);
+    this.holdBootstrapId(value?.workspace);
     try {
       if (!isOfflineHostForgotten(this.hub.id))
         await this.services.secureWrite?.(
@@ -129,8 +136,9 @@ export class RemoteHost {
   private framing = false;
   private bridgeReady = false;
   private confirmedWorkspace = false;
-  // The id the gateway last connected a workspace by: a reconnect with it asks for that
-  // workspace by id alone, never another named so since (one renamed into a removed one's id).
+  // The id of the workspace the gateway last said this app is on (its bootstrap, live or
+  // cached, and each connect): connecting with it asks for that workspace by id alone, never
+  // another named so since (one renamed into a removed one's id).
   private connectedId: string | undefined;
   private connectionTail: Promise<unknown> = Promise.resolve();
   private foreground = true;
@@ -459,6 +467,7 @@ export class RemoteHost {
       this.nativeConnected = false;
       this.bridgeReady = false;
       this.workspace = cached.workspace || "default";
+      this.holdBootstrapId(cached.workspace);
       this.readMethods = new Set(cached.read_methods || []);
       this.confirmedWorkspace = true;
       this.closing = this.transport.disconnect().catch(() => {});
@@ -502,12 +511,13 @@ export class RemoteHost {
     this.connectionTail = operation;
     return operation;
   }
-  private async connectWorkspace(workspace: string) {
+  /** Connects workspace `workspace`: with `byId` (an id the app holds), by that id alone. */
+  private async connectWorkspace(workspace: string, held = false) {
     if (!this.nativeConnected) {
       await this.openSocket();
       this.nativeConnected = true;
     }
-    const byId = workspace === this.connectedId;
+    const byId = held || workspace === this.connectedId;
     const result = await this.request(
       "connect",
       byId ? { workspace, by_id: true } : { workspace },
@@ -730,8 +740,10 @@ export class RemoteHost {
         platform: this.services.platform,
         hostId: this.hub.id,
       }),
-      connect: (workspace) =>
-        this.queueConnection(() => this.connectWorkspace(workspace)),
+      connect: (workspace, options) =>
+        this.queueConnection(() =>
+          this.connectWorkspace(workspace, options?.byId === true),
+        ),
       rpc: (method, params = {}) => request("rpc", { method, params }),
       cli: (args) => request("cli", { args }),
       catalog: () => request("catalog"),

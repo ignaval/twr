@@ -504,6 +504,35 @@ describe("mobile reconnect", () => {
     expect(fake.connect).toHaveBeenCalledTimes(1);
     await host.stop();
   });
+  it("connects the bootstrap's workspace by its id, the first time too", async () => {
+    const connects: any[] = [];
+    fake.send.mockImplementation(async ({ message }) => {
+      const call = JSON.parse(message);
+      if (call.method === "connect") connects.push(call.params);
+      reply(
+        call.id,
+        call.method === "bootstrap"
+          ? { workspace: "a", read_methods: ["hub.info", "notify.looking"] }
+          : call.method === "connect"
+            ? { workspace: "a" }
+            : {},
+      );
+    });
+    const host = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    await host.start();
+    // As the app does with the bootstrap's workspace; a name it was given goes by name.
+    await host.api().connect("a");
+    await host.api().connect("work");
+    expect(connects).toEqual([
+      { workspace: "a", by_id: true },
+      { workspace: "work" },
+    ]);
+    await host.stop();
+  });
   it("reconnects by the id the gateway gave, never by a name", async () => {
     const host = new RemoteHost(
       hub,

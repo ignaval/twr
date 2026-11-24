@@ -85,7 +85,7 @@ type HostOptions = {
   voiceSetup?: () => Promise<VoiceCaptureStatus>;
   inboxSources?: InboxSource[];
   /** How `connect` answers (default: it connects). */
-  connect?: (workspace: string) => Promise<Json>;
+  connect?: (workspace: string, options?: { byId?: boolean }) => Promise<Json>;
   /** What `twr ws list --json` lists (default: the views' workspaces). */
   listing?: Json[];
 };
@@ -362,6 +362,28 @@ describe("a workspace that cannot be opened at start", () => {
     expect(app.find("[data-workspace=a]").textContent).toContain("acme");
     await app.unmount();
     // (The file's first mount loads the whole app: more than the default 5 s under load.)
+  }, 30_000);
+});
+
+describe("a workspace the app holds the id of", () => {
+  it("is connected by that id alone: the bootstrap's, and a listed one's", async () => {
+    const calls: [string, { byId?: boolean } | undefined][] = [];
+    const app = await mount({
+      connect: async (workspace, options) => {
+        calls.push([workspace, options]);
+        return { workspace };
+      },
+      listing: [
+        { id: "default", name: "default", default: true, hub: "running" },
+        { id: "b", name: "acme", default: false, hub: "stopped" },
+      ],
+    });
+    await app.click(app.find("[data-workspace=b] .workspace-orchestrator"));
+    expect(calls).toEqual([
+      ["default", { byId: true }],
+      ["b", { byId: true }],
+    ]);
+    await app.unmount();
   }, 30_000);
 });
 

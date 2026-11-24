@@ -44,7 +44,8 @@ const api: DesktopAPI = {
   quit: () => ipcRenderer.invoke("twr:quit"),
   copyText: (text) => ipcRenderer.invoke("twr:copy-text", text),
   bootstrap: () => ipcRenderer.invoke("twr:bootstrap"),
-  connect: (workspace) => ipcRenderer.invoke("twr:connect", workspace),
+  connect: (workspace, options) =>
+    ipcRenderer.invoke("twr:connect", workspace, options),
   rpc: (method, params = {}) => ipcRenderer.invoke("twr:rpc", method, params),
   cli: (args) => ipcRenderer.invoke("twr:cli", args),
   catalog: () => ipcRenderer.invoke("twr:catalog"),

@@ -1077,10 +1077,15 @@ export default function App({
     [fail],
   );
   const connect = useCallback(
-    async (selector: string) => {
-      // By id (what the hub, the gateway and the saved state name it by), whichever of its
-      // names was given: a renamed workspace's name, or its id.
-      const name = resolveWorkspace(listingRef.current, selector) ?? selector;
+    async (selector: string, options?: { byId?: boolean }) => {
+      // By id (what the hub, the gateway and the saved state name it by). An id the app holds
+      // (`byId`: a listing's, the bootstrap's, a push's, an inbox source's, the one shown) is
+      // that workspace or none: once it is gone, never another renamed into it. A selector a
+      // person typed (`/ws`, a new workspace's name) is by name, else by id.
+      const byId = options?.byId === true;
+      const name = byId
+        ? selector
+        : (resolveWorkspace(listingRef.current, selector) ?? selector);
       const generation = ++connectGeneration.current;
       transcriptGeneration.current++;
       activeThread.current = undefined;
@@ -1109,7 +1114,7 @@ export default function App({
       setSection("chat");
       if (window.innerWidth <= 800) setSidebar(false);
       try {
-        const value = await hostApi.connect(name);
+        const value = await hostApi.connect(name, { byId });
         if (generation !== connectGeneration.current) return;
         // The id its hub serves, as it says it (a listing not read yet took no name).
         if (typeof value?.workspace === "string" && value.workspace)
@@ -1139,7 +1144,8 @@ export default function App({
         setSection("attention");
         setSidebar(false);
       };
-      if (next && next !== workspace) void connect(next).then(show);
+      if (next && next !== workspace)
+        void connect(next, { byId: true }).then(show);
       else show();
     };
     window.addEventListener("twr:open-attention", open);
@@ -1331,7 +1337,9 @@ export default function App({
         document.documentElement.dataset.theme = savedAppearance();
         applyOmarchyTheme(boot.theme);
         setHomePath(boot.home);
-        return connect(boot.workspace).then(() => onReady?.());
+        return connect(boot.workspace, { byId: !boot.typed }).then(() =>
+          onReady?.(),
+        );
       })
       .catch(fail);
     void hostApi.catalog().then(setCliCommands).catch(fail);
@@ -2811,7 +2819,7 @@ export default function App({
     }
     if (name === workspace) return show(thread, talk, then);
     pendingOpen.current = { workspace: name, thread, talk, then };
-    const switched = connect(name);
+    const switched = connect(name, { byId: true });
     // A later switch (here, the workspaces dialog, `/ws`) supersedes this one.
     const generation = connectGeneration.current;
     void switched.then(() => {
@@ -3279,7 +3287,9 @@ export default function App({
               </>
             ),
             actions: !connecting && (
-              <button onClick={() => void connect(workspace)}>Reconnect</button>
+              <button onClick={() => void connect(workspace, { byId: true })}>
+                Reconnect
+              </button>
             ),
           },
         ]
@@ -4434,7 +4444,7 @@ export default function App({
                 onRefresh={() => void refreshInboxSources()}
                 onOpenSource={(source) => {
                   if (source.hubId === hostId)
-                    void connect(source.workspace).then(() =>
+                    void connect(source.workspace, { byId: true }).then(() =>
                       setSection("attention"),
                     );
                   else
@@ -5231,7 +5241,7 @@ export default function App({
                   }
                   onClick={() => {
                     setWorkspaceModal(false);
-                    void connect(workspaceId(w));
+                    void connect(workspaceId(w), { byId: true });
                   }}
                 >
                   {workspaceLabel(w)}
