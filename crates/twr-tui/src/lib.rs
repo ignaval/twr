@@ -829,19 +829,38 @@ pub fn repaint<B: ratatui::backend::Backend>(
 
 /// Writes what this run told the user that is not saved yet ([`AppState::seen`]) to `file`,
 /// off the IO loop (the file's lock may be another TUI's for a moment); nowhere without one.
-fn save_seen(state: &mut AppState, file: Option<&Path>) {
+fn save_seen(state: &mut AppState, file: Option<&Path>) -> Option<tokio::task::JoinHandle<()>> {
     if !std::mem::take(&mut state.seen_dirty) {
-        return;
+        return None;
     }
-    let Some(file) = file else {
-        return;
-    };
-    let (file, seen) = (file.to_path_buf(), state.seen.clone());
-    tokio::task::spawn_blocking(move || {
+    let (file, seen) = (file?.to_path_buf(), state.seen.clone());
+    Some(tokio::task::spawn_blocking(move || {
         if let Err(e) = firstrun::save(&file, &seen) {
             twr_core::trace::mark_with(|| format!("tui: saving {}: {e}", file.display()));
         }
-    });
+    }))
+}
+
+/// Waits for the removals of workspaces this process has past their checks
+/// ([`twr_core::workspaces::removals_in_progress`]), saying so on `out` once, with no time
+/// limit: quitting never cuts one off half deleted. One still in its checks was given up.
+fn finish_removals(out: &mut dyn std::io::Write) {
+    let mut said = false;
+    loop {
+        let left = twr_core::workspaces::removals_in_progress();
+        if left.is_empty() {
+            return;
+        }
+        if !said {
+            let _ = writeln!(
+                out,
+                "twr: finishing deleting workspace {}...",
+                left.join(", ")
+            );
+            said = true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Writes setting `change` to the config file the environment names, where the settings
@@ -3113,6 +3132,8 @@ pub async fn run_with(
     drop(terminal);
     // The terminal is the user's again before anything else waits.
     drop(guard);
+    // A Delete past its checks finishes, whatever it takes (it deletes a workspace's files).
+    finish_removals(&mut std::io::stderr());
     // The lines sent last are written before the TUI exits, unless another TUI holds the
     // file's lock past [`HISTORY_FLUSH`]; so are the settings changed last.
     flush_history(history_writer);
@@ -3600,7 +3621,7 @@ where
                 }
                 // What this frame drew in full is all an option key may answer.
                 state.note_drawn(std::time::Instant::now());
-                save_seen(&mut state, ctx.seen_file.as_deref());
+                let _ = save_seen(&mut state, ctx.seen_file.as_deref());
                 if shown.replace(now_showing).is_none() {
                     typed_ahead.start(std::time::Instant::now());
                 }
@@ -3807,7 +3828,7 @@ where
                                     state.view.status =
                                         Some(firstrun::edit_status(terminal, &outcome, &place.home));
                                 }
-                                save_seen(&mut state, ctx.seen_file.as_deref());
+                                let _ = save_seen(&mut state, ctx.seen_file.as_deref());
                                 continue;
                             }
                             // Kept for the next runs (and the next workspaces shown).
@@ -4327,7 +4348,10 @@ where
     ctx.tui.notify.terminal = state.view.notify_terminal;
     ctx.tui.colors = state.view.color_mode;
     ctx.summaries = Some(state.summary.on);
-    save_seen(&mut state, ctx.seen_file.as_deref());
+    // Written before the next workspace's view, or the TUI's exit (bounded as the history is).
+    if let Some(saving) = save_seen(&mut state, ctx.seen_file.as_deref()) {
+        let _ = tokio::time::timeout(HISTORY_FLUSH, saving).await;
+    }
     ctx.seen = state.seen.clone();
     // Leaving this hub: its attendance connection closes, and the hub forgets it.
     drop(looking_tx);
@@ -4435,6 +4459,31 @@ mod asks_tests {
 
 #[cfg(test)]
 mod tests {
+    /// Quitting waits for a removal past its checks, however long it takes, and says so.
+    #[test]
+    fn quitting_waits_for_a_removal_past_its_checks() {
+        let removing = std::thread::spawn(|| {
+            let _r = twr_core::workspaces::Removing::begin("slow-to-delete");
+            std::thread::sleep(Duration::from_millis(1500));
+        });
+        // (Until it began.)
+        while !twr_core::workspaces::removals_in_progress().contains(&"slow-to-delete".into()) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let start = std::time::Instant::now();
+        let mut said = Vec::new();
+        finish_removals(&mut said);
+        assert!(
+            start.elapsed() >= Duration::from_millis(1000),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(String::from_utf8(said)
+            .unwrap()
+            .contains("finishing deleting workspace slow-to-delete"),);
+        removing.join().unwrap();
+    }
+
     /// A confirmed removal of the workspace shown runs only after the switch its own open
     /// made away from it: a reconnect, a quit or another open's switch lets it go, so it never
     /// runs later on a workspace used since.

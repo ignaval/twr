@@ -1547,9 +1547,10 @@ fn main() -> ExitCode {
         };
         format!("{role}: process started")
     });
-    // The TUI's own work is done once it returns (its history and settings written): what may
-    // still run is a blocking task, a workspace change waiting for the registry lock say, which
-    // must neither hold up its exit nor finish after it.
+    // The TUI's own work is done once it returns: its history, settings and seen state written,
+    // and a Delete past its checks finished. What may still run is a blocking task that is safe
+    // to drop (a read, a workspace change still waiting for the registry lock, which gives up),
+    // which must neither hold up its exit nor finish after it.
     let tui = cli.cmd.is_none();
     let stopping_hub = matches!(
         cli.cmd,
@@ -9373,6 +9374,8 @@ fn check_removal(
         )
     };
     let registry = twr_core::workspaces::RegistryLock::take(&root)?;
+    // What removals no longer running left set aside goes first.
+    twr_core::workspaces::sweep_asides(&root);
     // Again under the lock: removed, or renamed into another's name, meanwhile.
     if !ws.exists() || ws.display_name() != name {
         bail!("workspace {name} changed meanwhile: try again (`twr ws` lists them)");
@@ -9503,6 +9506,9 @@ impl CheckedRemoval {
                 ws.workspace_id()
             );
         }
+        // Past its checks: from here a process that quits waits for it (the TUI), so it is
+        // never cut off half deleted.
+        let _removing = twr_core::workspaces::Removing::begin(&name);
         // What a TUI saves of its input history waits meanwhile, then finds the workspace
         // gone (`twr_tui::save_history`): it never makes it again.
         let history = history_lock(&ws)?;

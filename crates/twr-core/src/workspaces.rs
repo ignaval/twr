@@ -392,10 +392,101 @@ pub fn cancellable<T>(
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     f: impl FnOnce() -> T,
 ) -> T {
-    let was = CANCEL.with(|c| c.replace(Some(cancel.clone())));
-    let out = f();
-    CANCEL.with(|c| *c.borrow_mut() = was);
-    out
+    /// Puts back what the thread had, however `f` ends (a panic too: a pool's thread lives
+    /// on).
+    struct Restore(Option<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let was = self.0.take().flatten();
+            CANCEL.with(|c| *c.borrow_mut() = was);
+        }
+    }
+    let _restore = Restore(Some(CANCEL.with(|c| c.replace(Some(cancel.clone())))));
+    f()
+}
+
+/// The removals of this process past their checks, by workspace name: from the first thing
+/// they change to the end of their deletion ([`Removing`]). A process that quits waits for
+/// them (the TUI), so none is cut off half deleted.
+static REMOVING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// A removal past its checks, while it lives ([`removals_in_progress`]).
+pub struct Removing(String);
+
+impl Removing {
+    /// Marks workspace `name`'s removal as past its checks until this is dropped.
+    pub fn begin(name: &str) -> Removing {
+        REMOVING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(name.to_string());
+        Removing(name.to_string())
+    }
+}
+
+impl Drop for Removing {
+    fn drop(&mut self) {
+        let mut all = REMOVING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(i) = all.iter().position(|n| *n == self.0) {
+            all.remove(i);
+        }
+    }
+}
+
+/// The workspaces this process is removing past their checks ([`Removing`]), by name.
+pub fn removals_in_progress() -> Vec<String> {
+    REMOVING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Deletes what a removal that is no longer running left set aside: the `.rm-<id>-<pid>-<ns>`
+/// directories ([`aside_name`]) in the workspaces' directory and the root's data directory
+/// whose process is gone (its removal was killed, or cut off). One whose process runs, or
+/// whose process can't be told, is left; so is one that can't be deleted, which `twr ws rm`
+/// and `twr ws new` try again. Callers hold the registry lock and are off any async worker.
+pub fn sweep_asides(root: &Paths) {
+    let root = root.root();
+    for dir in [root.workspaces_dir(), root.data_dir.clone()] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            let Some(pid) = aside_pid(&n) else {
+                continue;
+            };
+            if !e.file_type().is_ok_and(|t| t.is_dir()) || process_runs(pid) {
+                continue;
+            }
+            let _ = remove_tree(&e.path());
+        }
+    }
+}
+
+/// The process id in an aside directory's name [`aside_name`] made, `.rm-<id>-<pid>-<ns>`.
+fn aside_pid(name: &str) -> Option<i32> {
+    let rest = name.strip_prefix(".rm-")?;
+    let mut parts = rest.rsplitn(3, '-');
+    let nanos = parts.next()?;
+    let pid = parts.next()?;
+    let id = parts.next()?;
+    // (Its time in nanoseconds since 1970 has 19 digits: an older name, `.rm-<id>-<pid>`,
+    // whose id ends in a number, is not taken for one.)
+    (!id.is_empty() && nanos.len() >= 18 && nanos.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| pid.parse().ok())
+        .flatten()
+        .filter(|p| *p > 0)
+}
+
+/// Whether process `pid` runs (or can't be told: another user's).
+fn process_runs(pid: i32) -> bool {
+    // SAFETY: signal 0 checks for the process and sends nothing.
+    let r = unsafe { libc::kill(pid, 0) };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 type WaitHook = Box<dyn Fn() + Send + Sync>;
@@ -494,6 +585,8 @@ pub fn create(root: &Paths, name: &str) -> anyhow::Result<Created> {
     use std::os::unix::fs::DirBuilderExt;
     let root = root.root();
     let _lock = RegistryLock::take(&root)?;
+    // What removals no longer running left set aside goes first.
+    sweep_asides(&root);
     let all = root.workspaces()?;
     if name == DEFAULT_WORKSPACE {
         if !root.root_removed() {
@@ -1095,6 +1188,49 @@ mod tests {
         drop(held);
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert_eq!(root.workspace("a").unwrap().display_name(), "a");
+    }
+
+    /// A panic in a cancellable change leaves no cancel flag on its thread.
+    #[test]
+    fn a_panic_leaves_no_cancel_flag_behind() {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let r = std::panic::catch_unwind(|| cancellable(&cancel, || panic!("boom")));
+        assert!(r.is_err());
+        assert!(CANCEL.with(|c| c.borrow().is_none()));
+    }
+
+    /// The sweep deletes the aside directories of removals whose process is gone, and keeps a
+    /// running one's, an older name's and anything else.
+    #[test]
+    fn the_sweep_takes_only_a_dead_removal_s_aside() {
+        let (_d, root) = home();
+        create(&root, "a").unwrap();
+        let dir = root.workspaces_dir();
+        let live = dir.join(aside_name("x"));
+        // A pid no process has: above the kernel's limit.
+        let dead = dir.join(".rm-x-2147483646-1764000000000000000");
+        let old = dir.join(".rm-x-12345");
+        let root_dead = root
+            .data_dir
+            .join(".rm-default-2147483646-1764000000000000000");
+        for d in [&live, &dead, &old, &root_dead] {
+            std::fs::create_dir_all(d.join("worktrees")).unwrap();
+        }
+        sweep_asides(&root);
+        assert!(live.exists() && old.exists());
+        assert!(!dead.exists() && !root_dead.exists());
+        assert!(root.workspace("a").unwrap().exists());
+        assert_eq!(aside_pid(".rm-my-ws-42-1764000000000000000"), Some(42));
+        assert_eq!(aside_pid(".rm-x-12345"), None);
+    }
+
+    /// A removal past its checks is listed while it runs, and no longer once it is done.
+    #[test]
+    fn a_removal_in_progress_is_listed_while_it_runs() {
+        let guard = Removing::begin("listed-while-it-runs");
+        assert!(removals_in_progress().contains(&"listed-while-it-runs".to_string()));
+        drop(guard);
+        assert!(!removals_in_progress().contains(&"listed-while-it-runs".to_string()));
     }
 
     /// Deleting an aside directory another process deleted first is no error.
