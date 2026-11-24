@@ -9039,8 +9039,21 @@ fn test_token_trusted() -> bool {
 /// Creates workspace `name` of `root` ([`twr_core::workspaces::create`]). Refused to an agent
 /// ([`refuse_agent`]), from `twr ws new` and the TUI alike.
 fn create_workspace(root: &Paths, name: &str) -> anyhow::Result<twr_core::workspaces::Created> {
-    refuse_agent()?;
-    twr_core::workspaces::create(root, name)
+    let (asides, made) = create_workspace_deferring(root, name);
+    twr_core::workspaces::delete_asides(asides);
+    made
+}
+
+/// [`create_workspace`], with the aside directories still to delete left to the caller
+/// ([`twr_core::workspaces::create_deferring`]).
+fn create_workspace_deferring(
+    root: &Paths,
+    name: &str,
+) -> (Vec<PathBuf>, anyhow::Result<twr_core::workspaces::Created>) {
+    if let Err(e) = refuse_agent() {
+        return (Vec::new(), Err(e));
+    }
+    twr_core::workspaces::create_deferring(root, name)
 }
 
 /// `twr` alone when there is no default workspace (it was removed): the TUI opens the first
@@ -9295,6 +9308,26 @@ async fn remove_workspace(
     generation: Option<&str>,
     consent: Consent<'_>,
 ) -> anyhow::Result<Vec<String>> {
+    let mut stale = Vec::new();
+    let done = remove_workspace_deferring(root, which, generation, consent, &mut stale).await;
+    // What removals no longer running left set aside, found under the registry lock, is
+    // deleted once it is let go, whatever came of this one.
+    if !stale.is_empty() {
+        tokio::task::spawn_blocking(move || twr_core::workspaces::delete_asides(stale)).await?;
+    }
+    done
+}
+
+/// [`remove_workspace`], with what removals no longer running left set aside
+/// ([`twr_core::workspaces::stale_asides`]) put in `stale` for the caller to delete: the
+/// TUI's Delete says what it did first.
+async fn remove_workspace_deferring(
+    root: &Paths,
+    which: RemovalOf<'_>,
+    generation: Option<&str>,
+    consent: Consent<'_>,
+    stale: &mut Vec<PathBuf>,
+) -> anyhow::Result<Vec<String>> {
     let root = root.root();
     let (ws, selector) = match which {
         RemovalOf::Selector(s) => (root.find_workspace(s)?, s),
@@ -9319,17 +9352,12 @@ async fn remove_workspace(
     // The rest blocks (locks, the log read, the deletion): off the async workers. The
     // question, when there is one, is asked with both locks held.
     let generation = generation.map(str::to_string);
-    let (stale, checked) = tokio::task::spawn_blocking(move || {
+    let (found, checked) = tokio::task::spawn_blocking(move || {
         check_removal(root, ws, name, generation.as_deref(), config)
     })
     .await?;
-    let done = remove_checked(checked, consent).await;
-    // What removals no longer running left set aside, found under the registry lock, is
-    // deleted once it is let go, whatever came of this one.
-    if !stale.is_empty() {
-        tokio::task::spawn_blocking(move || twr_core::workspaces::delete_asides(stale)).await?;
-    }
-    done
+    *stale = found;
+    remove_checked(checked, consent).await
 }
 
 /// [`remove_workspace`] once checked: asks (`consent`), then removes.
@@ -10151,7 +10179,10 @@ impl twr_tui::Workspaces for TuiWorkspaces {
     }
 
     fn create(&self, name: &str) -> anyhow::Result<()> {
-        create_workspace(&self.root, name).map(|_| ())
+        // The TUI switches to it without waiting for what stale removals left to be deleted.
+        let (asides, made) = create_workspace_deferring(&self.root, name);
+        twr_core::workspaces::delete_asides_later(asides);
+        made.map(|_| ())
     }
 
     fn rename(&self, id: &str, to: &str) -> anyhow::Result<String> {
@@ -10214,7 +10245,18 @@ async fn remove_confirmed(
     if stop_hub {
         stop_hub_for_removal(&config.socket_path(&ws), &ws).await?;
     }
-    remove_workspace(root, RemovalOf::Id(id), generation.as_deref(), Consent::Yes).await
+    // What stale removals left is deleted after the TUI says what this one did.
+    let mut stale = Vec::new();
+    let done = remove_workspace_deferring(
+        root,
+        RemovalOf::Id(id),
+        generation.as_deref(),
+        Consent::Yes,
+        &mut stale,
+    )
+    .await;
+    twr_core::workspaces::delete_asides_later(stale);
+    done
 }
 
 /// Which workspace a removal is of ([`remove_workspace`]).

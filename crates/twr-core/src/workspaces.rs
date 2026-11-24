@@ -507,6 +507,18 @@ pub fn delete_asides(stale: Vec<PathBuf>) {
     }
 }
 
+/// [`delete_asides`] on a thread of its own, so nothing waits for it (the TUI, which goes on
+/// at once). Cut off if the process exits first, or if no thread starts: what is left is a
+/// stale aside the next sweep deletes once this process is gone.
+pub fn delete_asides_later(asides: Vec<PathBuf>) {
+    if asides.is_empty() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("twr-delete-asides".into())
+        .spawn(move || delete_asides(asides));
+}
+
 /// The process id in an aside directory's name [`aside_name`] made, `.rm-<id>-<pid>-<ns>`.
 fn aside_pid(name: &str) -> Option<i32> {
     let rest = name.strip_prefix(".rm-")?;
@@ -621,20 +633,32 @@ pub struct Created {
 /// (private, like every data directory) named `name`, its id; or, for `default`, the root
 /// slot again once it was removed (what its removal left half done is removed first). The
 /// first workspace made while there is no default becomes the default. What removals no
-/// longer running left set aside ([`stale_asides`]) is deleted once the lock is let go.
-/// Callers refuse agents, and keep it off async workers: it may wait for the lock, and delete.
+/// longer running left set aside ([`stale_asides`]), and what `default`'s own removal left,
+/// is deleted once the lock is let go. Callers refuse agents, and keep it off async workers:
+/// it may wait for the lock, and delete.
 pub fn create(root: &Paths, name: &str) -> anyhow::Result<Created> {
-    let root = root.root();
-    let lock = RegistryLock::take(&root)?;
-    let stale = stale_asides(&root);
-    let made = create_locked(&root, name);
-    drop(lock);
-    delete_asides(stale);
+    let (asides, made) = create_deferring(root, name);
+    delete_asides(asides);
     made
 }
 
-/// [`create`], under the registry lock.
-fn create_locked(root: &Paths, name: &str) -> anyhow::Result<Created> {
+/// [`create`], with the aside directories still to delete left to the caller
+/// ([`delete_asides`], without the lock, which is let go here): the TUI deletes them after
+/// it switches to the new workspace. Returned whether or not it was made.
+pub fn create_deferring(root: &Paths, name: &str) -> (Vec<PathBuf>, anyhow::Result<Created>) {
+    let root = root.root();
+    let lock = match RegistryLock::take(&root) {
+        Ok(lock) => lock,
+        Err(e) => return (Vec::new(), Err(e)),
+    };
+    let mut asides = stale_asides(&root);
+    let made = create_locked(&root, name, &mut asides);
+    drop(lock);
+    (asides, made)
+}
+
+/// [`create`], under the registry lock; what is to go once it is let go is added to `asides`.
+fn create_locked(root: &Paths, name: &str, asides: &mut Vec<PathBuf>) -> anyhow::Result<Created> {
     use std::os::unix::fs::DirBuilderExt;
     let root = root.clone();
     let all = root.workspaces()?;
@@ -657,7 +681,7 @@ fn create_locked(root: &Paths, name: &str) -> anyhow::Result<Created> {
         if let Some(why) = runner_spool_why(&root, false) {
             bail!(why);
         }
-        clear_root_leftovers(&root)?;
+        clear_root_leftovers(&root, asides)?;
         new_generation(&root)?;
         let had_default = root.default_id().is_some();
         std::fs::remove_file(root.removed_marker())
@@ -699,10 +723,12 @@ fn create_locked(root: &Paths, name: &str) -> anyhow::Result<Created> {
 
 /// What the root slot's removal left in the root's data directory when it stopped half way
 /// (a `.rm-default-*` directory, or its own entries when it stopped before it moved them):
-/// removed, before it is made again. Never what appeared under `default`'s names after the
-/// removal moved its own aside ([`ROOT_MOVED`]), a `twr runner`'s `worktrees/` say: an empty
-/// one goes, and one that holds anything refuses, listed, for the user to move or delete.
-fn clear_root_leftovers(root: &Paths) -> anyhow::Result<()> {
+/// gone before it is made again, its own entries moved aside, and the `.rm-default-*`
+/// directories added to `asides`, deleted once the registry lock is let go (nothing takes one
+/// for a workspace). Never what appeared under `default`'s names after the removal moved its
+/// own aside ([`ROOT_MOVED`]), a `twr runner`'s `worktrees/` say: an empty one goes, and one
+/// that holds anything refuses, listed, for the user to move or delete.
+fn clear_root_leftovers(root: &Paths, asides: &mut Vec<PathBuf>) -> anyhow::Result<()> {
     if root_moved(root) {
         let later = later_entries(root)?;
         // (A link identity written meanwhile holds no one's work: it goes like an empty one.)
@@ -749,16 +775,17 @@ fn clear_root_leftovers(root: &Paths) -> anyhow::Result<()> {
             gone.with_context(|| format!("removing {}", path.display()))?;
         }
     } else {
-        let aside = move_root_owned_aside(root)?;
-        if let Some(aside) = aside {
-            remove_tree(&aside).with_context(|| format!("removing {}", aside.display()))?;
-        }
+        // Its entries left in place go aside, under a name no workspace has (listed below).
+        move_root_owned_aside(root)?;
     }
     for e in std::fs::read_dir(&root.data_dir)?.flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
-        if n.starts_with(".rm-default-") && e.file_type().is_ok_and(|t| t.is_dir()) {
-            // (The removal that left it may be deleting it at this moment.)
-            remove_tree(&e.path()).with_context(|| format!("removing {}", e.path().display()))?;
+        // (The removal that left one may be deleting it at this moment: either may finish.)
+        if n.starts_with(".rm-default-")
+            && e.file_type().is_ok_and(|t| t.is_dir())
+            && !asides.contains(&e.path())
+        {
+            asides.push(e.path());
         }
     }
     Ok(())
@@ -1274,6 +1301,35 @@ mod tests {
         assert!(root.workspace("a").unwrap().exists());
         assert_eq!(aside_pid(".rm-my-ws-42-1764000000000000000"), Some(42));
         assert_eq!(aside_pid(".rm-x-12345"), None);
+    }
+
+    /// `default` made again leaves what its cut-off removal left, its own entries moved aside
+    /// and its `.rm-default-*` directories, to be deleted once the registry lock is let go.
+    #[test]
+    fn default_made_again_deletes_its_leftovers_after_the_lock() {
+        let (_d, root) = home();
+        std::fs::create_dir_all(root.data_dir.join("worktrees/p/t")).unwrap();
+        std::fs::write(root.data_dir.join("twr.db"), "x").unwrap();
+        let dead = root
+            .data_dir
+            .join(".rm-default-2147483646-1764000000000000000");
+        std::fs::create_dir_all(dead.join("worktrees")).unwrap();
+        write_atomic(&root.removed_marker(), "").unwrap();
+        let (asides, made) = create_deferring(&root, "default");
+        assert!(made.unwrap().root_slot && root.exists());
+        assert!(!RegistryLock::is_held(&root));
+        // Made, the lock let go, and the leftovers not deleted yet: out of `default`'s names.
+        assert!(!root.data_dir.join("twr.db").exists());
+        assert!(!root.data_dir.join("worktrees").exists());
+        assert_eq!(asides.len(), 2, "{asides:?}");
+        assert!(asides.contains(&dead) && asides.iter().all(|a| a.is_dir()));
+        delete_asides(asides);
+        let left: Vec<_> = std::fs::read_dir(&root.data_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".rm-"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     /// A removal past its checks is listed while it runs, and no longer once it is done.
