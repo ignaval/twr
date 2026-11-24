@@ -2145,9 +2145,6 @@ fn a_hub_starting_as_its_workspace_is_removed_does_not_make_it_again() {
     assert!(fails(home, &["-w", "a", "thread", "list"]).contains("there is no workspace a"));
 }
 
-/// A hub started for a workspace by id serves that one or none: once it is removed and
-/// another is renamed into its id, `-w <id>` names that other workspace, whose data the hub
-/// started for the first one never opens.
 /// A command another process of twr runs for a workspace id it held (`TWR_WORKSPACE_ID`, as
 /// the phone gateway's commands and terminals, the desktop app's and what a hub runs carry)
 /// reaches that workspace or none: never one renamed into the id once its own is gone. A
@@ -2176,9 +2173,58 @@ fn a_held_id_never_reaches_a_workspace_renamed_into_it() {
         assert!(!out.status.success());
         let e = String::from_utf8_lossy(&out.stderr);
         assert!(e.contains(gone), "{args:?}: {e}");
+        // Not advice that fails: `twr ws new a` is refused, the name is taken.
+        assert!(
+            e.contains("it was removed, and another workspace has its name now")
+                && !e.contains("twr ws new a"),
+            "{e}"
+        );
     }
 }
 
+/// What the phone gateway runs for a session whose workspace was removed (`twr -w <id>`,
+/// held): the workspaces are listed and made from there, as from any workspace, and a command
+/// that needs the workspace says it is gone.
+#[test]
+fn a_held_id_that_is_gone_still_lists_and_makes_workspaces() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    ok(home, &["ws", "new", "a"]);
+    ok(home, &["ws", "new", "b"]);
+    ok(home, &["ws", "rm", "a", "--yes"]);
+    let held = |args: &[&str]| {
+        let mut all = vec!["-w", "a"];
+        all.extend_from_slice(args);
+        command(home, &all)
+            .env("TWR_WORKSPACE_ID", "a")
+            .output()
+            .unwrap()
+    };
+    let listed = held(&["ws", "list", "--json"]);
+    assert!(listed.status.success(), "{listed:?}");
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let ids: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"b") && !ids.contains(&"a"), "{listed}");
+    let made = held(&["ws", "new", "c"]);
+    assert!(made.status.success(), "{made:?}");
+    assert!(Paths::with_home(home).workspace("c").unwrap().exists());
+    let used = held(&["thread", "list"]);
+    assert!(!used.status.success());
+    let e = String::from_utf8_lossy(&used.stderr);
+    assert!(
+        e.contains("there is no workspace a: create it with `twr ws new a`"),
+        "{e}"
+    );
+}
+
+/// A hub started for a workspace by id serves that one or none: once it is removed and
+/// another is renamed into its id, `-w <id>` names that other workspace, whose data the hub
+/// started for the first one never opens.
 #[test]
 fn a_hub_started_by_id_never_serves_a_workspace_renamed_into_it() {
     let home = tempfile::tempdir().unwrap();

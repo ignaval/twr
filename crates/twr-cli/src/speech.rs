@@ -681,18 +681,15 @@ fn speak_link(args: &Speak, paths: &Paths) -> anyhow::Result<LinkSpec> {
         // own speaker: live reading is per workspace anyway, and a speaker kept to one would
         // keep this device's other speakers from the rest (one speaks for a machine's hubs).
         None => match &args.workspace {
-            Some(ws) => {
-                let one = paths.root().find_workspace(ws)?;
-                if !one.exists() {
-                    anyhow::bail!(
-                        "there is no workspace {ws}: create it with `twr ws new {ws}` (`twr ws` \
-                         lists them)"
-                    );
+            // The workspace `run` resolved `-w` to (by id alone when another process of twr
+            // held it), by its id, which a rename leaves as it is.
+            Some(_) => {
+                if !paths.exists() {
+                    anyhow::bail!("{}", crate::missing_workspace_why(paths, ""));
                 }
-                // By its id, which a rename leaves as it is.
                 LinkSpec::Local {
                     paths: paths.root(),
-                    workspaces: Workspaces::One(one.workspace_id().to_string()),
+                    workspaces: Workspaces::One(paths.workspace_id().to_string()),
                 }
             }
             None => LinkSpec::Local {

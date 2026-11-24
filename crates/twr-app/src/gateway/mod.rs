@@ -262,9 +262,9 @@ mod socket_tests {
         // ...and a connection to `b` made by its id refuses a call stamped `a`.
         assert!(!same_workspace("a", "b", "b"));
         assert!(same_workspace("a", "b", "a"));
-        // A session still on `a` runs no command or terminal there: `a` is gone (`by_id`), and
-        // the `twr` it would run resolves `a` by id alone, never as `b`'s name.
-        assert!(root.existing_by_id("a").is_err());
+        // A session still on `a` runs its commands and terminals there: the `twr` it runs
+        // resolves `a` by id alone, never as `b`'s name, and refuses it gone where a command
+        // needs it (twr-cli's `a_held_id_never_reaches_a_workspace_renamed_into_it`).
         let cli = held_twr(Path::new("twr"), "a");
         let cli = cli.as_std();
         assert_eq!(
@@ -291,9 +291,16 @@ mod socket_tests {
     /// here needs a reason, and a place in this list.
     #[test]
     fn held_ids_are_never_looked_up_by_name() {
+        // Matched in the code with its comments and every space and line break taken out,
+        // however rustfmt wraps a call.
         let by_name = concat!("find_", "workspace(");
-        let selected = concat!("from_env_", "in(Some(");
+        let env_lookup = concat!("from_env_", "in(");
         let connect_by_name = concat!("root.find_", "workspace(workspace)?");
+        let root_lookups = [
+            concat!("Some(twr_core::paths::DEFAULT_", "WORKSPACE)"),
+            concat!("Some(DEFAULT_", "WORKSPACE)"),
+            concat!("Some(\"def", "ault\")"),
+        ];
         for (file, text) in [
             ("gateway/mod.rs", include_str!("mod.rs")),
             ("gateway/identity.rs", include_str!("identity.rs")),
@@ -310,20 +317,29 @@ mod socket_tests {
             ("remote/terminal.rs", include_str!("../remote/terminal.rs")),
             ("remote/voice.rs", include_str!("../remote/voice.rs")),
         ] {
-            for (n, line) in text.lines().enumerate() {
-                let code = line.split("//").next().unwrap_or_default();
-                let allowed_name = code.trim() == connect_by_name;
+            let code: String = text
+                .lines()
+                .map(|l| l.split("//").next().unwrap_or_default())
+                .flat_map(str::chars)
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            let near = |i: usize| code[i..].chars().take(80).collect::<String>();
+            let lookups = code.matches(by_name).count();
+            let allowed = code.matches(connect_by_name).count();
+            assert!(
+                lookups == allowed && allowed <= usize::from(file == "gateway/mod.rs"),
+                "{file}: a lookup by name: {}",
+                code.match_indices(by_name)
+                    .map(|(i, _)| near(i))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+            for (i, _) in code.match_indices(env_lookup) {
+                let after = &code[i + env_lookup.len()..];
                 assert!(
-                    !code.contains(by_name) || allowed_name,
-                    "{file}:{}: a lookup by name: {line}",
-                    n + 1
-                );
-                assert!(
-                    !code.contains(selected)
-                        || code.contains("DEFAULT_WORKSPACE")
-                        || code.contains("Some(\"default\")"),
-                    "{file}:{}: `from_env_in` of a workspace (by id, else name): {line}",
-                    n + 1
+                    root_lookups.iter().any(|r| after.starts_with(r)),
+                    "{file}: `from_env_in` of a workspace (by id, else name): {}",
+                    near(i)
                 );
             }
         }
@@ -1229,7 +1245,7 @@ fn same_workspace(requested: &str, connected: &str, selector: &str) -> bool {
 
 /// `twr -w <id>` for the session's workspace `id`, which the child resolves by id alone
 /// ([`twr_core::paths::WORKSPACE_ID_ENV`]): once it is gone, never another workspace renamed
-/// into it, even if one is meanwhile, after the gateway looked ([`by_id`]).
+/// into it.
 fn held_twr(binary: &Path, id: &str) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(binary);
     command
@@ -2117,9 +2133,10 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
             "cli" => {
                 let args: Vec<String> = serde_json::from_value(p["args"].clone())?;
                 device_cli_args(&self.device, &args)?;
-                // The session's workspace, by its id alone: never one renamed into it since
-                // it went.
-                by_id(&workspace)?;
+                // In the session's workspace, by its id alone: never one renamed into it since
+                // it went. A command that needs it refuses it gone; `ws list` and `ws new` work
+                // from any workspace, existing or not (a phone whose workspace went lists and
+                // makes others).
                 let out = held_twr(&server.binary, &workspace)
                     .args(args)
                     .env_remove("TWR_DEVICE_TOKEN")
@@ -2176,8 +2193,8 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
                 let args = if shell {
                     vec!["-l".to_owned()]
                 } else {
-                    // As `cli`: the session's workspace by its id alone.
-                    by_id(&workspace)?;
+                    // As `cli`: the session's workspace by its id alone (commands for none, as
+                    // `remote`, take no `-w`).
                     twr_core::app_commands::plan(&args, &workspace)?
                 };
                 let held = (!shell).then_some(workspace.as_str());

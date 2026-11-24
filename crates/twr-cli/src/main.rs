@@ -2315,13 +2315,12 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         if !selected {
             bail!("{}", no_default_why(&paths.root()));
         }
-        let name = paths.workspace_id();
         let from = if cli.workspace.is_none() {
             format!(" (from {WORKSPACE_ENV})")
         } else {
             String::new()
         };
-        bail!("there is no workspace {name}{from}: create it with `twr ws new {name}` (`twr ws` lists them)");
+        bail!("{}", missing_workspace_why(&paths, &from));
     }
     let config = Config::load_from(&paths)?;
     twr_core::trace::mark("cli: config loaded");
@@ -9999,17 +9998,33 @@ async fn probe_hub(socket: &Path) -> anyhow::Result<Probe> {
     )
 }
 
+/// Why workspace `paths` (by id, which does not exist) can't be used, `from` saying where
+/// its selector came from: `twr ws new` makes it, unless another workspace has its name
+/// now (one renamed into an id once its own was removed, which a held id never reaches:
+/// [`twr_core::paths::WORKSPACE_ID_ENV`]).
+fn missing_workspace_why(paths: &Paths, from: &str) -> String {
+    let id = paths.workspace_id();
+    let named = paths
+        .root()
+        .find_workspace(id)
+        .is_ok_and(|w| w.exists() && w.workspace_id() != id);
+    if named {
+        format!(
+            "there is no workspace {id}{from}: it was removed, and another workspace has its \
+             name now (`twr ws` lists them)"
+        )
+    } else {
+        format!("there is no workspace {id}{from}: create it with `twr ws new {id}` (`twr ws` lists them)")
+    }
+}
+
 /// The data directory of the workspace a hub is to serve, checked: the root's is made when
 /// there is none yet, a named workspace's never (only `twr ws new` makes it, and a hub starting
 /// while `twr ws rm` removes it must not make it again), and a workspace that was removed has
 /// none ([`Paths::exists`]; the hub checks again under its lock, [`HubOptions::removed_marker`]).
 fn hub_data_dir(paths: &Paths) -> anyhow::Result<()> {
     if !paths.exists() {
-        let id = paths.workspace_id();
-        bail!(
-            "there is no workspace {id} (it was removed): `twr ws new {id}` makes it again \
-             (`twr ws` lists them)"
-        );
+        bail!("{}", missing_workspace_why(paths, ""));
     }
     match paths.workspace {
         None => twr_core::paths::ensure_private_dir(&paths.data_dir),
