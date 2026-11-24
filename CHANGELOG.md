@@ -13,6 +13,11 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 ### Changed
 
 - The hub's own updates about a worker in the orchestrator's conversation (a report, a request, a run of routine updates) are drawn in that worker's box, as the orchestrator's own `<thread>` sections are: framed in its color and titled with its name, in the desktop and phone apps and in the TUI. The thread is the one the update names by id (`about_thread`), never by a name another thread may have taken since; an update about no thread, and in the TUI a folded run of requests of several threads, stays unboxed ([tui.md](docs/tui.md#stack-view), [desktop.md](docs/desktop.md)).
+- A delete card in the desktop and phone apps is short: headed **Confirm deletion** (not "Question for you"), it asks **Delete 5 threads?** with a line per thread saying what it loses that nothing else keeps (`2 unpushed commits`, `3 uncommitted files`; the threads that lose nothing share one line) and what goes for good, with every worktree path, size and branch behind **Details**. The hub adds this short form to the card (`ext.twr.delete.brief`, the attention item's `delete`); its summary, which the TUI, `twr delete` and the orchestrator show, is unchanged ([desktop.md](docs/desktop.md)).
+
+### Fixed
+
+- In the desktop and phone apps' conversation, the working cursor on its own line and the shortcut to your preceding message start at the conversation's text column instead of the pane's left edge, and the shortcut row is as wide as that column. A line scrolled up under the shortcut row fades out instead of looking cut through by it ([desktop.md](docs/desktop.md)).
 
 ## [0.6.0] - 2026-11-22
 

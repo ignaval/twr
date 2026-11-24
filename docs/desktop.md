@@ -107,7 +107,9 @@ on Linux), then assistance errors. **+N** shows the others under it; dismissing 
 brings up the next.
 
 Above the history, the orchestrator and each thread's conversation show the first line
-of your preceding message, on desktop and phone. At the bottom, this is your latest
+of your preceding message, on desktop and phone, in a row of its own as wide as the
+conversation's text column (it never covers the history; a line scrolled up to the
+history's top edge fades out under it). At the bottom, this is your latest
 message. While browsing, it is the last user message whose start lies above the history
 viewport's top edge, with a 1 CSS pixel tolerance. Reaching or passing its start while
 scrolling upward changes the shortcut to the previous user message. Scrolling downward
@@ -126,8 +128,8 @@ discard keyboard focus. Scrolling and background loads never transfer focus.
 While the orchestrator, or the thread whose conversation you have open, works, the
 conversation shows the TUI's working cursor ([What is working](tui.md#what-is-working)): a
 `_` in the accent color that breathes up to a block and back, at the end of a reply that
-is streaming in, or under the last message (beside **Show full message** while a long reply
-is collapsed). It appears as you send, before the hub has started the turn or the first
+is streaming in, or under the last message at the text column's left edge (beside **Show
+full message** while a long reply is collapsed). It appears as you send, before the hub has started the turn or the first
 text arrives, stays while the turn or its background tasks run, and goes when the turn ends
 or the thread waits on you for a permission or an answer. It shows only while the
 conversation is at its bottom and takes no room, so it never moves what you read. It is
@@ -153,8 +155,14 @@ only once its options have been on screen for 600 ms: from when the card appears
 into view or the window is shown again, and from zero for a request raised again. Until then
 they show dimmed and a click or key does nothing, so the second click of a double click, or a
 key pressed as one card replaces another, can't answer the request that slid into place.
+A delete card, headed **Confirm deletion**, says it in short: the question (**Delete 5
+threads?**), a line per thread with what deleting it loses that nothing else keeps (**2
+unpushed commits**, **3 uncommitted files**; the threads that lose nothing share one line),
+and what goes for good (build output, deleted rather than moved to the trash) and for how
+long the trash keeps the rest. **Details** opens the hub's whole text, with every worktree
+path, size and branch. A card from a hub that does not give it in short shows the whole text.
 In a conversation, its requests take at most about a third of its height and scroll in their
-own area, so the composer stays in view; while a request goes on below that area's edge
+own area, above the history and never over it, so the composer stays in view; while a request goes on below that area's edge
 (its buttons, in a short window), the edge fades out, and Tab brings each button into view.
 After an answer is accepted the card shows **Sent** and its buttons stay disabled until it
 goes away. Answers need a live connection to the hub. Orchestrator messages use `say` with

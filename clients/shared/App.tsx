@@ -133,6 +133,7 @@ import {
   Markdown,
   Spinner,
 } from "./ui";
+import { DeleteBriefView } from "./DeleteBrief";
 import {
   findThread,
   pickerSources,
@@ -5618,9 +5619,17 @@ function AttentionCard({
             </button>
           </p>
         )}
-        <pre className="attention-summary" id={`${ids}-summary`}>
-          {item.summary}
-        </pre>
+        {item.delete ? (
+          <DeleteBriefView
+            brief={item.delete}
+            summary={item.summary}
+            id={`${ids}-summary`}
+          />
+        ) : (
+          <pre className="attention-summary" id={`${ids}-summary`}>
+            {item.summary}
+          </pre>
+        )}
         {item.context?.task && (
           <details>
             <summary>Task</summary>

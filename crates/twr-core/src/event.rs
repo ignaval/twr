@@ -38,8 +38,9 @@ pub const PROPOSAL_KEY: &str = "proposal";
 /// confirm deleting one or more threads (`thread.delete`): for each, its runtime, its worktree
 /// (even with uncommitted, hidden or ignored files), its `twr/<name>` branch and the thread
 /// itself go. Its value is `{threads: [{thread, name}], losses: [{thread, pending, loss}],
-/// asked_by, replaces?}`: the threads by id and name, in order, what the card says each one
-/// loses (as recorded), who asked, and the card it replaces (`twr-hub` `hub::delete`). Like a
+/// asked_by, replaces?, brief?}`: the threads by id and name, in order, what the card says each
+/// one loses (as recorded), who asked, the card it replaces, and the card in short
+/// ([`DeleteBrief`]) (`twr-hub` `hub::delete`). Like a
 /// confirm card ([`is_confirm_card`]), only the user answers it.
 pub const DELETE_KEY: &str = "delete";
 
@@ -153,6 +154,65 @@ pub fn routine_of(ext: &Option<JsonMap>) -> Option<&str> {
         .and_then(|e| e.get("twr"))
         .and_then(|t| t.get(ROUTINE_KEY))
         .and_then(Value::as_str)
+}
+
+/// `ext.twr.`[`DELETE_KEY`] key of a delete card's short form ([`DeleteBrief`]).
+pub const DELETE_BRIEF_KEY: &str = "brief";
+
+/// A delete card in short, for a client to show before (or instead of) its whole summary:
+/// its question, a line for each thread with what it loses that nothing else keeps, and what
+/// goes for good. The hub adds it to the card (`ext.twr.delete.brief`); the summary still says
+/// all of it. A card without one (raised before, or with its `ext` cut) has only the summary.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DeleteBrief {
+    /// The question (`Delete 5 threads?`, `Delete thread api (project web)?`).
+    pub title: String,
+    /// Why this card replaces another one, when it does (what changed since).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Each thread, in the card's order.
+    pub threads: Vec<DeleteBriefThread>,
+    /// What goes for good and how long the trash keeps the rest (`Deletes 1.9 GB of build
+    /// output outright; the rest (160 MB) goes to the trash for 7 days.`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<String>,
+}
+
+/// One thread of a [`DeleteBrief`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DeleteBriefThread {
+    /// Its name.
+    pub name: String,
+    /// Its project, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// What deleting it loses, in short (`2 unpushed commits, 3 uncommitted files`), or that
+    /// it loses nothing unique.
+    pub risk: String,
+    /// It cannot be deleted as things are (the summary says why).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub refused: bool,
+    /// It loses nothing that is not kept elsewhere or in the trash (a client may list such
+    /// threads together).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub clean: bool,
+}
+
+/// The short form of delete card `ext` raised on `thread`, if it is one that has it.
+pub fn delete_brief(thread: &str, ext: &Option<JsonMap>) -> Option<DeleteBrief> {
+    if thread != HUB_THREAD {
+        return None;
+    }
+    let brief = ext
+        .as_ref()?
+        .get("twr")?
+        .get(DELETE_KEY)?
+        .get(DELETE_BRIEF_KEY)?;
+    serde_json::from_value(brief.clone())
+        .ok()
+        .filter(|b: &DeleteBrief| !b.title.is_empty())
 }
 
 /// Whether an `attention.raised` on `thread` with `ext` is a delete card ([`DELETE_KEY`]).

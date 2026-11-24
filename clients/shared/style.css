@@ -881,7 +881,7 @@ kbd {
    that breathes up to three quarters of a block and back (`_ ▁ ▂ ▃ ▄ ▅ ▆ ▅ ▄ ▃ ▂ ▁`, 125 ms
    a frame), where the next text will appear. It takes no room: the inline one has no
    advance width (it never wraps a line), the one on its own line sits in the gap below the
-   last message. A pseudo-element or an empty span: never copied, never read out. Reduced
+   last message, at the text column's left edge (the column of `.transcript-virtual`). A pseudo-element or an empty span: never copied, never read out. Reduced
    motion and `[tui] animate = false` (`data-still`) keep it a still `_`. */
 .working-cursor,
 [data-working-cursor]::after {
@@ -904,6 +904,8 @@ kbd {
 .working-line {
   position: relative;
   height: 0;
+  max-width: var(--content-width);
+  margin-inline: auto;
 }
 .working-line .working-cursor {
   position: absolute;
@@ -1129,10 +1131,16 @@ kbd {
   gap: 4px;
   flex-shrink: 0;
 }
+/* The shortcut to your preceding message: a row of its own above the history (never over
+   it), as wide as the conversation's text column and starting at its left edge (the
+   history's 24px inset, then `--content-width` centered). */
 .latest-user-message {
   flex-shrink: 0;
   min-width: 0;
-  border-block: 1px solid var(--border);
+  width: calc(100% - 48px);
+  max-width: var(--content-width);
+  margin-inline: auto;
+  border-bottom: 1px solid var(--border);
 }
 .latest-user-message > button,
 .latest-user-empty {
@@ -1141,13 +1149,15 @@ kbd {
   gap: 8px;
   min-height: 44px;
   width: 100%;
-  padding: 8px 24px;
+  padding: 8px 0;
   font-size: 0.923077rem;
   line-height: 1.5;
 }
+/* Within the column, its icon in line with the messages' avatars. */
 .latest-user-message > button {
   width: fit-content;
   max-width: 100%;
+  padding-inline: 8px;
   justify-content: flex-start;
   border: 0;
   border-radius: 0;
@@ -1200,6 +1210,19 @@ kbd {
   scrollbar-width: thin;
   overflow-anchor: none;
   padding: 0 24px 20px;
+}
+/* A line scrolled up to the history's top edge fades out there instead of being cut through
+   under the row above it. It takes no room (the first message's top padding is under it). */
+.conversation-scroll::before {
+  content: "";
+  display: block;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  height: 12px;
+  margin-bottom: -12px;
+  pointer-events: none;
+  background: linear-gradient(to bottom, var(--bg), transparent);
 }
 .transcript-block {
   padding: 12px 0 20px;
@@ -3254,6 +3277,60 @@ kbd {
   color: var(--text);
   font-size: 1.076923rem;
   line-height: 1.6;
+}
+/* A delete card in short: the question, a line per thread, what goes for good. The hub's
+   whole summary waits behind Details. */
+.delete-brief {
+  font-size: 1rem;
+  line-height: 1.5;
+}
+.delete-brief-title {
+  font-size: 1.076923rem;
+  font-weight: 500;
+  margin: 0 0 6px;
+}
+.delete-brief-note,
+.delete-brief-total {
+  color: var(--muted);
+  margin: 6px 0;
+}
+.delete-brief ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.delete-brief li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 8px;
+  padding: 2px 0;
+}
+.delete-brief li > b {
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+.delete-brief-project,
+.delete-brief-risk {
+  color: var(--muted);
+}
+.delete-brief-project {
+  font-size: 0.923077rem;
+}
+.delete-brief-risk {
+  margin-left: auto;
+  text-align: end;
+}
+.delete-brief li[data-refused] .delete-brief-risk {
+  color: var(--danger);
+}
+.delete-details > summary {
+  padding-bottom: 0;
+}
+.delete-details > .attention-summary {
+  margin-top: 8px;
+  font-size: 0.961538rem;
+  overflow-wrap: anywhere;
 }
 .row-actions {
   display: flex;
