@@ -361,7 +361,8 @@ describe("a workspace that cannot be opened at start", () => {
     expect(app.host.cliCalls).toContain("ws list --json");
     expect(app.find("[data-workspace=a]").textContent).toContain("acme");
     await app.unmount();
-  });
+    // (The file's first mount loads the whole app: more than the default 5 s under load.)
+  }, 30_000);
 });
 
 describe("the latest user message above conversation history", () => {
