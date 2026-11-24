@@ -55,12 +55,16 @@ export const resolveWorkspace = (listing: Json[], selector: string) => {
 /**
  * The id of the workspace to open by default: the listing's `default` row; with none (the
  * default workspace was removed and none chosen since) the first workspace listed, as a bare
- * `twr` opens; with no workspace at all, `default`.
+ * `twr` opens; with no workspace at all, or from an older twr whose rows say nothing of a
+ * default, `default`.
  */
 export const defaultWorkspace = (listing: Json[]) => {
+  const says = listing.some(
+    (w) => typeof w === "object" && w && "default" in w,
+  );
   const row =
     listing.find((w) => typeof w === "object" && w?.default === true) ??
-    listing.find((w) => workspaceId(w));
+    (says ? listing.find((w) => workspaceId(w)) : undefined);
   return row === undefined ? "default" : workspaceId(row);
 };
 const working = (t: Thread) =>
