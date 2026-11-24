@@ -156,8 +156,8 @@ fn spawn_hub(paths: &Paths, socket: &Path, binary: &Path) -> Result<bool> {
     let mut command = std::process::Command::new(binary);
     command
         .args(["--workspace", paths.workspace_id(), "--socket"])
-        // The hub serves that id or none ([`twr_core::workspaces::HUB_ID_ENV`]).
-        .env(twr_core::workspaces::HUB_ID_ENV, paths.workspace_id())
+        // The hub serves that id or none ([`twr_core::paths::WORKSPACE_ID_ENV`]).
+        .env(twr_core::paths::WORKSPACE_ID_ENV, paths.workspace_id())
         .arg(socket)
         .arg("hub")
         .stdin(Stdio::null())

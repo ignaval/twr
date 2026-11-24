@@ -48,6 +48,14 @@ pub const DEFAULT_WORKSPACE: &str = "default";
 /// what it runs, so an agent's own `twr` calls reach the hub of its workspace.
 pub const WORKSPACE_ENV: &str = "TWR_WORKSPACE";
 
+/// Set by a process of twr that runs `twr` (or its desktop bridge) for a workspace it holds
+/// the id of (a hub it starts, what a hub runs, the phone gateway's commands and terminals,
+/// the desktop app's): a selector (`-w`, [`WORKSPACE_ENV`]) equal to it is that id, resolved
+/// by id alone ([`Paths::from_env_selected`]), so a workspace renamed into the id once its own
+/// is gone is never taken for it. Internal: a person's selectors are resolved by id, else by
+/// name.
+pub const WORKSPACE_ID_ENV: &str = "TWR_WORKSPACE_ID";
+
 /// Longest workspace name, in bytes (it is part of the socket path).
 pub const MAX_WORKSPACE_NAME: usize = 32;
 
@@ -187,6 +195,38 @@ impl Paths {
             }
         }
         Self::resolve_in(|k| std::env::var(k).ok(), workspace)
+    }
+
+    /// [`Paths::from_env_in`] for the workspace `twr` runs in (`-w`, else [`WORKSPACE_ENV`]),
+    /// which may be an id another process of twr held ([`WORKSPACE_ID_ENV`]): that one by id
+    /// alone (its paths, which do not exist once it is gone), anything else as
+    /// [`Paths::from_env_in`] has it.
+    pub fn from_env_selected(workspace: Option<&str>) -> anyhow::Result<Paths> {
+        match Self::held_id(|k| std::env::var(k).ok(), workspace) {
+            Some(id) => Self::resolve_root(&|k: &str| std::env::var(k).ok())?.workspace(&id),
+            None => Self::from_env_in(workspace),
+        }
+    }
+
+    /// [`Paths::from_env_selected`] with `env` to look up variables.
+    pub fn resolve_selected(
+        env: impl Fn(&str) -> Option<String>,
+        workspace: Option<&str>,
+    ) -> anyhow::Result<Paths> {
+        match Self::held_id(&env, workspace) {
+            Some(id) => Self::resolve_root(&env)?.workspace(&id),
+            None => Self::resolve_in(env, workspace),
+        }
+    }
+
+    /// The selector (`workspace`, else [`WORKSPACE_ENV`]) when it is the id
+    /// [`WORKSPACE_ID_ENV`] says another process of twr held.
+    fn held_id(env: impl Fn(&str) -> Option<String>, workspace: Option<&str>) -> Option<String> {
+        let selector = match workspace {
+            Some(w) => Some(w.to_string()),
+            None => env(WORKSPACE_ENV).filter(|v| !v.is_empty()),
+        }?;
+        (env(WORKSPACE_ID_ENV).as_deref() == Some(selector.as_str())).then_some(selector)
     }
 
     /// Resolves paths using `env` to look up variables (testable without touching the
@@ -1013,6 +1053,51 @@ mod tests {
         assert_eq!(root.workspace("default").unwrap(), root);
         assert_eq!(w.workspace("default").unwrap(), root);
         assert_eq!(w.workspace("client-x").unwrap(), w);
+    }
+
+    /// A selector equal to the id another process of twr held ([`WORKSPACE_ID_ENV`]) is that
+    /// id alone: once its workspace is gone, never one renamed into it, from `-w` or
+    /// [`WORKSPACE_ENV`]; any other selector is by id, else by name.
+    #[test]
+    fn a_held_id_never_resolves_by_name() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().to_string_lossy().into_owned();
+        let root = Paths::with_home(d.path());
+        crate::workspaces::create(&root, "a").unwrap();
+        crate::workspaces::create(&root, "b").unwrap();
+        std::fs::remove_dir_all(root.workspace("a").unwrap().data_dir).unwrap();
+        crate::workspaces::rename(&root, "b", "a").unwrap();
+        let typed = [("TWR_HOME", home.as_str())];
+        assert_eq!(
+            Paths::resolve_selected(env(&typed), Some("a"))
+                .unwrap()
+                .workspace_id(),
+            "b"
+        );
+        let held = [("TWR_HOME", home.as_str()), (WORKSPACE_ID_ENV, "a")];
+        let p = Paths::resolve_selected(env(&held), Some("a")).unwrap();
+        assert!(p.workspace_id() == "a" && !p.exists());
+        let by_var = [
+            ("TWR_HOME", home.as_str()),
+            (WORKSPACE_ENV, "a"),
+            (WORKSPACE_ID_ENV, "a"),
+        ];
+        let p = Paths::resolve_selected(env(&by_var), None).unwrap();
+        assert!(p.workspace_id() == "a" && !p.exists());
+        // Another selector than the held id is a person's: by id, else by name.
+        let other = [("TWR_HOME", home.as_str()), (WORKSPACE_ID_ENV, "b")];
+        assert_eq!(
+            Paths::resolve_selected(env(&other), Some("a"))
+                .unwrap()
+                .workspace_id(),
+            "b"
+        );
+        // `default`'s held id is the root slot, as ever.
+        let root_held = [("TWR_HOME", home.as_str()), (WORKSPACE_ID_ENV, "default")];
+        assert_eq!(
+            Paths::resolve_selected(env(&root_held), Some("default")).unwrap(),
+            root
+        );
     }
 
     #[test]

@@ -262,6 +262,71 @@ mod socket_tests {
         // ...and a connection to `b` made by its id refuses a call stamped `a`.
         assert!(!same_workspace("a", "b", "b"));
         assert!(same_workspace("a", "b", "a"));
+        // A session still on `a` runs no command or terminal there: `a` is gone (`by_id`), and
+        // the `twr` it would run resolves `a` by id alone, never as `b`'s name.
+        assert!(root.existing_by_id("a").is_err());
+        let cli = held_twr(Path::new("twr"), "a");
+        let cli = cli.as_std();
+        assert_eq!(
+            cli.get_args().collect::<Vec<_>>(),
+            [std::ffi::OsStr::new("-w"), std::ffi::OsStr::new("a")]
+        );
+        assert!(cli.get_envs().any(|(k, v)| {
+            k == twr_core::paths::WORKSPACE_ID_ENV && v == Some(std::ffi::OsStr::new("a"))
+        }));
+        let env = |k: &str| match k {
+            "TWR_HOME" => Some(home.path().to_string_lossy().into_owned()),
+            twr_core::paths::WORKSPACE_ID_ENV => Some("a".into()),
+            _ => None,
+        };
+        let child = twr_core::paths::Paths::resolve_selected(env, Some("a")).unwrap();
+        assert!(child.workspace_id() == "a" && !child.exists());
+        let terminal = twr_core::app_commands::plan(&["attach".into(), "t".into()], "a").unwrap();
+        assert_eq!(terminal[..2], ["-w", "a"]);
+    }
+
+    /// What this crate looks workspaces up by is an id twr held (a session's, a source's, a
+    /// push observer's, the companion's): never a lookup that falls back to names, but for a
+    /// phone's first `connect` by name ([`connect_id`]). A guard for new code: a name lookup
+    /// here needs a reason, and a place in this list.
+    #[test]
+    fn held_ids_are_never_looked_up_by_name() {
+        let by_name = concat!("find_", "workspace(");
+        let selected = concat!("from_env_", "in(Some(");
+        let connect_by_name = concat!("root.find_", "workspace(workspace)?");
+        for (file, text) in [
+            ("gateway/mod.rs", include_str!("mod.rs")),
+            ("gateway/identity.rs", include_str!("identity.rs")),
+            ("gateway/routes.rs", include_str!("routes.rs")),
+            ("gateway/settings.rs", include_str!("settings.rs")),
+            ("bridge.rs", include_str!("../bridge.rs")),
+            ("phone.rs", include_str!("../phone.rs")),
+            ("runtime.rs", include_str!("../runtime.rs")),
+            (
+                "remote/companion.rs",
+                include_str!("../remote/companion.rs"),
+            ),
+            ("remote/push.rs", include_str!("../remote/push.rs")),
+            ("remote/terminal.rs", include_str!("../remote/terminal.rs")),
+            ("remote/voice.rs", include_str!("../remote/voice.rs")),
+        ] {
+            for (n, line) in text.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or_default();
+                let allowed_name = code.trim() == connect_by_name;
+                assert!(
+                    !code.contains(by_name) || allowed_name,
+                    "{file}:{}: a lookup by name: {line}",
+                    n + 1
+                );
+                assert!(
+                    !code.contains(selected)
+                        || code.contains("DEFAULT_WORKSPACE")
+                        || code.contains("Some(\"default\")"),
+                    "{file}:{}: `from_env_in` of a workspace (by id, else name): {line}",
+                    n + 1
+                );
+            }
+        }
     }
     #[test]
     fn launcher_pairing_flags_cannot_expand_read_only_invitations() {
@@ -1145,8 +1210,12 @@ mod socket_tests {
 /// The workspace kept by id `id` (a phone's connection, a push observer, the inbox's ids),
 /// while it exists: never another workspace only named so (`Paths::existing_by_id`).
 fn by_id(id: &str) -> Result<twr_core::paths::Paths> {
-    twr_core::paths::Paths::from_env_in(Some(twr_core::paths::DEFAULT_WORKSPACE))?
-        .existing_by_id(id)
+    root_paths()?.existing_by_id(id)
+}
+
+/// The root's paths (`default`'s), from the environment: what holds every workspace.
+fn root_paths() -> Result<twr_core::paths::Paths> {
+    twr_core::paths::Paths::from_env_in(Some(twr_core::paths::DEFAULT_WORKSPACE))
 }
 
 /// Whether a call stamped with workspace `requested` is for the workspace `connected` (an id)
@@ -1156,6 +1225,17 @@ fn by_id(id: &str) -> Result<twr_core::paths::Paths> {
 /// since removed would follow its name onto the one renamed into it.
 fn same_workspace(requested: &str, connected: &str, selector: &str) -> bool {
     requested == connected || requested == selector
+}
+
+/// `twr -w <id>` for the session's workspace `id`, which the child resolves by id alone
+/// ([`twr_core::paths::WORKSPACE_ID_ENV`]): once it is gone, never another workspace renamed
+/// into it, even if one is meanwhile, after the gateway looked ([`by_id`]).
+fn held_twr(binary: &Path, id: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .args(["-w", id])
+        .env(twr_core::paths::WORKSPACE_ID_ENV, id);
+    command
 }
 
 /// The id of the workspace a phone's `connect` of `workspace` in `root` is to: with `by_id`
@@ -1706,8 +1786,7 @@ impl Session {
                 // By its id, whichever of its names the phone used: what its hub, the inbox
                 // sources and the push observers name it by (a rename leaves it). An app
                 // reconnecting with the id it was given (`by_id`) gets that workspace or none.
-                let root =
-                    twr_core::paths::Paths::from_env_in(Some(twr_core::paths::DEFAULT_WORKSPACE))?;
+                let root = root_paths()?;
                 let selector = workspace.to_string();
                 let id = connect_id(&root, workspace, p["by_id"].as_bool() == Some(true))?;
                 let workspace = id.as_str();
@@ -1800,6 +1879,12 @@ impl Session {
                 )
                 .await?;
                 let paths = bridge.call("desktop.paths", json!({})).await?;
+                // The companion serves that id, or the connection is not made: never another
+                // workspace a lookup found meanwhile.
+                anyhow::ensure!(
+                    paths["workspace"].as_str() == Some(workspace),
+                    "there is no workspace {workspace} (it was removed or replaced meanwhile)"
+                );
                 // Prove device identity before presenting the connection as usable.
                 bridge.call("hub.info", json!({})).await?;
                 self.bridge_generation.store(generation, Ordering::SeqCst);
@@ -2032,8 +2117,10 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
             "cli" => {
                 let args: Vec<String> = serde_json::from_value(p["args"].clone())?;
                 device_cli_args(&self.device, &args)?;
-                let out = tokio::process::Command::new(&server.binary)
-                    .args(["-w", &workspace])
+                // The session's workspace, by its id alone: never one renamed into it since
+                // it went.
+                by_id(&workspace)?;
+                let out = held_twr(&server.binary, &workspace)
                     .args(args)
                     .env_remove("TWR_DEVICE_TOKEN")
                     .output()
@@ -2089,8 +2176,11 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
                 let args = if shell {
                     vec!["-l".to_owned()]
                 } else {
+                    // As `cli`: the session's workspace by its id alone.
+                    by_id(&workspace)?;
                     twr_core::app_commands::plan(&args, &workspace)?
                 };
+                let held = (!shell).then_some(workspace.as_str());
                 let binary = if shell {
                     PathBuf::from(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()))
                 } else {
@@ -2105,6 +2195,7 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
                 if !shell {
                     let out = tokio::process::Command::new(&binary)
                         .arg("--desktop-validate")
+                        .env(twr_core::paths::WORKSPACE_ID_ENV, &workspace)
                         .args(&args)
                         .output()
                         .await?;
@@ -2120,6 +2211,7 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
                     cwd,
                     p["title"].as_str().unwrap_or("Remote terminal").to_owned(),
                     workspace.clone(),
+                    held,
                     self.terminal_events.clone(),
                     vec![device_permit, server_permit],
                 )?;
@@ -2189,7 +2281,7 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
             // this machine can make for it.
             "voice-voices" => {
                 remote::voice::allowed(&self.device)?;
-                let chosen = self.voice_store(&workspace)?.load()?.voices;
+                let chosen = self.voice_store()?.load()?.voices;
                 let natural = match remote::voice::natural_listing(&server.binary).await {
                     Ok(listing) => listing,
                     Err(e) => json!({"voices": [], "models": [], "error": format!("{e:#}")}),
@@ -2204,7 +2296,7 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
                 remote::voice::allowed(&self.device)?;
                 let lang = p["lang"].as_str().context("Language required")?;
                 let voice = p["voice"].as_str().filter(|v| !v.is_empty());
-                let chosen = remote::voice::select(&self.voice_store(&workspace)?, lang, voice)?;
+                let chosen = remote::voice::select(&self.voice_store()?, lang, voice)?;
                 Ok(json!({"by_language": chosen}))
             }
             // Downloads a model onto this machine: as much as `operate` may change here.
@@ -2234,9 +2326,10 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
     }
 }
 impl Session {
-    /// The state file of this device's speaker (its voices too).
-    fn voice_store(&self, workspace: &str) -> Result<twr_speech::StateStore> {
-        let paths = twr_core::paths::Paths::from_env_in(Some(workspace))?;
+    /// The state file of this device's speaker (its voices too), in the root's data
+    /// directory, whichever workspace the session is in.
+    fn voice_store(&self) -> Result<twr_speech::StateStore> {
+        let paths = root_paths()?;
         remote::voice::state_store(&paths.root().data_dir.join("mobile"), &self.device.id)
     }
 

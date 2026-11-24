@@ -122,6 +122,8 @@ Any workspace can be renamed, `default` too, its hub running or not. Nothing mov
 
 The original name keeps selecting the workspace: `-w client-x` still reaches acme, as does what an agent of acme runs. So no other workspace can be named `client-x` while acme exists (`twr ws` lists it as `acme (was client-x)`); acme can take it back with `twr ws rename acme client-x`. That alias is not a workspace of its own and holds nothing: removing acme frees both names. Likewise only the workspace in twr's data directory can be named `default`. A new name follows the usual rules and can't be another workspace's name or original name.
 
+Once acme is removed, its original name is free, and another workspace may be renamed `client-x`. A name you type (`-w client-x`, `/ws client-x`) then reaches that one. What twr itself keeps by acme's id never does: a hub started for it, what its hub runs, the desktop app's last workspace and its windows' commands and terminals, a phone's connection, its queued requests, notifications and saved inbox: those reach acme or nothing, and say it is gone.
+
 ## The default workspace
 
 ```sh

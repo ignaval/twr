@@ -550,7 +550,8 @@ impl Service {
         command
             .args(["runner", "fetch-service", "--slot"])
             .arg(&slot)
-            .env_remove("TWR_WORKSPACE");
+            .env_remove("TWR_WORKSPACE")
+            .env_remove(twr_core::paths::WORKSPACE_ID_ENV);
         let output =
             twr_adapters::process::run_bounded(command, Duration::from_secs(15 * 60), 4096, |_| {
                 false

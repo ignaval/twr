@@ -69,6 +69,7 @@ async fn managed_worker_reconnects_and_a_retired_grant_cannot_restart() -> Resul
                 .env("TWR_AGENT_PROBE", "off")
                 .env("TWR_BOX_PROBE", "off")
                 .env_remove("TWR_WORKSPACE")
+                .env_remove("TWR_WORKSPACE_ID")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())

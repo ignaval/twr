@@ -1592,24 +1592,21 @@ fn main() -> ExitCode {
     // starts its workers.
     if matches!(cli.cmd, Some(Cmd::Hub { cmd: None })) {
         std::env::remove_var(twr_hub::host::AGENT_ENV);
-        // The id its starter knows the workspace by, checked once it is resolved (`run`).
-        if let Some(id) = std::env::var_os(twr_core::workspaces::HUB_ID_ENV) {
-            let _ = HUB_ID.set(id.to_string_lossy().into_owned());
-            std::env::remove_var(twr_core::workspaces::HUB_ID_ENV);
-        }
         // What the hub runs inherits the id of the workspace it serves (`default` for the
-        // root slot too), so an agent's own `twr` calls reach this hub whatever its name
-        // becomes, and whichever workspace becomes the default (a selection that fails, or is
-        // not UTF-8, stays as it is: `run` refuses it, before anything starts).
-        // Resolved once: the hub serves that id too (`run` resolves `-w` again, and a name
-        // may go to another workspace meanwhile).
-        if let Ok(paths) = Paths::from_env_in(cli.workspace.as_deref()) {
+        // root slot too), held ([`twr_core::paths::WORKSPACE_ID_ENV`]): an agent's own `twr`
+        // calls reach this hub's workspace whatever its name becomes, whichever workspace
+        // becomes the default, and none once it is gone (a selection that fails, or is not
+        // UTF-8, stays as it is: `run` refuses it, before anything starts).
+        // Resolved once: the hub serves that id too (`run` resolves it again, by id alone,
+        // as its starter's id is: a hub started for an id serves that one or none).
+        if let Ok(paths) = Paths::from_env_selected(cli.workspace.as_deref()) {
             // Nothing chosen and no default workspace: left as it is, for `run` to say why
             // (there is no default), not that `default` does not exist.
             let chosen = cli.workspace.is_some()
                 || std::env::var_os(WORKSPACE_ENV).is_some_and(|v| !v.is_empty());
             if chosen || paths.exists() {
                 std::env::set_var(WORKSPACE_ENV, paths.workspace_id());
+                std::env::set_var(twr_core::paths::WORKSPACE_ID_ENV, paths.workspace_id());
                 cli.workspace = Some(paths.workspace_id().to_string());
             }
         }
@@ -1618,6 +1615,7 @@ fn main() -> ExitCode {
     // nothing it runs inherits one.
     if matches!(cli.cmd, Some(Cmd::Runner { .. })) {
         std::env::remove_var(WORKSPACE_ENV);
+        std::env::remove_var(twr_core::paths::WORKSPACE_ID_ENV);
     }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1756,9 +1754,6 @@ static WORKSPACE_HINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// The workspace the hub a command connects to must serve, when the socket was not given
 /// (`--socket`): set once by `run` ([`check_workspace`]).
 static EXPECTED_WORKSPACE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// The id a hub's starter knows its workspace by ([`twr_core::workspaces::HUB_ID_ENV`]).
-static HUB_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Refuses a hub that serves another workspace than the command's ([`EXPECTED_WORKSPACE`]),
 /// by what its `hello` said: it took the socket of that workspace (`--socket` when it
@@ -2036,18 +2031,11 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // A runner's default storage is the root's (`main` removed `TWR_WORKSPACE` for it).
     let mut paths = match cli.cmd {
         Some(Cmd::Runner { .. }) => Paths::from_env_in(Some(DEFAULT_WORKSPACE))?,
-        _ => Paths::from_env_in(cli.workspace.as_deref())?,
+        // An id another process of twr held is that workspace or none (a hub started for
+        // it, a command the phone gateway runs): never one renamed into it since its own went
+        // ([`twr_core::paths::WORKSPACE_ID_ENV`]).
+        _ => Paths::from_env_selected(cli.workspace.as_deref())?,
     };
-    // A hub started for an id serves that one: once it is gone, `-w <id>` may name another
-    // workspace (renamed into its id since), whose data is not this hub's to open.
-    if let Some(id) = HUB_ID.get() {
-        if paths.workspace_id() != id {
-            bail!(
-                "there is no workspace {id} (it was removed): `twr ws new {id}` makes it again \
-                 (`twr ws` lists them)"
-            );
-        }
-    }
     // Whether `-w` or `TWR_WORKSPACE` chose the workspace (else it is the default one).
     let selected =
         cli.workspace.is_some() || std::env::var_os(WORKSPACE_ENV).is_some_and(|v| !v.is_empty());
@@ -5124,6 +5112,7 @@ async fn prewarm_installed(new_exe: &Path) {
     let prewarm = tokio::process::Command::new(new_exe)
         .args(["log", "checkpoint", "--all"])
         .env_remove(twr_core::paths::WORKSPACE_ENV)
+        .env_remove(twr_core::paths::WORKSPACE_ID_ENV)
         .status()
         .await;
     if !prewarm.is_ok_and(|s| s.success()) {
@@ -10060,9 +10049,9 @@ fn spawn_hub(socket: &Path, paths: &Paths) -> anyhow::Result<bool> {
         .arg(socket)
         .arg("--workspace")
         // By id: the hub serves this workspace even if it is renamed meanwhile, and none if
-        // it is removed meanwhile ([`twr_core::workspaces::HUB_ID_ENV`]).
+        // it is removed meanwhile ([`twr_core::paths::WORKSPACE_ID_ENV`]).
         .arg(paths.workspace_id())
-        .env(twr_core::workspaces::HUB_ID_ENV, paths.workspace_id())
+        .env(twr_core::paths::WORKSPACE_ID_ENV, paths.workspace_id())
         .arg("hub")
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)

@@ -45,8 +45,9 @@ pub struct AttachGrant {
     /// Environment changes: a string sets the variable, `null` removes it. Always sets
     /// [`ATTACH_ENV`] (the marker the client's process carries, see `attach.child`) and
     /// [`AGENT_ENV`] (`<thread>:attach.<lease>`: what it and its descendants start is the
-    /// thread's agent, `hub::agents`); on the hub's own box also `TWR_WORKSPACE`, the hub's
-    /// workspace (`null` for `default`).
+    /// thread's agent, `hub::agents`); on the hub's own box also `TWR_WORKSPACE` and
+    /// `TWR_WORKSPACE_ID`, the hub's workspace id (`default` for the root slot), held
+    /// ([`twr_core::paths::WORKSPACE_ID_ENV`]).
     pub env: Map<String, Value>,
     /// Session the command resumes.
     pub session_id: String,
@@ -342,14 +343,19 @@ impl Core {
         // An agent's own `twr` calls from the attached CLI reach this hub's workspace, by its
         // id (`default` for the root slot too): whatever it is renamed to, and whichever
         // workspace is the default. A remote box's CLI runs there, not under the local `ssh`.
+        // Held ([`twr_core::paths::WORKSPACE_ID_ENV`]): once it is gone, never another
+        // workspace renamed into that id.
         if grant.box_name.is_none() {
-            grant.env.insert(
-                twr_core::paths::WORKSPACE_ENV.to_string(),
-                json!(hub
-                    .workspace
-                    .as_deref()
-                    .unwrap_or(twr_core::paths::DEFAULT_WORKSPACE)),
-            );
+            let id = hub
+                .workspace
+                .as_deref()
+                .unwrap_or(twr_core::paths::DEFAULT_WORKSPACE);
+            grant
+                .env
+                .insert(twr_core::paths::WORKSPACE_ENV.to_string(), json!(id));
+            grant
+                .env
+                .insert(twr_core::paths::WORKSPACE_ID_ENV.to_string(), json!(id));
         }
         self.rt(id).attach = Some(AttachLease {
             lease,

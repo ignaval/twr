@@ -17,6 +17,7 @@ fn command(home: &Path, args: &[&str]) -> Command {
     c.args(args)
         .env("TWR_HOME", home)
         .env_remove("TWR_WORKSPACE")
+        .env_remove("TWR_WORKSPACE_ID")
         .env_remove("RUST_LOG")
         .env("TWR_TEST_USER_TOKEN_FILE", test_token())
         // No hub or runner of a test runs the user's login shell or real agent CLIs.
@@ -2147,6 +2148,37 @@ fn a_hub_starting_as_its_workspace_is_removed_does_not_make_it_again() {
 /// A hub started for a workspace by id serves that one or none: once it is removed and
 /// another is renamed into its id, `-w <id>` names that other workspace, whose data the hub
 /// started for the first one never opens.
+/// A command another process of twr runs for a workspace id it held (`TWR_WORKSPACE_ID`, as
+/// the phone gateway's commands and terminals, the desktop app's and what a hub runs carry)
+/// reaches that workspace or none: never one renamed into the id once its own is gone. A
+/// person's `-w` of the same name reaches the one so named.
+#[test]
+fn a_held_id_never_reaches_a_workspace_renamed_into_it() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    ok(home, &["ws", "new", "a"]);
+    ok(home, &["ws", "new", "b"]);
+    ok(home, &["ws", "rm", "a", "--yes"]);
+    ok(home, &["ws", "rename", "b", "a"]);
+    let gone = "there is no workspace a";
+    let typed = fails(home, &["-w", "a", "thread", "list"]);
+    assert!(!typed.contains(gone), "{typed}");
+    for (args, var) in [
+        (&["-w", "a", "thread", "list"][..], None),
+        (&["thread", "list"][..], Some("a")),
+    ] {
+        let mut c = command(home, args);
+        c.env("TWR_WORKSPACE_ID", "a");
+        if let Some(var) = var {
+            c.env("TWR_WORKSPACE", var);
+        }
+        let out = c.output().unwrap();
+        assert!(!out.status.success());
+        let e = String::from_utf8_lossy(&out.stderr);
+        assert!(e.contains(gone), "{args:?}: {e}");
+    }
+}
+
 #[test]
 fn a_hub_started_by_id_never_serves_a_workspace_renamed_into_it() {
     let home = tempfile::tempdir().unwrap();
@@ -2167,15 +2199,12 @@ fn a_hub_started_by_id_never_serves_a_workspace_renamed_into_it() {
             "hub",
         ],
     )
-    .env("TWR_HUB_WORKSPACE_ID", "a")
+    .env("TWR_WORKSPACE_ID", "a")
     .output()
     .unwrap();
     assert!(!out.status.success());
     let e = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        e.contains("there is no workspace a (it was removed)"),
-        "{e}"
-    );
+    assert!(e.contains("there is no workspace a"), "{e}");
     assert!(!b.db_file().exists());
     assert!(!a.data_dir.exists());
 }

@@ -34,7 +34,9 @@ That is the socket of the workspace in twr's data directory, id `default`. Anoth
 `W` (by id) is a hub of its own, at `ws/W.sock` beside it (`X/ws/W.sock`,
 `$XDG_RUNTIME_DIR/twr/ws/W.sock`, ...), with its data in `<data>/workspaces/W/`. Which one a
 command reaches: `-w <name or id>`, else `$TWR_WORKSPACE` (which a workspace's hub sets to
-its id for what it runs), else the default workspace: the one `default-workspace` in twr's
+its id for what it runs, with `$TWR_WORKSPACE_ID` the same: a selector equal to that is the id
+alone, so once the workspace is removed it reaches none, never another renamed into its
+original name), else the default workspace: the one `default-workspace` in twr's
 data directory names (`twr ws default <name>`), else `default` itself, while it exists. With
 none (it was removed and no other made the default), commands need `-w`. `hub.info` reports
 its id as `workspace` and its name (a rename changes only that) as `workspace_name`.

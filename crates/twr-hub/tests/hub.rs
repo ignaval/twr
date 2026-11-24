@@ -2647,7 +2647,7 @@ async fn attach_while_idle_quiesces_and_detach_runs_the_queue() {
         grant.env.iter().all(|(k, v)| v.is_null()
             || k == "TWR_ATTACH"
             || k == "TWR_AGENT"
-            || (k == "TWR_WORKSPACE" && v == "default"))
+            || ((k == "TWR_WORKSPACE" || k == "TWR_WORKSPACE_ID") && v == "default"))
             && !grant.env.contains_key("TWR_THREAD"),
         "{:?}",
         grant.env

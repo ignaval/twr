@@ -408,7 +408,11 @@ pub async fn run(workspace: String) -> Result<()> {
         anyhow::ensure!(token.len() == 64, "Invalid device credential");
         let _ = DEVICE_TOKEN.set(token.to_owned());
     }
-    let paths = Arc::new(Paths::from_env_in(Some(&workspace))?);
+    // An id its starter held (the gateway's, the desktop app's: [`WORKSPACE_ID_ENV`]) by id
+    // alone; a name the desktop app was given (`TWR_WORKSPACE`) as `-w` takes it.
+    //
+    // [`WORKSPACE_ID_ENV`]: twr_core::paths::WORKSPACE_ID_ENV
+    let paths = Arc::new(Paths::from_env_selected(Some(&workspace))?);
     let config = Config::load_from(&paths);
     let socket = config
         .as_ref()

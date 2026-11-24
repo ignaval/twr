@@ -48,12 +48,6 @@ pub const DEFAULT_FILE: &str = "default-workspace";
 /// The file in the root's data directory that says the root slot's workspace was removed.
 pub const REMOVED_FILE: &str = "workspace-removed";
 
-/// Set by a process that starts a hub for a workspace it knows by id (`twr`, the desktop app,
-/// with `--workspace <id>`): the hub serves that id or none, never a workspace that a name
-/// fallback would find once that one is gone ([`Paths::find_workspace`]). The hub removes it
-/// from what it runs.
-pub const HUB_ID_ENV: &str = "TWR_HUB_WORKSPACE_ID";
-
 /// The lock in the root's data directory held while workspaces are created, renamed, removed
 /// or made the default, so two of those never pass the same check.
 pub const REGISTRY_LOCK: &str = "workspaces.lock";
