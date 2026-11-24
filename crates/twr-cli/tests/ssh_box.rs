@@ -2850,7 +2850,10 @@ fn box_project_guards_come_first() {
         .unwrap();
     assert!(!out.status.success());
     assert!(
-        said(&out).contains("boxes belong to the default workspace's hub"),
+        said(&out).contains(
+            "boxes belong to the hub of the workspace in twr's data directory (default), not \
+             workspace other's: run `twr -w default box project`"
+        ),
         "{}",
         said(&out)
     );

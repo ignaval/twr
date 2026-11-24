@@ -17,7 +17,7 @@ twr thread new api --box gpu
 4. It writes `[boxes.gpu]` with `transport = "ssh"` and the destination to `boxes.toml`, next to `config.toml`, and adds the box to the running hub (`box.add`), starting the hub when none runs.
 5. It waits up to 90 seconds for the box to come online and prints each state on the way: `connecting`, then `online` with the twr version and how to start a thread there. On a timeout it prints the state, the last error and the box's notes, and exits non-zero.
 
-Boxes belong to the default workspace's hub: `twr -w <name> box add` is refused.
+Boxes belong to the hub of the workspace in twr's data directory, `default` (whatever you renamed it to, and whichever workspace is the default): `twr -w <name> box add` is refused for a workspace you created, and says to run `twr -w default box add`. `twr box list` there says the same rather than listing none.
 
 ### What the hub does
 
