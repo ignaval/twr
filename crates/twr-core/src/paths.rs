@@ -346,6 +346,16 @@ impl Paths {
         if self.workspace.is_some() || self.data_dir.join(crate::workspaces::NAME_FILE).exists() {
             return self.display_name();
         }
+        self.base_instance_name()
+    }
+
+    /// [`Paths::instance_name`] as it is before any rename: a named workspace's id; else the
+    /// `TWR_HOME` directory's name, or `default`. A hub reports its name file's name over it
+    /// while there is one, read as it is asked (`hub.info` `instance`).
+    pub fn base_instance_name(&self) -> String {
+        if let Some(id) = &self.workspace {
+            return id.clone();
+        }
         let Some(home) = self.instance_home() else {
             return "default".into();
         };

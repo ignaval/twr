@@ -3644,7 +3644,7 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
     opts.boxes_lock = boxes_lock;
     opts.removed_boxes = removed_boxes;
     opts.config_file = Some(paths.config_file.clone());
-    opts.instance_name = paths.instance_name();
+    opts.instance_name = paths.base_instance_name();
     opts.workspace = paths.workspace.clone();
     // Its name, read as it is asked (a rename moves nothing, so the hub keeps running), and
     // for the root slot what says it was removed, checked under the hub's lock.

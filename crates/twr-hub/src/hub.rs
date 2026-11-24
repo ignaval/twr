@@ -1026,12 +1026,23 @@ impl Inner {
             .workspace
             .as_deref()
             .unwrap_or(twr_core::paths::DEFAULT_WORKSPACE);
+        self.renamed().unwrap_or_else(|| id.to_string())
+    }
+
+    /// The name its workspace was renamed to, as it is now ([`HubOptions::workspace_name_file`]);
+    /// `None` while it has its id for a name.
+    fn renamed(&self) -> Option<String> {
         self.workspace_name_file
             .as_ref()
             .and_then(|f| std::fs::read_to_string(f).ok())
             .and_then(|t| t.lines().next().map(|l| l.trim().to_string()))
             .filter(|n| twr_core::paths::workspace_name_error(n).is_none())
-            .unwrap_or_else(|| id.to_string())
+    }
+
+    /// `hub.info`'s `instance`: the workspace's name once it was renamed, read as it is asked,
+    /// else [`HubOptions::instance_name`].
+    fn instance(&self) -> String {
+        self.renamed().unwrap_or_else(|| self.instance_name.clone())
     }
 
     fn core(&self) -> MutexGuard<'_, Core> {
@@ -3176,7 +3187,7 @@ impl Hub {
             "listening": self.inner.listening.load(std::sync::atomic::Ordering::Relaxed),
             "pid": std::process::id(),
             "db": self.inner.db_path,
-            "instance": self.inner.instance_name,
+            "instance": self.inner.instance(),
             "workspace": self.workspace(),
             "workspace_name": self.workspace_name(),
             "started_at": self.inner.started_at,

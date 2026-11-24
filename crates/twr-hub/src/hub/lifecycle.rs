@@ -1542,6 +1542,10 @@ mod tests {
         assert_eq!(hub.workspace(), "default");
         assert_eq!(hub.workspace_name(), "main");
         assert_eq!(hub.info()["workspace_name"], "main");
+        // So does its instance, read as it is asked, and its own again once renamed back.
+        assert_eq!(hub.info()["instance"], "main");
+        std::fs::remove_file(&name).unwrap();
+        assert_eq!(hub.info()["instance"], "default");
         hub.shutdown().await;
     }
 
