@@ -1,0 +1,133 @@
+{
+  "about": "Test vectors for docs/relay-protocol.md version 1. Byte strings are hex unless the field is base64url (b64 in the spec: pins, keys, spki, sig, body). Frozen once version 1 is released.",
+  "admissions": {
+    "pair": {
+      "json": {
+        "a": "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c",
+        "b": "6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1",
+        "expires": 1802592000,
+        "kind": "pair",
+        "sig_a": "PP8km2aBMqOn4zGKL2VaZPAUdWutp_mcW4jfFE9UikOHmMoIU4fO7k-1p5hV-BZui7zbqaW6-P9kZFN3JAJEDA",
+        "sig_b": "KFpXSS-cimL3YqXLMkIp2dKpdNxHJgayn3G1ZXOu7XsL3OnTTMskbneOM4_KGMmS48ow49ZQRdPOlgv1d4UfCA",
+        "v": 1
+      },
+      "seed_a": "0404040404040404040404040404040404040404040404040404040404040404",
+      "seed_b": "0505050505050505050505050505050505050505050505050505050505050505",
+      "signed": "7477722d72656c61792061646d6974207631007061697200ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1000000006b715f00"
+    },
+    "pairing": {
+      "json": {
+        "endpoint": "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c",
+        "issued": 1800000000,
+        "kind": "pairing",
+        "sig": "Zg9dQlnEjYQlshgZzQbrXyyNtWwpwL64W8IyWF3ZSsFXmHxedSxXV2H3k8pQor801gt_R1TxR2Hgp26wddzvBw",
+        "v": 1
+      },
+      "seed": "0404040404040404040404040404040404040404040404040404040404040404",
+      "signed": "7477722d72656c61792061646d69742076310070616972696e6700ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c000000006b49d200"
+    }
+  },
+  "frames": [
+    {
+      "bytes": "000000157b2274797065223a2270696e67222c226e223a317d",
+      "message": {
+        "n": 1,
+        "type": "ping"
+      }
+    }
+  ],
+  "hub_auth": [
+    {
+      "exporter": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "hub_name": "wcgv67nstr2cu6vy5tffl4e6ye",
+      "key": "ed25519",
+      "pin": "_RENMB0vB33hQUuPmfRBsUA_qyB7IFL70sBl5O6OfcI",
+      "seed": "0101010101010101010101010101010101010101010101010101010101010101",
+      "sig": "IBthn1O_DxjLKbOXoa1v8sQgGCcEH_jtDc8nwCARbJEAO2RHJIfA0m91XmoUgPwbAoqnSfGu8m5Fz7aBtE0TCQ",
+      "signed": "7477722d72656c6179206875622d61757468207631005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "spki": "MCowBQYDK2VwAyEAiojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w"
+    },
+    {
+      "exporter": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "hub_name": "bos3klb3n42cjxmdnyo76fs2v4",
+      "key": "p256",
+      "pin": "ypot6r_r2ZD7n0Bik13L2TMJjwylvAjQ-ZvHtUHs8LQ",
+      "pkcs8": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgEixb-D0TOXkeSXy3eG4u7b_AcVmAX1JHbbDQ7O3JWOOhRANCAAT1cDuWhe_mZpz6t5_iImxvVa4UFtH6G1GqNnRvNLvnGp9-6rsBcZX3PsD6hMjYp4JJlpHk2oblEpbMA8HXLAu8",
+      "sig": "MEUCIHDUZUo11ju8ie556Yrmfnv2oHleD-xOI-HiTHg_k5MIAiEAzDvADlWM1hs0EX15m4z82aNsv1CTSRL6-hxhzqwzhP0",
+      "sig_note": "ECDSA signatures are randomized: verify this one, don't expect to reproduce it",
+      "signed": "7477722d72656c6179206875622d61757468207631005a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "spki": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE9XA7loXv5mac-ref4iJsb1WuFBbR-htRqjZ0bzS75xqffuq7AXGV9z7A-oTI2KeCSZaR5NqG5RKWzAPB1ywLvA"
+    }
+  ],
+  "hub_names": [
+    {
+      "hub_name": "ujh5zfe5wpsmvz367hb7r7xg5m",
+      "pin": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    {
+      "hub_name": "gmqcspn4xkftldjlthx65azwim",
+      "pin": "__________________________________________8"
+    },
+    {
+      "hub_name": "wcgv67nstr2cu6vy5tffl4e6ye",
+      "pin": "_RENMB0vB33hQUuPmfRBsUA_qyB7IFL70sBl5O6OfcI"
+    }
+  ],
+  "moved": {
+    "body": "eyJodWIiOiJ3Y2d2Njduc3RyMmN1NnZ5NXRmZmw0ZTZ5ZSIsImlzc3VlZCI6MTgwMDAwMDAwMCwicm91dGVzIjpbInJlbGF5Oi8vdXMucmVsYXkudHdyLnRvb2xzIiwiMjAzLjAuMTEzLjU6NDczMjEiXX0",
+    "body_text": "{\"hub\":\"wcgv67nstr2cu6vy5tffl4e6ye\",\"issued\":1800000000,\"routes\":[\"relay://us.relay.twr.tools\",\"203.0.113.5:47321\"]}",
+    "issued": 1800000000,
+    "routes": [
+      "relay://us.relay.twr.tools",
+      "203.0.113.5:47321"
+    ],
+    "seed": "0101010101010101010101010101010101010101010101010101010101010101",
+    "sig": "HQY2O-3FXscnSYvcZiCBRLtspbmxLNbNsi48fRSMisY72HS0I4FLC_wmHoNRbo61DtoOKbnw0ygKhnDSM57yDw",
+    "spki": "MCowBQYDK2VwAyEAiojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w"
+  },
+  "record_signable": {
+    "packet": "000000000000000000000000",
+    "signable": "333a736571693138303030303030303030303030303065313a7631323a000000000000000000000000",
+    "signable_text": "3:seqi1800000000000000e1:v12:\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0",
+    "timestamp_us": 1800000000000000
+  },
+  "tags": [
+    {
+      "hub_name": "wcgv67nstr2cu6vy5tffl4e6ye",
+      "label": "wcgv67nstr2cu6vy5tffl4e6ye-paqfkk3avqo4tnwlwk4pwlrndq",
+      "relay_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
+      "sni": "wcgv67nstr2cu6vy5tffl4e6ye-paqfkk3avqo4tnwlwk4pwlrndq.eu.relay.twr.tools",
+      "tag": "paqfkk3avqo4tnwlwk4pwlrndq",
+      "unix_seconds_example": 0,
+      "window": 0
+    },
+    {
+      "hub_name": "wcgv67nstr2cu6vy5tffl4e6ye",
+      "label": "wcgv67nstr2cu6vy5tffl4e6ye-yx5wlsmwdj3i4ec2i2g3swwaji",
+      "relay_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
+      "sni": "wcgv67nstr2cu6vy5tffl4e6ye-yx5wlsmwdj3i4ec2i2g3swwaji.eu.relay.twr.tools",
+      "tag": "yx5wlsmwdj3i4ec2i2g3swwaji",
+      "unix_seconds_example": 1800000000,
+      "window": 6000000
+    },
+    {
+      "hub_name": "wcgv67nstr2cu6vy5tffl4e6ye",
+      "label": "wcgv67nstr2cu6vy5tffl4e6ye-3ebmrc4vn3gjjwuf4alc3pafny",
+      "relay_key": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+      "sni": "wcgv67nstr2cu6vy5tffl4e6ye-3ebmrc4vn3gjjwuf4alc3pafny.eu.relay.twr.tools",
+      "tag": "3ebmrc4vn3gjjwuf4alc3pafny",
+      "unix_seconds_example": 1800000300,
+      "window": 6000001
+    },
+    {
+      "hub_name": "wcgv67nstr2cu6vy5tffl4e6ye",
+      "label": "wcgv67nstr2cu6vy5tffl4e6ye-wyotzdu32srn6nehykvkaojg7q",
+      "relay_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "sni": "wcgv67nstr2cu6vy5tffl4e6ye-wyotzdu32srn6nehykvkaojg7q.eu.relay.twr.tools",
+      "tag": "wyotzdu32srn6nehykvkaojg7q",
+      "unix_seconds_example": 18446744073709551600,
+      "window": 61489146912365172
+    }
+  ],
+  "version": 1
+}
