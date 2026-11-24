@@ -31,6 +31,8 @@ const combined = new URLSearchParams(location.search).has("combined");
 const short = new URLSearchParams(location.search).has("short");
 const sparse = new URLSearchParams(location.search).has("sparse");
 const fastHistory = new URLSearchParams(location.search).has("fast-history");
+// The hub runs another build of the app's version: the engine notice shows in the strip.
+const engineNotice = new URLSearchParams(location.search).has("engine-notice");
 const historyRequests: string[] = [];
 // Replay streamed final-only history only in the identity-cutoff reload scenario.
 const replayHistory = new URLSearchParams(location.search).has(
@@ -230,7 +232,16 @@ window.twr = {
         },
       });
     }, 0);
-    return {};
+    return engineNotice
+      ? {
+          version: "0.6.0",
+          build: "463a2ed0aaaaaaaa",
+          hubVersion: "0.6.0",
+          hubBuild: "85ab7b43eecbe2ec",
+          engineDifference: "build",
+          versionMismatch: true,
+        }
+      : {};
   },
   rpc: async (method: string, params: Json = {}) => {
     if (method === "desktop.subscribe") subscription = params.subscription;

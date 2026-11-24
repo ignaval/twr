@@ -1187,6 +1187,62 @@ try {
     );
     await page.close();
   }
+  {
+    // A notice that wraps in a short, narrow window (the engine notice, three lines and its
+    // buttons at 420px) left a waiting request 3px: its answers sat under the conversation.
+    // While a request waits, the notices keep to two lines and the request keeps room.
+    const page = await browser.newPage({
+      viewport: { width: 420, height: 480 },
+    });
+    await page.goto(`${url}?fast-history&engine-notice`);
+    await page.locator('[data-notice="version"]').waitFor();
+    await page.evaluate(() => {
+      const qa = window.conversationScrollQA;
+      qa.setThreads(qa.threads(), [
+        {
+          attn_id: "perm",
+          revision: 1,
+          thread: "hub",
+          reason: "permission",
+          options: ["allow", "deny"],
+          summary:
+            "Bash LAYOUT_BOUNDARY " +
+            "Review this command carefully. ".repeat(300),
+        },
+      ]);
+    });
+    const request = page
+      .locator(".conversation-attention .attention-card")
+      .filter({ hasText: "LAYOUT_BOUNDARY" });
+    await request.waitFor();
+    const deny = request
+      .locator(".attention-options button")
+      .filter({ hasText: "deny" });
+    await deny.scrollIntoViewIfNeeded();
+    await frames(page);
+    const reach = await deny.evaluate((button) => {
+      const r = button.getBoundingClientRect();
+      const hit = document.elementFromPoint(
+        r.left + r.width / 2,
+        r.top + r.height / 2,
+      );
+      return {
+        hit: !!hit && (hit === button || button.contains(hit)),
+        requests: document
+          .querySelector(".conversation-attention")
+          .getBoundingClientRect().height,
+        strip: document.querySelector(".status-strip").getBoundingClientRect()
+          .height,
+      };
+    });
+    expect(reach.hit, JSON.stringify(reach)).toBe(true);
+    expect(reach.requests).toBeGreaterThanOrEqual(48);
+    expect(reach.strip).toBeLessThanOrEqual(57);
+    console.log(
+      "PASS short window: a wrapped notice keeps to two lines while a request waits, and Deny stays reachable",
+    );
+    await page.close();
+  }
 } finally {
   await browser?.close();
   await server.close();

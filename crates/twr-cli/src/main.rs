@@ -8380,8 +8380,8 @@ async fn ws_list(paths: &Paths, json: bool, detail: bool) -> anyhow::Result<()> 
 /// What `twr ws` shows of workspace `name`'s hub on `socket`: `{"hub": "stopped"}` when
 /// nothing listens ([`nothing_listens`]), `"error"` with the `error` when the socket can't be
 /// used (another user's, say), `"busy"` when it does not answer in time, `"other"` when it
-/// serves another workspace, else `"running"` with its worker threads, how many run, and how
-/// many items block on you.
+/// serves another workspace, else `"running"` with its worker threads, how many run, how
+/// many items block on you, and the hub's `version` and `build` (`hub.info`'s).
 ///
 /// With `detail` (`twr ws list --json --detail`, the desktop app's one read of every workspace
 /// per refresh) it waits [`DETAIL_PROBE_TIMEOUT`], and a row whose hub isn't stopped also has
@@ -8425,10 +8425,12 @@ async fn ws_status(socket: &Path, name: &str, detail: bool) -> Value {
             .is_some_and(|i| i.starts_with("user:"));
         let threads = c.call("thread.list", Value::Null).await?;
         let items = c.call("attention.list", json!({ "all": true })).await?;
-        anyhow::Ok(Some((threads, items, user)))
+        // The engine it runs: the desktop app compares it with its own after an upgrade.
+        let info = c.call("hub.info", json!({})).await?;
+        anyhow::Ok(Some((threads, items, user, info)))
     })
     .await;
-    let (threads, items, user) = match answer {
+    let (threads, items, user, info) = match answer {
         Ok(Ok(Some(answer))) => answer,
         Ok(Ok(None)) => {
             return unread(json!({ "hub": "other" }), "Socket serves another workspace")
@@ -8457,16 +8459,21 @@ async fn ws_status(socket: &Path, name: &str, detail: bool) -> Value {
         .flatten()
         .filter(|i| is_blocking(i))
         .count();
-    let row = json!({
+    let mut row = json!({
         "hub": "running",
         "threads": workers.len(),
         "running": running,
         "waiting": waiting,
     });
+    // `build` is absent from a hub too old to report it (and when its file can't be read).
+    for key in ["version", "build"] {
+        if let Some(value) = info[key].as_str() {
+            row[key] = json!(value);
+        }
+    }
     match (detail, user) {
         (false, _) => row,
         (true, true) => {
-            let mut row = row;
             row["detail"] = json!({ "threads": threads, "attention": items });
             row
         }

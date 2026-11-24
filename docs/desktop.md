@@ -108,7 +108,8 @@ brings up the next.
 
 A hub keeps the engine it started with when the app is upgraded. The app compares each
 running workspace's hub with the engine it bundles: by version, and for the same version by
-build (the `build` of `hub.info`, the first 16 hex digits of the engine's SHA-256), so a
+build (the `build` of `hub.info`, the first 16 hex digits of the engine's SHA-256; `twr ws
+list --json` reports both for every running hub, so no extra connection is opened), so a
 package rebuilt from a later commit with the same version is noticed too. The notice says
 which: "this hub still runs 0.5.2", or "a different build of twr 0.6.0 (463a2ed0) than this
 hub runs (85ab7b43)", and names the other workspaces whose hubs differ. **Stop hub…** stops

@@ -34,7 +34,8 @@ Upgrading: a gateway started without `--tls-cert` no longer refuses to start; it
 
 ### Fixed
 
-- The desktop app now notices a hub running another build of its own version, such as one left running from before a distribution package rebuilt from a later commit was installed: it compared versions only, so the notice with **Stop hub…** never showed. It compares `hub.info`'s `build` with the build id of the engine it bundles, says "a different build of twr 0.6.0 (463a2ed0) than this hub runs (85ab7b43)" when the versions are equal, and also names the other running workspaces whose hubs differ, with **Stop all hubs…** (`twr hub stop --all`) ([desktop.md](docs/desktop.md)).
+- The desktop app now notices a hub running another build of its own version, such as one left running from before a distribution package rebuilt from a later commit was installed: it compared versions only, so the notice with **Stop hub…** never showed. It compares `hub.info`'s `build` with the build id of the engine it bundles, says "a different build of twr 0.6.0 (463a2ed0) than this hub runs (85ab7b43)" when the versions are equal, and also names the other running workspaces whose hubs differ, with **Stop all hubs…** (`twr hub stop --all`). `twr ws list --json` now gives each running hub's `version` and `build`, which is where the app reads them ([desktop.md](docs/desktop.md)).
+- In a short, narrow desktop window, a notice that wrapped (such as that one) no longer leaves a waiting request in the conversation 3 pixels tall, with its answers under the conversation: while a request waits, the notices keep to two lines and scroll.
 
 ## [0.6.0] - 2026-11-22
 

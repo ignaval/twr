@@ -611,7 +611,8 @@ function register() {
     ),
   );
   // The hubs of every running workspace whose engine is not the app's: after an upgrade
-  // they keep running the old one until stopped.
+  // they keep running the old one until stopped. The listing reads each hub's `hub.info`
+  // itself, so no bridge is opened for it.
   handleWithEnvironment("engine-hubs", async () => {
     if (!workspaceReady || !bridge) return [];
     const live = bridge;
@@ -626,19 +627,7 @@ function register() {
         })
       ).stdout,
     );
-    return engineHubs(listing?.workspaces ?? listing, engine, (name) =>
-      name === workspace
-        ? {
-            call: (m: string, p?: any) => live.call(m, p, 3000),
-            close: () => {},
-          }
-        : new Bridge(
-            binaries.bridge,
-            name,
-            { ...env(), TWR_BRIDGE_READ_ONLY: "1" },
-            () => {},
-          ),
-    );
+    return engineHubs(listing?.workspaces ?? listing, engine);
   });
   handle("remote-list", () => remoteTransport.listHubs());
   handle("remote-pair", (request) => remoteTransport.pair(request));

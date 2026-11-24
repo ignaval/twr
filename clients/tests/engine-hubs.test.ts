@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -57,92 +57,49 @@ describe("buildIdOf", () => {
 });
 
 describe("engineHubs", () => {
-  const infos: Record<string, any> = {
-    default: {
-      workspace: "default",
-      version: "0.6.0",
-      build: "85ab7b43eecbe2ec",
-    },
-    twr: { workspace: "twr", version: "0.6.0", build: "85ab7b43eecbe2ec" },
-    fresh: { workspace: "fresh", version: "0.6.0", build: app.build },
-    old: { workspace: "old", version: "0.5.2" },
-    impostor: { workspace: "default", version: "0.5.2" },
-  };
-  const reader = (asked: string[], closed: string[]) => (name: string) => {
-    asked.push(name);
-    return {
-      call: async (method: string) => {
-        expect(method).toBe("hub.info");
-        if (name === "hung") return new Promise(() => {});
-        if (name === "broken") throw new Error("connection refused");
-        return infos[name];
-      },
-      close: () => void closed.push(name),
-    };
-  };
-
-  it("lists every running hub on another engine, and asks only running hubs", async () => {
-    const asked: string[] = [];
-    const closed: string[] = [];
-    const hubs = await engineHubs(
-      [
-        { name: "default", hub: "running" },
-        { name: "twr", hub: "running" },
-        { name: "fresh", hub: "running" },
-        { name: "old", hub: "running" },
-        { name: "idle", hub: "stopped" },
-        { name: "busy", hub: "busy" },
-      ],
-      app,
-      reader(asked, closed),
-    );
-    expect(hubs).toEqual([
-      {
-        workspace: "default",
-        difference: "build",
-        version: "0.6.0",
-        build: "85ab7b43eecbe2ec",
-      },
-      {
-        workspace: "twr",
-        difference: "build",
-        version: "0.6.0",
-        build: "85ab7b43eecbe2ec",
-      },
-      { workspace: "old", difference: "version", version: "0.5.2" },
-    ]);
-    expect(asked).toEqual(["default", "twr", "fresh", "old"]);
-    expect(closed.sort()).toEqual([...asked].sort());
+  const running = (name: string, info: Record<string, unknown>) => ({
+    name,
+    hub: "running",
+    threads: 0,
+    running: 0,
+    waiting: 0,
+    current: false,
+    ...info,
   });
-
-  it("leaves out a hub that serves another workspace, fails, or does not answer", async () => {
-    vi.useFakeTimers();
-    try {
-      const closed: string[] = [];
-      const pending = engineHubs(
-        ["impostor", "broken", "hung"].map((name) => ({
-          name,
-          hub: "running",
-        })),
+  it("lists every running hub on another engine, from the listing alone", () => {
+    const old = { version: "0.6.0", build: "85ab7b43eecbe2ec" };
+    expect(
+      engineHubs(
+        [
+          running("default", old),
+          running("twr", old),
+          running("fresh", { version: "0.6.0", build: app.build }),
+          running("older", { version: "0.5.2" }),
+          // Not running, or not answered: nothing to compare.
+          { name: "idle", hub: "stopped" },
+          { name: "busy", hub: "busy", version: "0.5.2" },
+          running("mute", {}),
+        ],
         app,
-        reader([], closed),
-        3000,
-      );
-      await vi.advanceTimersByTimeAsync(3000);
-      expect(await pending).toEqual([]);
-      expect(closed.sort()).toEqual(["broken", "hung", "impostor"]);
-    } finally {
-      vi.useRealTimers();
-    }
+      ),
+    ).toEqual([
+      { workspace: "default", difference: "build", ...old },
+      { workspace: "twr", difference: "build", ...old },
+      { workspace: "older", difference: "version", version: "0.5.2" },
+    ]);
   });
-
-  it("refuses a listing that is not one", async () => {
-    await expect(engineHubs({}, app, reader([], []))).rejects.toThrow(
-      "Invalid workspace listing",
-    );
-    await expect(
-      engineHubs([{ name: "../x", hub: "running" }], app, reader([], [])),
-    ).rejects.toThrow();
+  it("drops a build that is not one", () => {
+    expect(
+      engineHubs([running("default", { version: "0.5.2", build: "x" })], app),
+    ).toEqual([
+      { workspace: "default", difference: "version", version: "0.5.2" },
+    ]);
+  });
+  it("refuses a listing that is not one", () => {
+    expect(() => engineHubs({}, app)).toThrow("Invalid workspace listing");
+    expect(() =>
+      engineHubs([running("../x", { version: "0.5.2" })], app),
+    ).toThrow();
   });
 });
 
