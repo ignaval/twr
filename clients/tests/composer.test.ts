@@ -84,6 +84,10 @@ type HostOptions = {
   voiceStatus?: () => Promise<VoiceCaptureStatus>;
   voiceSetup?: () => Promise<VoiceCaptureStatus>;
   inboxSources?: InboxSource[];
+  /** How `connect` answers (default: it connects). */
+  connect?: (workspace: string) => Promise<Json>;
+  /** What `twr ws list --json` lists (default: the views' workspaces). */
+  listing?: Json[];
 };
 
 function fakeHost(options: HostOptions = {}) {
@@ -149,7 +153,9 @@ function fakeHost(options: HostOptions = {}) {
       theme: null,
       terminals: [],
     }),
-    connect: async () => ({}),
+    connect: options.connect || (async () => ({})),
+    /** The CLI commands run, joined. */
+    cliCalls: [] as string[],
     inboxSources: async () => options.inboxSources || [],
     rpc: async (method: string, params: Json = {}) => {
       const answer = options.rpc?.(method, params);
@@ -174,10 +180,16 @@ function fakeHost(options: HostOptions = {}) {
       }
       return {};
     },
-    cli: async (args: string[]) =>
-      args.join(" ") === "ws list --json"
-        ? { stdout: JSON.stringify(Object.keys(views)), stderr: "", code: 0 }
-        : { stdout: "", stderr: "", code: 0 },
+    cli: async (args: string[]) => {
+      host.cliCalls.push(args.join(" "));
+      return args.join(" ") === "ws list --json"
+        ? {
+            stdout: JSON.stringify(options.listing || Object.keys(views)),
+            stderr: "",
+            code: 0,
+          }
+        : { stdout: "", stderr: "", code: 0 };
+    },
     catalog: async () => [],
     configRead: async () => ({
       content: "",
@@ -335,6 +347,22 @@ async function mount(
 
 let mounted: Mounted;
 const app = () => mounted;
+
+describe("a workspace that cannot be opened at start", () => {
+  it("still lists the workspaces, so another can be picked", async () => {
+    const app = await mount({
+      connect: async () => {
+        throw new Error(
+          "Workspace does not exist; create it before connecting",
+        );
+      },
+      listing: [{ id: "a", name: "acme", default: false, hub: "stopped" }],
+    });
+    expect(app.host.cliCalls).toContain("ws list --json");
+    expect(app.find("[data-workspace=a]").textContent).toContain("acme");
+    await app.unmount();
+  });
+});
 
 describe("the latest user message above conversation history", () => {
   afterEach(async () => {

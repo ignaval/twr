@@ -40,6 +40,7 @@ import { localUploadRequest } from "./upload-request";
 import {
   cliArgs,
   nonInteractiveArgs,
+  runsWithoutWorkspace,
   externalUrl,
   terminalSchema,
   sizeSchema,
@@ -345,11 +346,11 @@ async function loadLoginEnvironment() {
   }
 }
 async function cli(args: unknown) {
-  if (!workspaceReady)
+  const words = nonInteractiveArgs(args);
+  if (!workspaceReady && !runsWithoutWorkspace(words))
     throw new Error(
       "Connect to the selected workspace before running CLI commands",
     );
-  const words = nonInteractiveArgs(args);
   const planned = await companion().call("desktop.cli_plan", {
     args: words,
     workspace,

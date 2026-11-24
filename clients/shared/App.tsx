@@ -1119,8 +1119,12 @@ export default function App({
         await refreshWorkspaces();
         setRefresh((n) => n + 1);
       } catch (e) {
-        if (generation === connectGeneration.current)
+        if (generation === connectGeneration.current) {
           setConnectionError(e instanceof Error ? e.message : String(e));
+          // The workspaces are listed all the same, so another one can be picked or made
+          // (this one may have been removed).
+          void refreshWorkspaces().catch(() => {});
+        }
       } finally {
         if (generation === connectGeneration.current) setConnecting(false);
       }

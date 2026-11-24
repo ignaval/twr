@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { localInboxSources } from "../desktop/inbox";
+import { runsWithoutWorkspace } from "../desktop/validation";
 import { notices } from "../desktop/notify-state";
 import { trayEntries } from "../desktop/tray-state";
 import { attentionSummary } from "../shared/attentionSummary";
@@ -118,8 +119,29 @@ describe("a renamed workspace", () => {
     const later = [{ id: "acme", name: "client", default: true }];
     expect(startWorkspace(undefined, "default", later)).toBe("acme");
     expect(startWorkspace(undefined, undefined, later)).toBe("acme");
+    // No default workspace (it was removed, none chosen since): the first listed, as a bare
+    // `twr` opens.
+    expect(
+      startWorkspace(undefined, "default", [
+        { id: "a", name: "a", default: false },
+      ]),
+    ).toBe("a");
+    expect(startWorkspace(undefined, undefined, [])).toBe("default");
     // A listing that could not be read: the saved one, else `default`.
     expect(startWorkspace(undefined, "acme", undefined)).toBe("acme");
     expect(startWorkspace(undefined, undefined, undefined)).toBe("default");
+  });
+
+  it("leaves a desktop whose workspace could not be opened able to list and make others", () => {
+    expect(runsWithoutWorkspace(["ws", "list", "--json"])).toBe(true);
+    expect(runsWithoutWorkspace(["ws", "list", "--json", "--detail"])).toBe(
+      true,
+    );
+    expect(runsWithoutWorkspace(["ws"])).toBe(true);
+    expect(runsWithoutWorkspace(["ws", "new", "b"])).toBe(true);
+    // Not what changes or removes one, nor anything else.
+    expect(runsWithoutWorkspace(["ws", "rm", "b"])).toBe(false);
+    expect(runsWithoutWorkspace(["ws", "rename", "a", "b"])).toBe(false);
+    expect(runsWithoutWorkspace(["thread", "list"])).toBe(false);
   });
 });

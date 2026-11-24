@@ -52,9 +52,15 @@ export const resolveWorkspace = (listing: Json[], selector: string) => {
   const byId = listing.find((w) => workspaceId(w) === selector);
   return byId === undefined ? undefined : workspaceId(byId);
 };
-/** The default workspace's id in the listing (its `default` row), else `default`. */
+/**
+ * The id of the workspace to open by default: the listing's `default` row; with none (the
+ * default workspace was removed and none chosen since) the first workspace listed, as a bare
+ * `twr` opens; with no workspace at all, `default`.
+ */
 export const defaultWorkspace = (listing: Json[]) => {
-  const row = listing.find((w) => typeof w === "object" && w?.default === true);
+  const row =
+    listing.find((w) => typeof w === "object" && w?.default === true) ??
+    listing.find((w) => workspaceId(w));
   return row === undefined ? "default" : workspaceId(row);
 };
 const working = (t: Thread) =>

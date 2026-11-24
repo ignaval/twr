@@ -175,3 +175,17 @@ export const attentionSummarySchema = z
       .optional(),
   })
   .strict();
+
+/**
+ * Whether a CLI command runs while no workspace is connected: listing workspaces and making
+ * one, which are the root's (`twr ws`), so a workspace that could not be opened (removed,
+ * say) leaves the app able to pick or make another.
+ */
+export function runsWithoutWorkspace(words: string[]) {
+  return (
+    words[0] === "ws" &&
+    (words.length === 1 ||
+      (words[1] === "list" && words.length <= 4) ||
+      (words[1] === "new" && words.length === 3))
+  );
+}
