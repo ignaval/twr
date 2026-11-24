@@ -29,7 +29,7 @@ use std::path::PathBuf;
 pub use hub::{
     checkpoint_build, local_agent, lock_opened, prewarm_checkpoint, AgentJobBy, AttachGrant,
     Caller, Hub, HubOptions, HubState, JobStart, NewThread, Prewarm, Relay, SayOrigin, SendOutcome,
-    ShellRun, SuggestAsk, SwitchOptions, LOCK_FILE, MEMORY_DIR,
+    ShellRun, SuggestAsk, SwitchOptions, LOCK_FILE, MEMORY_DIR, SHUTDOWN_LONGEST,
 };
 pub use job_gate::job_gate_main;
 

@@ -10375,7 +10375,10 @@ async fn stop_hub_for_removal(socket: &Path, ws: &Paths) -> anyhow::Result<()> {
         Err(e) if nothing_listens(&e) => {}
         Err(e) => return Err(e),
     }
-    let deadline = tokio::time::Instant::now() + HUB_START_TIMEOUT;
+    // As long as its shutdown can take (its jobs, review runs and notification command ended,
+    // its runtimes stopped), and a little more.
+    let wait = twr_hub::SHUTDOWN_LONGEST + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + wait;
     loop {
         match stop_workspace_lock(ws)? {
             StopWorkspaceLock::Missing | StopWorkspaceLock::Free(_) => return Ok(()),
@@ -10383,10 +10386,10 @@ async fn stop_hub_for_removal(socket: &Path, ws: &Paths) -> anyhow::Result<()> {
         }
         if tokio::time::Instant::now() >= deadline {
             bail!(
-                "the hub of workspace {} did not stop within {}s: stop it with `twr -w {id} hub \
-                 stop`, then delete it",
+                "the hub of workspace {} is still stopping after {}s: once `twr -w {id} hub \
+                 stop` says it stopped, delete it again",
                 ws.display_name(),
-                HUB_START_TIMEOUT.as_secs()
+                wait.as_secs()
             );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -14194,6 +14197,25 @@ mod tests {
         assert!(!test_user_waived(true, named, uid));
         mode(0o622).unwrap();
         assert!(!test_user_waived(true, named, uid));
+    }
+
+    /// The TUI's Delete waits for a hub it asked to stop for as long as the hub's shutdown can
+    /// take: one that holds its lock longer than a start's wait (5 s) is still waited for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delete_waits_for_a_hub_that_takes_a_while_to_stop() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        let a = twr_core::workspaces::create(&root, "a").unwrap().paths;
+        assert!(twr_hub::SHUTDOWN_LONGEST > HUB_START_TIMEOUT);
+        let held = lock_workspace(&a).unwrap().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(HUB_START_TIMEOUT + Duration::from_secs(1));
+            drop(held);
+        });
+        stop_hub_for_removal(&home.path().join("none.sock"), &a)
+            .await
+            .unwrap();
+        release.join().unwrap();
     }
 
     /// A hub start that finds `default`'s lock held (a removal's checks, `twr hub stop`

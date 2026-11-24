@@ -31,6 +31,21 @@ use crate::store::{self, Store};
 /// open file description until `exec` closes it).
 const LOCK_RETRY: Duration = Duration::from_secs(3);
 
+/// How long [`Hub::shutdown`] waits for the jobs to end, then for the review runs, then for
+/// the notification command.
+const JOBS_STOP: Duration = Duration::from_secs(15);
+const REVIEWS_STOP: Duration = Duration::from_secs(10);
+const HOOK_STOP: Duration = Duration::from_secs(15);
+
+/// The longest [`Hub::shutdown`] of a hub with the default stop timeout can take, each of its
+/// waits in turn ([`JOBS_STOP`], [`REVIEWS_STOP`], [`HOOK_STOP`], then
+/// [`super::STOP_TIMEOUT`] for the runtimes): what a client waiting for a hub it asked to stop
+/// waits before it says the hub did not stop.
+pub const SHUTDOWN_LONGEST: Duration = JOBS_STOP
+    .saturating_add(REVIEWS_STOP)
+    .saturating_add(HOOK_STOP)
+    .saturating_add(super::STOP_TIMEOUT);
+
 impl Hub {
     /// Locks the data directory (failing if another hub uses it), opens the database,
     /// rebuilds state by replaying it, kills and closes threads whose runtime outlived the
@@ -430,10 +445,10 @@ impl Hub {
         }
         // Every job first: each records its end (its process group gone) before the runtimes
         // stop.
-        self.end_jobs(Duration::from_secs(15)).await;
+        self.end_jobs(JOBS_STOP).await;
         // Every review run too (their process groups killed); nothing is recorded of them: the
         // next hub runs their rounds again (`hub::loops::driver`).
-        self.end_reviews(Duration::from_secs(10)).await;
+        self.end_reviews(REVIEWS_STOP).await;
         // The notification command too, if one runs: it ends it, its group with it.
         let _ = self.inner.hook_stop.send(true);
         let hook = self
@@ -443,7 +458,7 @@ impl Hub {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         if let Some(task) = hook {
-            let _ = tokio::time::timeout(Duration::from_secs(15), task).await;
+            let _ = tokio::time::timeout(HOOK_STOP, task).await;
         }
         {
             let mut core = self.inner.core();
@@ -1351,7 +1366,13 @@ fn try_lock_data_dir(db_path: &Path, must_exist: bool) -> anyhow::Result<Option<
     // `twr ws rm` may have removed it since the hub was started.
     if must_exist {
         twr_core::paths::check_private_dir(&dir).map_err(|e| {
-            anyhow::anyhow!("{e:#}: the workspace was removed (`twr ws` lists them)")
+            // Removed only when it is gone: a directory that is there failed the check itself
+            // (another user's, open to others), which `e` says.
+            if std::fs::symlink_metadata(&dir).is_err() {
+                anyhow::anyhow!("{e:#}: the workspace was removed (`twr ws` lists them)")
+            } else {
+                e
+            }
         })?;
     } else {
         twr_core::paths::ensure_private_dir(&dir)?;
@@ -1522,6 +1543,22 @@ mod tests {
         assert_eq!(hub.workspace_name(), "main");
         assert_eq!(hub.info()["workspace_name"], "main");
         hub.shutdown().await;
+    }
+
+    /// A named workspace's hub that can't open its data directory says why: removed only when
+    /// it is gone, else what the check found.
+    #[test]
+    fn a_named_data_directory_says_why_it_cannot_be_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("gone/twr.db");
+        let e = try_lock_data_dir(&gone, true).unwrap_err().to_string();
+        assert!(e.contains("the workspace was removed"), "{e}");
+        let file = tmp.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        let e = try_lock_data_dir(&file.join("twr.db"), true)
+            .unwrap_err()
+            .to_string();
+        assert!(!e.contains("removed"), "{e}");
     }
 
     /// A lock on a data directory's lock file that was moved away (by `twr ws rm`) after it

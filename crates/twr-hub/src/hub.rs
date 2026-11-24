@@ -225,6 +225,7 @@ pub use idle_compact::{
 pub use jobs::{AgentJobBy, JobStart, ShellJob, SlotPool};
 pub(crate) use lifecycle::lock_data_dir;
 pub use lifecycle::lock_opened;
+pub use lifecycle::SHUTDOWN_LONGEST;
 pub use model::ModelRequest;
 pub use net::{own_net_probe, probe_targets, NetProbe, NetTiming, Probed};
 pub use project_read::{ReadParams, Tool as ReadTool};
