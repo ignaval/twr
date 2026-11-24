@@ -10929,11 +10929,14 @@ mod tests {
         );
         assert!(file.exists());
         assert!(root.root_removed());
-        // Emptied, it is no one's: it goes, and `default` is made again.
+        // Emptied, it is no one's: it goes, and `default` is made again. So does a link
+        // identity the runner service wrote meanwhile, which holds no one's work.
         std::fs::remove_file(&file).unwrap();
+        std::fs::write(root.data_dir.join("link-identity"), [7u8; 64]).unwrap();
         twr_core::workspaces::create(&root, "default").unwrap();
         assert!(!root.root_removed());
         assert!(!root.data_dir.join("worktrees").exists());
+        assert!(!root.data_dir.join("link-identity").exists());
     }
 
     /// Removing `default` says when revoked runners haven't acknowledged their revocation:

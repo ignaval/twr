@@ -468,7 +468,11 @@ pub fn create(root: &Paths, name: &str) -> anyhow::Result<Created> {
 fn clear_root_leftovers(root: &Paths) -> anyhow::Result<()> {
     if root_moved(root) {
         let later = later_entries(root)?;
-        let full: Vec<&(String, u64, u64)> = later.iter().filter(|(_, _, b)| *b > 0).collect();
+        // (A link identity written meanwhile holds no one's work: it goes like an empty one.)
+        let full: Vec<&(String, u64, u64)> = later
+            .iter()
+            .filter(|(n, _, b)| *b > 0 && n != "link-identity")
+            .collect();
         if !full.is_empty() {
             let listed: Vec<String> = full
                 .iter()

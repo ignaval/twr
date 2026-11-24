@@ -718,8 +718,16 @@ impl Service {
                     .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
             {
                 let b = crate::random::<64>()?;
-                // Never made here: the workspace may have been removed since it was looked at.
-                crate::state::atomic_write_existing(&file, &b)?;
+                // Under the registry lock, which a removal holds from its checks through its
+                // move: checked again there, so it is never written into a workspace removed
+                // since it was looked at (`default`'s directory stays when it is removed).
+                let (paths, file) = (paths.clone(), file.clone());
+                tokio::task::spawn_blocking(move || {
+                    let _registry = twr_core::workspaces::RegistryLock::take(&paths)?;
+                    ensure!(paths.exists(), "workspace does not exist");
+                    crate::state::atomic_write_existing(&file, &b)
+                })
+                .await??;
                 b.to_vec()
             }
             Err(e) => return Err(e),
