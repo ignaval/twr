@@ -7,6 +7,7 @@ import type {
   Thread,
 } from "./types";
 import { endedWords, requestLine, type LastLoop } from "./loops";
+import { isOffline } from "./connectivity";
 
 /** The most items a summary lists; `count` still counts every one. */
 export const SUMMARY_MAX_ITEMS = 200;
@@ -30,16 +31,24 @@ const HUB_THREAD = "hub";
  * `proposal` (twr-core `is_confirm_card`), a delete card when it offers Delete (its options
  * are `Delete`/`Cancel`; a confirm card's are `Confirm`/`Cancel`); a loop's setup card or a
  * stuck loop's item, which the hub marks on the loop's thread (`AttentionItem::loop_setup`,
- * `loop_stuck`). Every one of them needs the user, whatever its reason.
+ * `loop_stuck`). Every one of them needs the user, whatever its reason. And an item the hub
+ * raised because its machine has no internet connection (`AttentionItem::offline_since`):
+ * `offline`.
  */
 export function cardOf(
   item: Pick<
     Attention,
-    "thread" | "proposal" | "options" | "loop_setup" | "loop_stuck"
+    | "thread"
+    | "proposal"
+    | "options"
+    | "loop_setup"
+    | "loop_stuck"
+    | "offline_since"
   >,
 ): AttentionSummaryItem["card"] {
   if (item.loop_setup === true) return "loop_setup";
   if (item.loop_stuck === true) return "loop_stuck";
+  if (isOffline(item)) return "offline";
   if (item.thread !== HUB_THREAD || item.proposal !== true) return undefined;
   return Array.isArray(item.options) && item.options.includes("Delete")
     ? "delete"

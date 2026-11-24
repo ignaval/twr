@@ -123,6 +123,17 @@ earliest boundary, the shortcut says **No earlier messages from you** and does n
 It stays focusable while loading and at that boundary so changing its target does not
 discard keyboard focus. Scrolling and background loads never transfer focus.
 
+While the orchestrator, or the thread whose conversation you have open, works, the
+conversation shows the TUI's working cursor ([What is working](tui.md#what-is-working)): a
+`_` in the accent color that breathes up to a block and back, at the end of a reply that
+is streaming in, or under the last message (beside **Show full message** while a long reply
+is collapsed). It appears as you send, before the hub has started the turn or the first
+text arrives, stays while the turn or its background tasks run, and goes when the turn ends
+or the thread waits on you for a permission or an answer. It shows only while the
+conversation is at its bottom and takes no room, so it never moves what you read. It is
+never copied with the text or read out. With reduced motion, or `[tui] animate = false`
+([configuration](configuration.md)), it stays a still `_`.
+
 Recent history and live updates appear first. Older turns, including all their pages,
 load in the background when the predecessor is not yet known, skipping automatic turns.
 If an older page fails, recent history stays available and **Load earlier turn** retries
@@ -250,6 +261,11 @@ shows greyed as the empty message box's placeholder: `Tab` or `→` puts it in t
 it has been on screen 300 ms, so a key pressed as it appears isn't taken for it), typing
 types over it, and it is sent only when you press Enter. Only visible routine-update groups receive summaries; permission/question
 updates remain visible and summaries are bound to their conversation and covered update.
+In the orchestrator's conversation, an update the hub wrote about one worker (a report, a
+request, a run of routine updates) is drawn in that worker's box, as the orchestrator's own
+`<thread>` sections are: framed in its color and titled with its name. The thread is the one
+the hub names by id (`about_thread`), never by name; an update about no thread, or about one
+this client doesn't list, stays unboxed.
 
 Settings › Agents › Orchestrator shows the orchestrator's runtime, model and effort as
 lists. On the runtime it runs, **Apply** changes the model and effort in place, as the
@@ -936,7 +952,7 @@ it was last moved, resized or closed (saved in the app's `desktop.json`). It is 
 shrunk to fit the display that shows most of it; if that display is gone, it keeps its size
 and opens in the default place.
 
-Settings › General › Layout & text has a **Compact layout** switch and the interface and code text sizes (Small, Default, Large, Extra large; a size an earlier version saved shows as Custom). Drag the sidebar's right edge or the inspector's header edge, or focus the separator and use Left/Right, Home or End. Widths are constrained to fit a tiled window and saved on this device. Mobile conversation text follows the system text-size setting; chrome and terminal sizes use a bounded scale so their controls remain usable.
+Settings › General › Layout & text has a **Compact layout** switch and the interface and code text sizes (Small, Default, Large, Extra large; a size an earlier version saved shows as Custom). Drag the sidebar's right edge or the inspector's header edge, or focus the separator and use Left/Right, Home or End. Widths are constrained to fit a tiled window and saved on this device. Ctrl/⌘ with + or = makes both text sizes a pixel larger, Ctrl/⌘ with - a pixel smaller and Ctrl/⌘+0 resets them (also the View menu's **Larger Text**, **Smaller Text** and **Actual Text Size**, which replace page zoom), within the same bounds and saved the same way. Mobile conversation text follows the system text-size setting; chrome and terminal sizes use a bounded scale so their controls remain usable.
 
 Recent conversations and message drafts are encrypted locally using the macOS keychain, a Linux secret service, iOS Keychain or Android Keystore. Linux sessions without an unlocked keyring keep live operation available and report that encrypted persistence is unavailable; no plaintext fallback is used. History is bounded, retained for up to seven days and can be cleared in Settings › Advanced. Configuration/editor drafts stay in memory because they may contain credentials.
 

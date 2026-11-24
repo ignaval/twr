@@ -4266,3 +4266,80 @@ async fn a_suggested_message_is_never_applied_as_a_command() {
     drop(rt);
     hub.shutdown().await;
 }
+
+/// While the hub's machine has no internet connection (`hub::net`), the orchestrator's notices
+/// wait (its turn could not reach its model), and the hub's notice about the outage is never
+/// one of them; once the connection is back they go, after a line saying how long it was down.
+#[tokio::test]
+async fn notices_wait_for_the_connection_and_the_outage_is_told_when_it_ends() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use twr_hub::hub::{NetProbe, NetTiming, Probed};
+    let mut env = Env::new();
+    let up = Arc::new(AtomicBool::new(true));
+    let mut o = env.opts(|_| {});
+    let flag = Arc::clone(&up);
+    o.net_probe = Some(NetProbe {
+        targets: vec!["api.example.com:443".into()],
+        check: Arc::new(move || {
+            let ok = flag.load(Ordering::SeqCst);
+            Box::pin(async move {
+                Probed {
+                    ok,
+                    detail: "api.example.com:443".into(),
+                }
+            })
+        }),
+        timing: NetTiming {
+            every: Some(Duration::from_millis(20)),
+            suspect_every: Duration::from_millis(10),
+            offline_every: Duration::from_millis(10),
+            offline_after: Duration::from_millis(40),
+            nudge_gap: Duration::from_millis(5),
+        },
+    });
+    let hub = Hub::open(o).await.unwrap();
+    let api = env.worker(&hub, "api").await;
+    // (Two workers: with one, `say` goes to it.)
+    env.worker(&hub, "web").await;
+    hub.say("watch the builds", None, &tui()).await.unwrap();
+    let mut rt = env.orch().await;
+    let orch_id = hub.orchestrator_thread().unwrap();
+    let (_, t1) = rt.next_turn().await;
+    rt.end_turn(t1, "Watching.");
+    timeout(WAIT, async {
+        while hub.thread_view(&orch_id).unwrap().current_turn.is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    up.store(false, Ordering::SeqCst);
+    timeout(WAIT, async {
+        while hub.info()["connectivity"]["state"] != "offline" {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // An urgent notice while it is down: it waits.
+    raise(&hub, &api, "api-error", AttentionReason::Error, &[]);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(hub.thread_view(&orch_id).unwrap().turns, 1);
+
+    up.store(true, Ordering::SeqCst);
+    let (notice, t2) = rt.next_turn().await;
+    assert_eq!(t2, 2);
+    assert!(
+        notice.contains("- connectivity: the hub's machine had no internet connection from "),
+        "{notice}"
+    );
+    assert!(
+        notice.contains("- thread=api reason=error attn_id=api-error"),
+        "{notice}"
+    );
+    // The hub's notice about the outage was none of the orchestrator's lines.
+    assert!(!notice.contains("No internet connection since"), "{notice}");
+    rt.end_turn(t2, "Noted.");
+    hub.shutdown().await;
+}

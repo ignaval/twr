@@ -2306,6 +2306,12 @@ impl Core {
                 if by == Some("orchestrator") {
                     return;
                 }
+                // A stall while the hub's machine had no internet connection (`hub::net`): it
+                // closes when the connection is back, and the orchestrator is told of the
+                // outage then.
+                if offline_since(&ev.source, &p.ext).is_some() {
+                    return;
+                }
                 // A hung-turn card is no routine stall (`hub::stall`).
                 let hung = is_hung_card(&p.ext);
                 let reason = if hung {
@@ -2494,10 +2500,13 @@ impl Core {
         self.raise_card(hub)?;
         // While a switch hands over, the notices wait: the new orchestrator gets them after
         // its handoff turn (the state they describe is in the handoff too).
+        // While the hub's machine has no internet connection they wait too: the orchestrator's
+        // turn could not reach its model (`hub::net`).
         if self.shutting_down
             || self.orch.switching
             || self.orch.notices.is_empty()
             || !self.orch_active()
+            || self.net_offline()
         {
             return Ok(());
         }

@@ -877,6 +877,84 @@ kbd {
     opacity: 0.4;
   }
 }
+/* The conversation's working cursor, the TUI's (docs/tui.md, "What is working"): a `_`
+   that breathes up to three quarters of a block and back (`_ ▁ ▂ ▃ ▄ ▅ ▆ ▅ ▄ ▃ ▂ ▁`, 125 ms
+   a frame), where the next text will appear. It takes no room: the inline one has no
+   advance width (it never wraps a line), the one on its own line sits in the gap below the
+   last message. A pseudo-element or an empty span: never copied, never read out. Reduced
+   motion and `[tui] animate = false` (`data-still`) keep it a still `_`. */
+.working-cursor,
+[data-working-cursor]::after {
+  display: inline-block;
+  width: 0.6em;
+  height: 1em;
+  margin-right: -0.6em;
+  vertical-align: -0.2em;
+  background: var(--accent);
+  translate: 0.15em 0;
+  scale: 1 0.1;
+  transform-origin: bottom;
+  pointer-events: none;
+  user-select: none;
+  animation: working-cursor 1.5s step-end infinite;
+}
+[data-working-cursor]::after {
+  content: "";
+}
+.working-line {
+  position: relative;
+  height: 0;
+}
+.working-line .working-cursor {
+  position: absolute;
+  left: 0;
+  /* In the gap below the last message: its bottom padding (20px). */
+  top: -18px;
+  margin: 0;
+  translate: none;
+}
+.message-working {
+  margin-left: 8px;
+}
+.conversation-scroll[data-still] .working-cursor,
+.conversation-scroll[data-still] [data-working-cursor]::after {
+  animation: none;
+}
+/* Frame n of twr-tui's `icon::FRAMES` at n/12 of the breath: `_`, then ▁ to ▆ and back. */
+@keyframes working-cursor {
+  0% {
+    scale: 1 0.1;
+  }
+  8.333%,
+  91.667% {
+    scale: 1 0.125;
+  }
+  16.667%,
+  83.333% {
+    scale: 1 0.25;
+  }
+  25%,
+  75% {
+    scale: 1 0.375;
+  }
+  33.333%,
+  66.667% {
+    scale: 1 0.5;
+  }
+  41.667%,
+  58.333% {
+    scale: 1 0.625;
+  }
+  50% {
+    scale: 1 0.75;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .working-cursor,
+  [data-working-cursor]::after {
+    animation: none;
+  }
+}
 .sidebar-empty {
   font-size: 0.923077rem;
   color: var(--faint);

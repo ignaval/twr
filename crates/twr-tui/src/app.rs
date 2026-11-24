@@ -27845,16 +27845,20 @@ pub(crate) mod tests {
             )
         }
 
-        /// The conversation pane's rows as the last frame drew them, `w` x `h`.
+        /// The conversation pane's rows as the last frame drew them, `w` x `h`, a box's text
+        /// rows without its side bars (`│ … │`): an update about a thread is in its box.
         fn rows(st: &mut AppState, w: u16, h: u16) -> Vec<String> {
             let buf = draw(st, w, h);
             let pane = st.view.panes.get(&PaneId::Transcript).unwrap().clone();
             (pane.area.y..pane.area.bottom())
                 .map(|y| {
-                    (pane.area.x..pane.area.right())
+                    let row = (pane.area.x..pane.area.right())
                         .map(|x| buf[(x, y)].symbol())
-                        .collect::<String>()
-                        .trim_end()
+                        .collect::<String>();
+                    let row = row.trim_end();
+                    row.strip_prefix("│ ")
+                        .and_then(|r| r.strip_suffix('│'))
+                        .map_or(row, str::trim_end)
                         .to_string()
                 })
                 .filter(|r| !r.is_empty())
@@ -29036,7 +29040,7 @@ pub(crate) mod tests {
             let every = st.summary.every();
             let mut now = Instant::now();
             let mut ask = |st: &mut AppState, summary: &str, seq: u64| {
-                rows(st, 160, 120);
+                rows(st, 160, 400);
                 assert_eq!(st.take_summaries_due(now).len(), 1, "{summary}");
                 st.summary_result_now("t-gamma", covering(summary, seq), now);
                 now += every;
@@ -29059,7 +29063,7 @@ pub(crate) mod tests {
                 let seq = interim(&mut st, &mut o, "gamma", &format!("live {i}"));
                 ask(&mut st, &format!("Live {i}."), seq);
             }
-            let text = rows(&mut st, 160, 120).join("\n");
+            let text = rows(&mut st, 160, 400).join("\n");
             for i in 0..RUNS {
                 assert!(
                     text.contains(&format!("◦ gamma · Run {i}.")),
@@ -29091,7 +29095,7 @@ pub(crate) mod tests {
             assert_eq!(kept.len(), RUNS + 1 - 5, "{kept:?}");
             assert!(kept.iter().all(|(_, _, t)| t.as_deref() != Some("Run 4.")));
             assert!(kept.iter().any(|(_, _, t)| t.as_deref() == Some("Run 5.")));
-            let text = rows(&mut st, 160, 120).join("\n");
+            let text = rows(&mut st, 160, 400).join("\n");
             assert!(text.contains("◦ gamma · Run 5."), "{text}");
             assert!(text.contains("◦ gamma · Live 20."), "{text}");
         }
@@ -29492,7 +29496,10 @@ pub(crate) mod tests {
                 let cells: Vec<&str> = (pane.x..pane.right())
                     .map(|x| buf[(x, y)].symbol())
                     .collect();
-                if !cells.concat().trim_start().starts_with(lead) {
+                // A row in a box: its text after the side bar.
+                let line = cells.concat();
+                let line = line.trim_start();
+                if !line.strip_prefix("│ ").unwrap_or(line).starts_with(lead) {
                     return None;
                 }
                 let n = word.chars().count();

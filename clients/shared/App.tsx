@@ -33,8 +33,10 @@ import {
   withoutDroppedText,
 } from "./modelPick";
 import { MessageBody } from "./MessageBody";
+import { ThreadBox, aboutThread } from "./ThreadMessage";
 import { ConversationSearch, NeedsYouInbox } from "./InboxSearch";
 import { PaneResize } from "./LayoutOptions";
+import { stepTextSize, textSizeShortcut } from "./layoutPreferences";
 import { WORKSPACE_REFRESH_MS, workspaceEntries } from "./workspaceTree";
 import { attentionSummary } from "./attentionSummary";
 import { connectionWords, errorMessage } from "./errors";
@@ -100,6 +102,7 @@ import {
   CirclePause,
   Scissors,
   Shrink,
+  WifiOff,
 } from "lucide-react";
 import {
   commands as applicationCommands,
@@ -148,6 +151,13 @@ import {
 import { Manager, JobLog, navSection, type Section } from "./Managers";
 import { ActionsMenu, type MenuItem } from "./ActionsMenu";
 import { StatusStrip, type StripItem } from "./StatusStrip";
+import {
+  attentionKindLabel,
+  hubOffline,
+  isOffline,
+  offlineNoticeText,
+  offlineThreads,
+} from "./connectivity";
 import { PermissionModePicker, ThreadActions } from "./ThreadActions";
 import "./palette.css";
 import { useEditorSessions } from "./editors";
@@ -205,6 +215,16 @@ import {
   useModal,
 } from "./a11y";
 import { omarchyProperties } from "./omarchy";
+import {
+  type AwaitedTurn,
+  AWAIT_LIMIT_MS,
+  animateChange,
+  animateSetting,
+  conversationWorks,
+  cursorPlace,
+  lastTurnEnd,
+  stillAwaited,
+} from "./working";
 import { omarchyInkVar, parseHex, threadInk, threadStyle } from "./threadColor";
 const Terminal = lazy(() =>
   import("./Terminal").then((module) => ({ default: module.Terminal })),
@@ -546,6 +566,10 @@ export default function App({
     };
   }, [journal, drafts, uploads]);
   const [sending, setSending] = useState(false);
+  // The thread a message in flight goes to, for its conversation's working cursor: from
+  // the send until the hub says its turn runs (`awaited`, ./working).
+  const [sendingTo, setSendingTo] = useState<string>();
+  const [awaited, setAwaited] = useState<AwaitedTurn>();
   const slashPending = useRef(false);
   const [queued, setQueued] = useState<Json[]>([]);
   const [queueInfo, setQueueInfo] = useState<Json>({});
@@ -715,6 +739,28 @@ export default function App({
     resyncs,
   ]);
   const [visibleRoutines, setVisibleRoutines] = useState<string[]>([]);
+  // The conversation's working cursor (./working): while a message to it is in flight or
+  // awaited, and while its thread works, never while it waits on the user.
+  const waitingForTurn = stillAwaited(awaited, target, events, Date.now());
+  const working = conversationWorks({
+    thread: target,
+    attention: view.attention,
+    sending: !!target && sendingTo === target.id,
+    awaited: waitingForTurn,
+  });
+  useEffect(() => {
+    if (!awaited) return;
+    if (!waitingForTurn && awaited.thread === target?.id) {
+      setAwaited(undefined);
+      return;
+    }
+    // A turn that never shows running stops being awaited, even if nothing else changes.
+    const timer = setTimeout(
+      () => setAwaited((old) => (old === awaited ? undefined : old)),
+      Math.max(0, awaited.at + AWAIT_LIMIT_MS - Date.now()),
+    );
+    return () => clearTimeout(timer);
+  }, [awaited, waitingForTurn, target?.id]);
   const presentedEvents = useMemo(() => {
     const resolved = new Set(view.went_on || []);
     return events.map((event) =>
@@ -836,12 +882,22 @@ export default function App({
   const action = useCallback(
     (id: string, initialValues: Json = {}, options?: OperationOptions) => {
       const command = commands.find((c) => c.id === id);
-      // Choosing the first orchestrator starts from the one the hub would start: its
-      // runtime, and the runtime's default model unless one is picked.
+      // Choosing the first orchestrator starts from the one the hub would start: the
+      // configured runtime with its configured model and effort (`[orchestrator] model /
+      // effort`), unless the caller named a runtime of its own.
       const o = infoRef.current?.orchestrator;
       if (id === "orch" && !initialValues.runtime && o && !o.thread) {
         const runtime = o.configured?.runtime || o.runtime;
-        if (runtime) initialValues = { ...initialValues, runtime };
+        if (runtime) {
+          const model = o.configured ? o.configured.model : o.model;
+          const effort = o.configured ? o.configured.effort : o.effort;
+          initialValues = {
+            ...(model ? { model } : {}),
+            ...(effort ? { effort } : {}),
+            ...initialValues,
+            runtime,
+          };
+        }
       }
       if (command) openOperation(command, initialValues, options);
     },
@@ -889,18 +945,29 @@ export default function App({
   // `[loops] offer_review` (`config.show`), once per connection: the Review loop button on
   // a finished turn with changes. An older hub has no `loops`, and offers it.
   const [offerReview, setOfferReview] = useState(true);
+  // `[tui] animate` too: `false` keeps the conversation's working cursor a still `_`. Read
+  // again when the conversation shows it changed (the orchestrator sets it at once).
+  const [animate, setAnimate] = useState(true);
+  // The latest change seen, kept while a worker's conversation (which has none) is open.
+  const [animateChanged, setAnimateChanged] = useState<string>();
+  const animateChangeShown = animateChange(events);
+  useEffect(() => {
+    if (animateChangeShown) setAnimateChanged(animateChangeShown);
+  }, [animateChangeShown]);
   useEffect(() => {
     if (!connected) return;
     let live = true;
     void rpc("config.show")
       .then((config) => {
-        if (live) setOfferReview(offerReviewSetting(config));
+        if (!live) return;
+        setOfferReview(offerReviewSetting(config));
+        setAnimate(animateSetting(config));
       })
       .catch(() => {});
     return () => {
       live = false;
     };
-  }, [connected, workspace, rpc]);
+  }, [connected, workspace, rpc, animateChanged]);
   const refreshWorkspaces = useCallback(async () => {
     const value = await hostApi.cli(["ws", "list", "--json"]);
     if (value.code !== 0) throw new Error(value.stderr || value.stdout);
@@ -1167,6 +1234,9 @@ export default function App({
       }
       if (event.type === "menu-attention")
         openAttention.current(event.workspace, event.thread);
+      if (event.type === "menu-text-larger") stepTextSize("larger", "menu");
+      if (event.type === "menu-text-smaller") stepTextSize("smaller", "menu");
+      if (event.type === "menu-text-reset") stepTextSize("reset", "menu");
       if (event.type === "menu-palette") {
         setPalette(true);
         setQuery("");
@@ -1533,6 +1603,12 @@ export default function App({
         ".terminal-surface",
       );
       if (inTerminal) return;
+      const textStep = textSizeShortcut(event, mac);
+      if (textStep) {
+        event.preventDefault();
+        stepTextSize(textStep, "keyboard");
+        return;
+      }
       if (mod && event.key.toLowerCase() === "n") {
         event.preventDefault();
         actionRef.current("new");
@@ -1641,6 +1717,7 @@ export default function App({
           reason: item.reason,
           loop_setup: item.loop_setup === true,
           loop_stuck: item.loop_stuck === true,
+          offline: isOffline(item),
           summary: item.summary,
           threadName: view.threads.find((t) => t.id === item.thread)?.name,
         }),
@@ -1864,6 +1941,11 @@ export default function App({
     const fileIds = files.map((file) => file.id);
     if (!uploads.reserve(fileIds)) return;
     setSending(true);
+    // A message (not a `!` command) to a hub that is there starts a turn: its
+    // conversation shows the working cursor from now on.
+    const turnTo = connected && !isShellDraft(draft) ? target.id : undefined;
+    const endedBefore = lastTurnEnd(events);
+    setSendingTo(turnTo);
     const key = draftKey;
     const text = messageText(draft);
     // What is sent, and what the outbox keeps to put back in the draft: with the files.
@@ -1993,6 +2075,8 @@ export default function App({
       }
       drafts.set(key, (old) => (old === draft ? "" : old));
       takeFiles();
+      if (turnTo && !response.saved_offline)
+        setAwaited({ thread: turnTo, endedBefore, at: Date.now() });
       announce(
         response.saved_offline
           ? "Message saved on this device. It sends when the hub reconnects."
@@ -2009,6 +2093,7 @@ export default function App({
     } finally {
       uploads.release(fileIds);
       setSending(false);
+      setSendingTo(undefined);
       input.current?.focus();
     }
   };
@@ -3132,6 +3217,7 @@ export default function App({
     ? `Offline · saved ${new Date(savedOffline.savedAt).toLocaleString()}. Requests need a live connection before you can answer.`
     : "";
   const connectionNotice = !!(connectionError || connecting);
+  const noInternet = hubOffline(view.attention);
   // The host reconnecting on its own (its error names the hub's socket): news, not alarm.
   const reconnecting = !connecting && !!connectionWords(connectionError).detail;
   const notices: StripItem[] = [
@@ -3177,6 +3263,22 @@ export default function App({
             role: "status" as const,
             tone: "offline" as const,
             content: offlineWords,
+          },
+        ]
+      : []),
+    // The hub's machine lost its internet connection (twr-hub `hub::net`): its own notice,
+    // while it is open.
+    ...(connected && noInternet
+      ? [
+          {
+            key: "no-internet",
+            role: "status" as const,
+            tone: "warning" as const,
+            icon: <WifiOff size={15} />,
+            content: offlineNoticeText(
+              noInternet,
+              offlineThreads(view.attention),
+            ),
           },
         ]
       : []),
@@ -3975,6 +4077,8 @@ export default function App({
                   }
                   earlierBusy={earlierBusy}
                   target={target}
+                  working={working}
+                  animate={animate}
                   threads={view.threads}
                   onSetup={setupOrchestrator}
                   connected={connected}
@@ -4998,24 +5102,31 @@ export default function App({
                     >
                       {result !== undefined ? "Close" : "Cancel"}
                     </button>
-                    <button
-                      className="primary"
-                      type="submit"
-                      disabled={operationBusy}
-                    >
-                      {operationBusy ? (
-                        <Spinner />
-                      ) : operation.cli ? (
-                        <TerminalSquare size={15} />
-                      ) : operation.id === "new" ? (
-                        <Plus size={15} />
-                      ) : (
-                        <ArrowUpRight size={15} />
-                      )}{" "}
-                      {operation.cli
-                        ? "Open terminal"
-                        : operationAction(operation, result !== undefined)}
-                    </button>
+                    {/* An orchestrator chosen is final for this form: no offer to
+                        switch again (Close stays). */}
+                    {!(
+                      result !== undefined &&
+                      operation.method === "orchestrator.use"
+                    ) && (
+                      <button
+                        className="primary"
+                        type="submit"
+                        disabled={operationBusy}
+                      >
+                        {operationBusy ? (
+                          <Spinner />
+                        ) : operation.cli ? (
+                          <TerminalSquare size={15} />
+                        ) : operation.id === "new" ? (
+                          <Plus size={15} />
+                        ) : (
+                          <ArrowUpRight size={15} />
+                        )}{" "}
+                        {operation.cli
+                          ? "Open terminal"
+                          : operationAction(operation, result !== undefined)}
+                      </button>
+                    )}
                   </div>
                 </footer>
               </form>
@@ -5491,13 +5602,7 @@ function AttentionCard({
       <header>
         <span className="attention-kind" id={`${ids}-kind`}>
           <AlertCircle size={14} />
-          {item.loop_stuck
-            ? "Loop stuck"
-            : item.reason === "permission"
-              ? "Permission requested"
-              : item.reason === "question"
-                ? "Question for you"
-                : item.reason}
+          {attentionKindLabel(item)}
         </span>
         <span id={`${ids}-thread`}>{thread?.name || "twr"}</span>
       </header>
@@ -5647,7 +5752,14 @@ const Conversation = memo(function Conversation({
   onError,
   offer,
   sentImage,
+  working = false,
+  animate = true,
 }: {
+  /** The thread shown runs a turn ([`conversationWorks`]): the working cursor waits where
+   * its next text will appear. */
+  working?: boolean;
+  /** `[tui] animate`: `false` keeps the cursor a still `_`. */
+  animate?: boolean;
   /** The thread whose finished turn with changes the conversation offers a review loop. */
   offer?: Thread;
   /** The preview this client still holds of a file a message named, by its path. */
@@ -5872,6 +5984,11 @@ const Conversation = memo(function Conversation({
     onVisibleRoutines(visibleRoutineKey ? visibleRoutineKey.split(",") : []);
   }, [visibleRoutineKey, onVisibleRoutines]);
   const last = blocks.at(-1);
+  // The working cursor shows only while the conversation is at its bottom (followed), and
+  // never takes room: inline it is drawn over the text's end, on its own line in the gap
+  // below the last message. So it neither moves the view nor shows where you read.
+  const cursor =
+    working && following && !loading && last ? cursorPlace(last) : undefined;
   function loadEarlier() {
     if (!earlier || earlierBusy || !parent.current) return;
     follow.current = false;
@@ -5893,6 +6010,7 @@ const Conversation = memo(function Conversation({
       role="region"
       aria-label={`Conversation with ${target?.name || "orchestrator"}`}
       aria-busy={loading || undefined}
+      data-still={animate ? undefined : ""}
       tabIndex={0}
       onWheel={cancelMessageJump}
       onTouchStart={cancelMessageJump}
@@ -6066,28 +6184,30 @@ const Conversation = memo(function Conversation({
                 />
               </div>
               {block.children ? (
-                <details
-                  className="routine-updates"
-                  open={opened.get("details:" + block.id) ?? false}
-                  onToggle={(event) =>
-                    setOpen("details:" + block.id, event.currentTarget.open)
-                  }
-                >
-                  <summary>
-                    {block.text}
-                    <span>
-                      {" "}
-                      · {block.children.length} update
-                      {block.children.length === 1 ? "" : "s"}
-                    </span>
-                  </summary>
-                  {block.children.map((entry) => (
-                    <div key={entry.id}>
-                      <time dateTime={entry.ts}>{messageTime(entry.ts)}</time>
-                      <Markdown text={entry.text} />
-                    </div>
-                  ))}
-                </details>
+                <ThreadBox thread={aboutThread(threads, block.about)}>
+                  <details
+                    className="routine-updates"
+                    open={opened.get("details:" + block.id) ?? false}
+                    onToggle={(event) =>
+                      setOpen("details:" + block.id, event.currentTarget.open)
+                    }
+                  >
+                    <summary>
+                      {block.text}
+                      <span>
+                        {" "}
+                        · {block.children.length} update
+                        {block.children.length === 1 ? "" : "s"}
+                      </span>
+                    </summary>
+                    {block.children.map((entry) => (
+                      <div key={entry.id}>
+                        <time dateTime={entry.ts}>{messageTime(entry.ts)}</time>
+                        <Markdown text={entry.text} />
+                      </div>
+                    ))}
+                  </details>
+                </ThreadBox>
               ) : block.kind === "tool" ? (
                 <details
                   open={opened.get("details:" + block.id) ?? false}
@@ -6108,16 +6228,26 @@ const Conversation = memo(function Conversation({
               ) : block.kind === "user" || block.kind === "notice" ? (
                 // A prompt the orchestrator forwarded is a notice: the files it names show as
                 // chips too, never their paths.
-                <SentMessage
-                  text={block.text}
-                  sentImage={sentImage}
-                  expanded={opened.get(block.id) ?? false}
-                  onExpandedChange={(open) => setOpen(block.id, open)}
-                />
+                // A hub update about a worker sits in that worker's box.
+                <ThreadBox
+                  thread={
+                    block.kind === "notice"
+                      ? aboutThread(threads, block.about)
+                      : undefined
+                  }
+                >
+                  <SentMessage
+                    text={block.text}
+                    sentImage={sentImage}
+                    expanded={opened.get(block.id) ?? false}
+                    onExpandedChange={(open) => setOpen(block.id, open)}
+                  />
+                </ThreadBox>
               ) : (
                 <MessageBody
                   text={block.text}
                   streaming={block.kind === "assistant" && !!block.pending}
+                  working={cursor === "inline" && block === last}
                   threadTags={
                     block.kind === "assistant" && !!target?.is_orchestrator
                   }
@@ -6131,6 +6261,11 @@ const Conversation = memo(function Conversation({
           );
         })}
       </div>
+      {cursor === "line" && (
+        <div className="working-line" aria-hidden="true">
+          <span className="working-cursor" />
+        </div>
+      )}
       {offer && !loading && (
         <div className="loop-offer-row">
           <span>
