@@ -9506,13 +9506,7 @@ fn history_lock(ws: &Paths) -> anyhow::Result<WorkspaceLock> {
 /// twr's data directory (its `runner-<box>.db`): its worktrees and trash are `default`'s
 /// directories too, which the removal would take.
 fn runner_in_root_why(root: &Paths) -> Option<String> {
-    let runner = twr_core::workspaces::runner_spool(root)?;
-    Some(format!(
-        "a `twr runner` of this machine keeps its data in {} ({runner}), and its worktrees and \
-         trash there are this workspace's directories too: stop it and give it a `--data-dir` \
-         of its own, then remove the workspace",
-        root.data_dir.display()
-    ))
+    twr_core::workspaces::runner_spool_why(root, "remove the workspace")
 }
 
 /// Why workspace `name` can't be removed while messages are queued for its orchestrator:
@@ -10866,13 +10860,16 @@ mod tests {
         assert!(
             plan.refused
                 .as_deref()
-                .is_some_and(|r| r.contains("a `twr runner` of this machine")),
+                .is_some_and(|r| r.contains("a `twr runner` for box gpu keeps its data")),
             "{plan:?}"
         );
         let e = remove_confirmed(&root, &config, "default", true, plan.generation)
             .await
             .unwrap_err();
-        assert!(e.to_string().contains("a `twr runner`"), "{e:#}");
+        assert!(
+            e.to_string().contains("a `twr runner` for box gpu"),
+            "{e:#}"
+        );
         assert_eq!(probe_hub(&root.socket).await.unwrap(), Probe::Answers);
         assert!(!root.root_removed());
         server.abort();
@@ -11075,7 +11072,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            e.to_string().contains("a `twr runner` of this machine"),
+            e.to_string()
+                .contains("a `twr runner` for box gpu keeps its data"),
             "{e:#}"
         );
         assert!(!root.root_removed());

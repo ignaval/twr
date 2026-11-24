@@ -371,13 +371,8 @@ pub fn create(root: &Paths, name: &str) -> anyhow::Result<Created> {
         crate::paths::check_socket_path(&root.socket)?;
         // What a removal cut short left goes (`worktrees/` and `trash/` among it), which a
         // `twr runner` keeping its data here would use as its own.
-        if let Some(spool) = runner_spool(&root) {
-            bail!(
-                "a `twr runner` of this machine keeps its data in {} ({spool}), whose worktrees \
-                 and trash there `default` would take for its own: stop it and give it a \
-                 `--data-dir` of its own, then make the workspace again",
-                root.data_dir.display()
-            );
+        if let Some(why) = runner_spool_why(&root, "make the workspace again") {
+            bail!(why);
         }
         clear_root_leftovers(&root)?;
         new_generation(&root)?;
@@ -444,6 +439,29 @@ pub fn runner_spool(root: &Paths) -> Option<String> {
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .find(|n| n.starts_with("runner-") && n.ends_with(".db"))
+}
+
+/// Why `default` can't be removed or made again while a `twr runner`'s spool is in the
+/// root's data directory (its default `--data-dir`), whether that runner runs or not: the
+/// spool holds what it has not delivered to its hub, and its worktrees and trash there are
+/// `default`'s directories too. What to do, then `doing`. `None`: no spool is there.
+pub fn runner_spool_why(root: &Paths, doing: &str) -> Option<String> {
+    let spool = runner_spool(root)?;
+    let dir = root.root().data_dir;
+    let name = spool
+        .strip_prefix("runner-")
+        .and_then(|s| s.strip_suffix(".db"))
+        .unwrap_or(&spool);
+    Some(format!(
+        "a `twr runner` for box {name} keeps its data in {dir}: its spool {spool}, which holds \
+         what it has not delivered to its hub yet (and the agents it started), and its \
+         worktrees and trash, which are `default`'s directories too. If that runner runs, or \
+         will again, start it with a `--data-dir` of its own once its hub has what it holds \
+         (it delivers it when it connects); if it never will, deleting {} loses only what it \
+         never delivered. Then {doing}",
+        dir.join(&spool).display(),
+        dir = dir.display(),
+    ))
 }
 
 /// The name a removal moves workspace `id`'s files aside to, `.rm-<id>-<pid>-<nanoseconds>`:
@@ -731,7 +749,15 @@ mod tests {
         // Not while a runner keeps its data there: its worktrees and trash would go.
         std::fs::write(root.data_dir.join("runner-gpu.db"), "").unwrap();
         let e = create(&root, "default").unwrap_err().to_string();
-        assert!(e.contains("a `twr runner` of this machine"), "{e}");
+        assert!(
+            e.contains("a `twr runner` for box gpu keeps its data in")
+                && e.contains("runner-gpu.db"),
+            "{e}"
+        );
+        assert!(
+            e.contains("deleting ") && e.ends_with("Then make the workspace again"),
+            "{e}"
+        );
         assert!(root.data_dir.join("twr.db").exists() && root.root_removed());
         std::fs::remove_file(root.data_dir.join("runner-gpu.db")).unwrap();
         // A half done removal's leftovers go when it is made again; the rest stays.
