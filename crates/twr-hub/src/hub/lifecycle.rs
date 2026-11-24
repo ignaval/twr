@@ -48,6 +48,9 @@ impl Hub {
         // was is not opened (and so not made again).
         if let Some(marker) = &opts.removed_marker {
             if std::fs::symlink_metadata(marker).is_ok() {
+                // Let go unlocked, not only closed (a process started meanwhile shares the open
+                // file until it execs).
+                let _ = lock.unlock();
                 anyhow::bail!(
                     "workspace {} was removed: `twr ws new {}` makes it again",
                     twr_core::paths::DEFAULT_WORKSPACE,

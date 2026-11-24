@@ -2124,3 +2124,39 @@ fn a_hub_starting_as_its_workspace_is_removed_does_not_make_it_again() {
     assert!(!a.data_dir.exists());
     assert!(fails(home, &["-w", "a", "thread", "list"]).contains("there is no workspace a"));
 }
+
+/// A hub started for a workspace by id serves that one or none: once it is removed and
+/// another is renamed into its id, `-w <id>` names that other workspace, whose data the hub
+/// started for the first one never opens.
+#[test]
+fn a_hub_started_by_id_never_serves_a_workspace_renamed_into_it() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    ok(home, &["ws", "new", "a"]);
+    ok(home, &["ws", "new", "b"]);
+    let a = Paths::with_home(home).workspace("a").unwrap();
+    let b = Paths::with_home(home).workspace("b").unwrap();
+    ok(home, &["ws", "rm", "a", "--yes"]);
+    ok(home, &["ws", "rename", "b", "a"]);
+    let out = command(
+        home,
+        &[
+            "--workspace",
+            "a",
+            "--socket",
+            a.socket.to_str().unwrap(),
+            "hub",
+        ],
+    )
+    .env("TWR_HUB_WORKSPACE_ID", "a")
+    .output()
+    .unwrap();
+    assert!(!out.status.success());
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        e.contains("there is no workspace a (it was removed)"),
+        "{e}"
+    );
+    assert!(!b.db_file().exists());
+    assert!(!a.data_dir.exists());
+}

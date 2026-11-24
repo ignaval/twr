@@ -48,6 +48,12 @@ pub const DEFAULT_FILE: &str = "default-workspace";
 /// The file in the root's data directory that says the root slot's workspace was removed.
 pub const REMOVED_FILE: &str = "workspace-removed";
 
+/// Set by a process that starts a hub for a workspace it knows by id (`twr`, the desktop app,
+/// with `--workspace <id>`): the hub serves that id or none, never a workspace that a name
+/// fallback would find once that one is gone ([`Paths::find_workspace`]). The hub removes it
+/// from what it runs.
+pub const HUB_ID_ENV: &str = "TWR_HUB_WORKSPACE_ID";
+
 /// The lock in the root's data directory held while workspaces are created, renamed, removed
 /// or made the default, so two of those never pass the same check.
 pub const REGISTRY_LOCK: &str = "workspaces.lock";
@@ -240,7 +246,15 @@ pub fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
 
 /// The registry lock ([`REGISTRY_LOCK`]), held until dropped.
 pub struct RegistryLock {
-    _file: std::fs::File,
+    file: std::fs::File,
+}
+
+/// Unlocked when let go, not only closed: a process another thread starts meanwhile shares the
+/// open file until it execs, and the lock stays on it while anyone has it open.
+impl Drop for RegistryLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
 }
 
 impl RegistryLock {
@@ -259,7 +273,7 @@ impl RegistryLock {
             .with_context(|| format!("opening {}", path.display()))?;
         file.lock()
             .with_context(|| format!("locking {}", path.display()))?;
-        Ok(RegistryLock { _file: file })
+        Ok(RegistryLock { file })
     }
 }
 
@@ -432,6 +446,16 @@ pub fn runner_spool(root: &Paths) -> Option<String> {
         .find(|n| n.starts_with("runner-") && n.ends_with(".db"))
 }
 
+/// The name a removal moves workspace `id`'s files aside to, `.rm-<id>-<pid>-<nanoseconds>`:
+/// a name no workspace can have, and none that a removal cut short left (whose process id
+/// may since be another's) is taken again.
+pub fn aside_name(id: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!(".rm-{id}-{}-{nanos}", std::process::id())
+}
+
 /// Whether `name`, an entry of the root's data directory, is the root slot's own: one of
 /// [`ROOT_OWNED`] or [`ROOT_OWNED_PREFIXES`], or what a writer of those left half written (a
 /// temporary file of the input history's, or of [`write_atomic`]'s). `tui-history.lock`
@@ -446,7 +470,7 @@ pub fn root_owned(name: &str) -> bool {
 }
 
 /// Moves the root slot's own entries of the root's data directory ([`root_owned`]) into a
-/// new directory beside them, `.rm-default-<pid>`, which it returns (`None` when there were
+/// new directory beside them, `.rm-default-…` ([`aside_name`]), which it returns (`None` when there were
 /// none): renames within one directory, so none is ever half moved.
 pub fn move_root_owned_aside(root: &Paths) -> anyhow::Result<Option<PathBuf>> {
     let root = root.root();
@@ -463,9 +487,7 @@ pub fn move_root_owned_aside(root: &Paths) -> anyhow::Result<Option<PathBuf>> {
     if owned.is_empty() {
         return Ok(None);
     }
-    let aside = root
-        .data_dir
-        .join(format!(".rm-{DEFAULT_WORKSPACE}-{}", std::process::id()));
+    let aside = root.data_dir.join(aside_name(DEFAULT_WORKSPACE));
     crate::paths::ensure_private_dir(&aside)?;
     for n in owned {
         std::fs::rename(root.data_dir.join(&n), aside.join(&n))
