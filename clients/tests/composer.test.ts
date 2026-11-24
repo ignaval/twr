@@ -88,6 +88,10 @@ type HostOptions = {
   connect?: (workspace: string, options?: { byId?: boolean }) => Promise<Json>;
   /** What `twr ws list --json` lists (default: the views' workspaces). */
   listing?: Json[];
+  /** What the bootstrap says of the workspace (default: `default`, an id). */
+  boot?: { workspace: string; typed?: boolean };
+  /** No live view arrives at start (the first connection failed). */
+  noLive?: boolean;
 };
 
 function fakeHost(options: HostOptions = {}) {
@@ -146,6 +150,7 @@ function fakeHost(options: HostOptions = {}) {
     secureDelete: async (key: string) => void secure.delete(key),
     bootstrap: async () => ({
       workspace: "default",
+      ...options.boot,
       hostId: "composer-test",
       platform: "linux",
       home: "/home/test",
@@ -281,7 +286,7 @@ async function mount(
   };
   await act(async () => root.render(createElement(App)));
   await settle();
-  await live("default");
+  if (!options.noLive) await live("default");
   const all = (selector: string) => document.querySelectorAll(selector);
   const find = (selector: string, text?: string) => {
     const node = all(selector).find(
@@ -382,6 +387,31 @@ describe("a workspace the app holds the id of", () => {
     expect(calls).toEqual([
       ["default", { byId: true }],
       ["b", { byId: true }],
+    ]);
+    await app.unmount();
+  }, 30_000);
+});
+
+describe("a workspace given by name", () => {
+  it("is asked for by name again on Reconnect, once its first connection failed", async () => {
+    const calls: [string, { byId?: boolean } | undefined][] = [];
+    const app = await mount({
+      // The desktop app started with `TWR_WORKSPACE=acme`, `client-x`'s new name.
+      boot: { workspace: "acme", typed: true },
+      noLive: true,
+      connect: async (workspace, options) => {
+        calls.push([workspace, options]);
+        if (calls.length === 1) throw new Error("config.toml: invalid TOML");
+        return { workspace };
+      },
+      listing: [
+        { id: "client-x", name: "acme", default: true, hub: "stopped" },
+      ],
+    });
+    await app.click(app.find("button", "Reconnect"));
+    expect(calls).toEqual([
+      ["acme", { byId: false }],
+      ["client-x", { byId: false }],
     ]);
     await app.unmount();
   }, 30_000);

@@ -642,6 +642,10 @@ export default function App({
   const recentTurn = useRef<number | undefined>(undefined);
   const earlierRequest = useRef<number | undefined>(undefined);
   const connectGeneration = useRef(0);
+  // Whether `workspace` is an id the app holds (given as one, found in the listing, or what a
+  // connect said it serves), not a name a person typed that nothing resolved yet: only then
+  // does Reconnect ask for it by id alone.
+  const workspaceHeld = useRef(false);
   const transcriptGeneration = useRef(0);
   const activeThread = useRef<string | undefined>(undefined);
   /** The conversation whose transcript on screen was loaded live from the hub. */
@@ -1083,9 +1087,11 @@ export default function App({
       // that workspace or none: once it is gone, never another renamed into it. A selector a
       // person typed (`/ws`, a new workspace's name) is by name, else by id.
       const byId = options?.byId === true;
-      const name = byId
-        ? selector
-        : (resolveWorkspace(listingRef.current, selector) ?? selector);
+      const listed = byId
+        ? undefined
+        : resolveWorkspace(listingRef.current, selector);
+      const name = byId ? selector : (listed ?? selector);
+      workspaceHeld.current = byId || listed !== undefined;
       const generation = ++connectGeneration.current;
       transcriptGeneration.current++;
       activeThread.current = undefined;
@@ -1117,8 +1123,10 @@ export default function App({
         const value = await hostApi.connect(name, { byId });
         if (generation !== connectGeneration.current) return;
         // The id its hub serves, as it says it (a listing not read yet took no name).
-        if (typeof value?.workspace === "string" && value.workspace)
+        if (typeof value?.workspace === "string" && value.workspace) {
           setWorkspace(value.workspace);
+          workspaceHeld.current = true;
+        }
         setPaths(value);
         await refreshInfo();
         await refreshWorkspaces();
@@ -3287,7 +3295,11 @@ export default function App({
               </>
             ),
             actions: !connecting && (
-              <button onClick={() => void connect(workspace, { byId: true })}>
+              <button
+                onClick={() =>
+                  void connect(workspace, { byId: workspaceHeld.current })
+                }
+              >
                 Reconnect
               </button>
             ),
