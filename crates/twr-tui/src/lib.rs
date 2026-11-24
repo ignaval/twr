@@ -2037,6 +2037,9 @@ fn accounts_failure(e: &anyhow::Error) -> Value {
     }
 }
 
+/// What gives up the TUI's waiting workspace changes ([`Shared::cancel`]).
+type Cancel = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
 /// A removal the workspace menu confirmed of the workspace shown ([`Shared::pending_removal`]):
 /// it runs once the open `open` (the switch away from it) is done.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2090,15 +2093,20 @@ fn spawn_removal(
 }
 
 /// Creates workspace `name` when asked, opens its hub and connects to it.
-async fn open_workspace(ws: &dyn Workspaces, name: &str, create: bool) -> anyhow::Result<Session> {
+async fn open_workspace(
+    ws: &dyn Workspaces,
+    name: &str,
+    create: bool,
+    cancel: &Cancel,
+) -> anyhow::Result<Session> {
     if create {
-        // It waits for the registry's lock, which a removal may hold a moment.
+        // It waits for the registry's lock, which a removal may hold a moment (or while its
+        // question waits), until the TUI quits ([`Shared::cancel`]).
         // (Only a multi-threaded runtime, the CLI's, can let a worker block.)
+        let made = || twr_core::workspaces::cancellable(cancel, || create_workspace(ws, name));
         match tokio::runtime::Handle::current().runtime_flavor() {
-            tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| create_workspace(ws, name))?
-            }
-            _ => create_workspace(ws, name)?,
+            tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(made)?,
+            _ => made()?,
         }
     }
     let socket = ws.open(name).await?;
@@ -2794,6 +2802,10 @@ struct Shared {
     /// A workspace being deleted from the workspace menu ([`Action::WsRemove`]): the one the
     /// TUI showed, deleted once the switch away from it is done ([`due_removal`]).
     pending_removal: Option<PendingRemoval>,
+    /// Set as the TUI quits: what gives up a workspace change of its that still waits for the
+    /// registry lock (`twr ws rm` asking its question elsewhere), so nothing is applied after
+    /// the user left ([`twr_core::workspaces::cancellable`]).
+    cancel: Cancel,
     /// The opens of a workspace's hub started so far ([`Action::Workspace`],
     /// [`Action::WsRemove`]): each one's number, so a removal waits for its own.
     opens: u64,
@@ -3032,6 +3044,7 @@ pub async fn run_with(
         late_tx,
         late_rx,
         pending_removal: None,
+        cancel: Cancel::default(),
         opens: 0,
         note: None,
         ws_done_tx,
@@ -3087,7 +3100,9 @@ pub async fn run_with(
     )
     .await;
     // Nothing is sent once the user quit, from any workspace: no suggestion asked either,
-    // and nothing more read aloud.
+    // and nothing more read aloud. A workspace change still waiting for the registry lock
+    // gives up, unapplied.
+    ctx.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
     abort_all(&mut ctx.all_callers);
     ctx.asking.settle(false);
     ctx.summarizing.settle(false);
@@ -3827,9 +3842,13 @@ where
                             // Off the loop: they wait for the lock a removal holds meanwhile.
                             Action::WsRename { id, to } => {
                                 if let Some(ws) = ctx.workspaces.clone() {
-                                    let done = ctx.ws_done_tx.clone();
+                                    let (done, cancel) = (ctx.ws_done_tx.clone(), ctx.cancel.clone());
                                     tokio::task::spawn_blocking(move || {
-                                        let msg = match ws.rename(&id, &to) {
+                                        // Given up, unapplied, once the TUI quits.
+                                        let renamed = twr_core::workspaces::cancellable(&cancel, || {
+                                            ws.rename(&id, &to)
+                                        });
+                                        let msg = match renamed {
                                             Ok(msg) => msg,
                                             Err(e) => format!("rename: {e:#}"),
                                         };
@@ -3840,9 +3859,12 @@ where
                             }
                             Action::WsDefault { id } => {
                                 if let Some(ws) = ctx.workspaces.clone() {
-                                    let done = ctx.ws_done_tx.clone();
+                                    let (done, cancel) = (ctx.ws_done_tx.clone(), ctx.cancel.clone());
                                     tokio::task::spawn_blocking(move || {
-                                        let msg = match ws.set_default(&id) {
+                                        let made = twr_core::workspaces::cancellable(&cancel, || {
+                                            ws.set_default(&id)
+                                        });
+                                        let msg = match made {
                                             Ok(msg) => msg,
                                             Err(e) => format!("make default: {e:#}"),
                                         };
@@ -3880,9 +3902,10 @@ where
                                             stop_hub,
                                             generation,
                                         });
-                                        let tx = open_tx.clone();
+                                        let (tx, cancel) = (open_tx.clone(), ctx.cancel.clone());
                                         tokio::spawn(async move {
-                                            let r = open_workspace(ws.as_ref(), &to, false).await;
+                                            let r = open_workspace(ws.as_ref(), &to, false, &cancel)
+                                                .await;
                                             let _ = tx.send((to, open, r));
                                         });
                                     }
@@ -3905,11 +3928,13 @@ where
                                     if !state.begin_switch(&name) {
                                         continue;
                                     }
-                                    let (ws, tx) = (ws.clone(), open_tx.clone());
+                                    let (ws, tx, cancel) =
+                                        (ws.clone(), open_tx.clone(), ctx.cancel.clone());
                                     ctx.opens += 1;
                                     let open = ctx.opens;
                                     tokio::spawn(async move {
-                                        let r = open_workspace(ws.as_ref(), &name, create).await;
+                                        let r = open_workspace(ws.as_ref(), &name, create, &cancel)
+                                            .await;
                                         let _ = tx.send((name, open, r));
                                     });
                                 }

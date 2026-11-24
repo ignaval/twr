@@ -265,6 +265,7 @@ async fn the_tui_reconnects_after_its_hub_restarts() {
         late_tx: late_tx.clone(),
         late_rx,
         pending_removal: None,
+        cancel: Default::default(),
         opens: 0,
         note: None,
         ws_done_tx,

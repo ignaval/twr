@@ -1547,6 +1547,10 @@ fn main() -> ExitCode {
         };
         format!("{role}: process started")
     });
+    // The TUI's own work is done once it returns (its history and settings written): what may
+    // still run is a blocking task, a workspace change waiting for the registry lock say, which
+    // must neither hold up its exit nor finish after it.
+    let tui = cli.cmd.is_none();
     let stopping_hub = matches!(
         cli.cmd,
         Some(Cmd::Hub {
@@ -1632,7 +1636,11 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     };
-    shutdown_cli_runtime(runtime, stopping_hub || relaying);
+    if tui {
+        runtime.shutdown_timeout(Duration::from_secs(1));
+    } else {
+        shutdown_cli_runtime(runtime, stopping_hub || relaying);
+    }
     code
 }
 
@@ -9470,11 +9478,31 @@ impl CheckedRemoval {
             removed,
             kept,
             after,
+            goes,
             registry,
             lock,
-            ..
         } = self;
         let id = ws.workspace_id().to_string();
+        // Checked again after the question, which may have waited long: what a writer that
+        // takes neither lock (`twr runner` keeping its data in twr's data directory) changed
+        // meanwhile is not removed unlisted. (It could still start between here and the move
+        // just below, a few file operations apart.)
+        if let Some(why) = refusal_before_stopping(&root, &ws) {
+            bail!(why);
+        }
+        let now = leftover_worktrees(&ws.worktrees_dir());
+        if now != goes.worktrees {
+            bail!(
+                "what removing workspace {name} takes changed since it was listed (its worktree \
+                 directories are now {}): nothing was removed; look again with `twr ws rm {}`",
+                if now.is_empty() {
+                    "none".to_string()
+                } else {
+                    now.join(", ")
+                },
+                ws.workspace_id()
+            );
+        }
         // What a TUI saves of its input history waits meanwhile, then finds the workspace
         // gone (`twr_tui::save_history`): it never makes it again.
         let history = history_lock(&ws)?;
@@ -10285,9 +10313,17 @@ async fn plan_removal_of(
                 anyhow::Ok(Some((ws_threads(&ws2)?, trash_items(&ws2)?)))
             })
             .await??;
-            // A hub holds its lock without answering on its socket: it runs on another socket
-            // (`--socket`), or is starting or stopping.
+            // Its lock is held: by another workspace change (a `twr ws rm` of it, at its
+            // question say), which holds the registry lock too; else by a hub that doesn't
+            // answer on its socket: it runs on another (`--socket`), or is starting or stopping.
             let Some((log, trash)) = read else {
+                if twr_core::workspaces::RegistryLock::is_held(root) {
+                    return refused(
+                        "another change to the workspaces is in progress (a `twr ws` command, \
+                         maybe asking a question): try again once it is done"
+                            .into(),
+                    );
+                }
                 return refused(format!(
                     "a hub of it is running on another socket, or starting or stopping: stop it \
                      with `twr -w {} hub stop` (or `twr --socket <path> hub stop`), or try again \
@@ -11095,6 +11131,63 @@ mod tests {
             .to_string();
         assert!(e.contains("threads being made"), "{e}");
         assert!(a.data_dir.is_dir());
+    }
+
+    /// A removal checks again after its question what a writer that takes neither lock may
+    /// have changed meanwhile: a `twr runner` that started keeping its data in twr's data
+    /// directory (its spool, a thread's worktree) refuses it, and nothing is removed.
+    #[test]
+    fn a_runner_that_starts_during_the_question_keeps_default() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        std::fs::create_dir_all(&root.data_dir).unwrap();
+        let name = root.display_name();
+        let checked = check_removal(root.clone(), root.clone(), name.clone(), None, None).unwrap();
+        // The runner starts meanwhile: its spool, and a thread's worktree.
+        std::fs::write(root.data_dir.join("runner-gpu.db"), "").unwrap();
+        let e = checked.remove().unwrap_err().to_string();
+        assert!(e.contains("a `twr runner` for box gpu"), "{e}");
+        assert!(!root.root_removed());
+        std::fs::remove_file(root.data_dir.join("runner-gpu.db")).unwrap();
+        let checked = check_removal(root.clone(), root.clone(), name, None, None).unwrap();
+        let work = root.data_dir.join("worktrees/p/t");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("file"), "a thread's work").unwrap();
+        let e = checked.remove().unwrap_err().to_string();
+        assert!(
+            e.contains("changed since it was listed") && e.contains("p/t"),
+            "{e}"
+        );
+        assert!(!root.root_removed());
+        assert!(work.join("file").exists());
+    }
+
+    /// The TUI's Delete plan of a stopped workspace whose lock is held says why: another
+    /// workspace change (a `twr ws rm` of it at its question) when the registry lock is held
+    /// too, else a hub on another socket.
+    #[tokio::test]
+    async fn a_delete_plan_names_what_holds_the_workspace() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        let a = twr_core::workspaces::create(&root, "a").unwrap().paths;
+        let config = Config::default();
+        let lock = lock_workspace(&a).unwrap().unwrap();
+        let plan = plan_removal_of(&root, "a", &config).await.unwrap();
+        assert!(
+            plan.refused
+                .as_deref()
+                .is_some_and(|r| r.contains("running on another socket")),
+            "{plan:?}"
+        );
+        let registry = twr_core::workspaces::RegistryLock::take(&root).unwrap();
+        let plan = plan_removal_of(&root, "a", &config).await.unwrap();
+        assert!(
+            plan.refused
+                .as_deref()
+                .is_some_and(|r| r.contains("another change to the workspaces")),
+            "{plan:?}"
+        );
+        drop((registry, lock));
     }
 
     /// The TUI's Delete shows what `twr ws rm` lists before it asks: worktree directories left

@@ -293,8 +293,30 @@ impl RegistryLock {
                 {
                     hook();
                 }
-                file.lock()
-                    .with_context(|| format!("locking {}", path.display()))?;
+                // A wait the caller can give up ([`cancellable`]): polled, so that it notices.
+                match CANCEL.with(|c| c.borrow().clone()) {
+                    None => file
+                        .lock()
+                        .with_context(|| format!("locking {}", path.display()))?,
+                    Some(cancel) => loop {
+                        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                            bail!(
+                                "given up while it waited for another change to the \
+                                 workspaces: nothing was changed"
+                            );
+                        }
+                        match file.try_lock() {
+                            Ok(()) => break,
+                            Err(std::fs::TryLockError::WouldBlock) => {
+                                std::thread::sleep(std::time::Duration::from_millis(50))
+                            }
+                            Err(std::fs::TryLockError::Error(e)) => {
+                                return Err(e)
+                                    .with_context(|| format!("locking {}", path.display()))
+                            }
+                        }
+                    },
+                }
             }
             Err(std::fs::TryLockError::Error(e)) => {
                 return Err(e).with_context(|| format!("locking {}", path.display()))
@@ -305,6 +327,23 @@ impl RegistryLock {
 }
 
 impl RegistryLock {
+    /// Whether another process holds the registry lock now (a `twr ws` change, `twr ws rm`
+    /// maybe asking its question): looked at without waiting, and let go at once.
+    pub fn is_held(root: &Paths) -> bool {
+        let path = root.root().data_dir.join(REGISTRY_LOCK);
+        let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) else {
+            return false;
+        };
+        match file.try_lock() {
+            Ok(()) => {
+                let _ = file.unlock();
+                false
+            }
+            Err(std::fs::TryLockError::WouldBlock) => true,
+            Err(std::fs::TryLockError::Error(_)) => false,
+        }
+    }
+
     /// [`RegistryLock::take`] for long-lived code (the runner service): waits at most `wait`
     /// for another holder (`twr ws rm` may hold it while its question waits, for hours), then
     /// fails saying a workspace change is in progress, for its caller to try again later. Never
@@ -337,6 +376,26 @@ impl RegistryLock {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
+}
+
+thread_local! {
+    /// The flag that gives up this thread's wait for the registry lock ([`cancellable`]).
+    static CANCEL: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` on this thread with `cancel` as what gives up its waits for the registry lock
+/// ([`RegistryLock::take`]): once it is set, a wait ends with an error and changes nothing.
+/// For a long-lived process that runs a change for its user (the TUI's Rename, Make default,
+/// New workspace) and must not apply it once they quit.
+pub fn cancellable<T>(
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    f: impl FnOnce() -> T,
+) -> T {
+    let was = CANCEL.with(|c| c.replace(Some(cancel.clone())));
+    let out = f();
+    CANCEL.with(|c| *c.borrow_mut() = was);
+    out
 }
 
 type WaitHook = Box<dyn Fn() + Send + Sync>;
@@ -1012,6 +1071,30 @@ mod tests {
         assert_eq!(root.find_workspace("a").unwrap().workspace_id(), "b");
         assert!(root.existing_by_id("a").is_err());
         assert_eq!(root.existing_by_id("b").unwrap().workspace_id(), "b");
+    }
+
+    /// A change that waits for the registry lock under [`cancellable`] gives up once its flag
+    /// is set, at once, and changes nothing after the lock goes.
+    #[test]
+    fn a_cancelled_wait_gives_up_and_changes_nothing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_d, root) = home();
+        create(&root, "a").unwrap();
+        let held = RegistryLock::take(&root).unwrap();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let renaming = {
+            let (root, cancel) = (root.clone(), cancel.clone());
+            std::thread::spawn(move || cancellable(&cancel, || rename(&root, "a", "acme")))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let asked = std::time::Instant::now();
+        cancel.store(true, Ordering::SeqCst);
+        let e = renaming.join().unwrap().unwrap_err().to_string();
+        assert!(asked.elapsed() < std::time::Duration::from_secs(1));
+        assert!(e.contains("given up"), "{e}");
+        drop(held);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(root.workspace("a").unwrap().display_name(), "a");
     }
 
     /// Deleting an aside directory another process deleted first is no error.
