@@ -11149,6 +11149,15 @@ mod tests {
                 .unwrap();
             hub.shutdown().await;
         }
+        // (The hub's tasks let go of its lock as they end, a moment after: under load, later.)
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while lock_workspace(&a).unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the hub kept its lock"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let version = |v: Option<i32>| {
             let conn = twr_hub::store::connect(&a.db_file()).unwrap();
             if let Some(v) = v {
