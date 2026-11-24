@@ -308,6 +308,54 @@ jobs:
           TWR_TEST_REQUIRE_SYSTEMD: "1"
         run: cargo test -p twr-hub --locked --test limits -- --ignored real_systemd --nocapture
 
+  relay-compat:
+    # docs/tools/relay-compat.sh: this build's relay against `twr relay probe` from the last two
+    # releases, and this build's probe against their relays (docs/relay-protocol.md §13). A
+    # release from before the relay existed is skipped. Loopback only.
+    name: relay compatibility (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The release tags, to build the last two releases.
+          fetch-depth: 0
+      - name: Install the Rust toolchain (rust-toolchain.toml)
+        shell: bash
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml)
+          [ -n "$channel" ] || { echo "::error::no channel in rust-toolchain.toml"; exit 1; }
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+          rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: relay-compat
+      - run: cargo build -p twr-cli --no-default-features --locked
+      - run: sh docs/tools/relay-compat.sh target/debug/twr
+
+  relay-acme:
+    # The relay's Let's Encrypt path against pebble, Let's Encrypt's ACME test server, in Docker
+    # on loopback (docs/tools/relay-acme-pebble.sh). No real ACME service is contacted.
+    name: relay ACME with pebble (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the Rust toolchain (rust-toolchain.toml)
+        shell: bash
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml)
+          [ -n "$channel" ] || { echo "::error::no channel in rust-toolchain.toml"; exit 1; }
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+          rustc --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: relay-acme
+      - run: sh docs/tools/relay-acme-pebble.sh
+
   release-build:
     # The release builds (release.yml), without publishing: the musl cross builds with
     # cargo-zigbuild and both macOS builds from the arm64 runner. Setup, commands, flags and

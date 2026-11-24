@@ -3529,6 +3529,139 @@
     ]
   },
   {
+    "id": "cli:relay check-config",
+    "title": "twr relay check-config",
+    "description": "Check a configuration file as `serve` would read it, without starting anything",
+    "group": "CLI · relay",
+    "fields": [
+      {
+        "key": "path",
+        "label": "path",
+        "type": "text",
+        "required": true,
+        "description": ""
+      }
+    ],
+    "cli": [
+      "relay",
+      "check-config"
+    ],
+    "cliFields": [
+      {
+        "key": "path",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:relay probe",
+    "title": "twr relay probe",
+    "description": "Check a running relay end to end: info, a test hub with a phone through it, the record store, iroh admission and iroh's relay. Exits 1 if any check fails",
+    "group": "CLI · relay",
+    "fields": [
+      {
+        "key": "url",
+        "label": "url",
+        "type": "text",
+        "required": true,
+        "description": "`relay://host[:port][#pin]`"
+      },
+      {
+        "key": "connect",
+        "label": "connect",
+        "type": "text",
+        "description": "Connect to this address instead of resolving the URL's host",
+        "advanced": false
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print one JSON object",
+        "advanced": true
+      },
+      {
+        "key": "timeout",
+        "label": "timeout",
+        "type": "text",
+        "description": "Seconds per check [default: 15]",
+        "advanced": false
+      },
+      {
+        "key": "state",
+        "label": "state",
+        "type": "text",
+        "description": "Keep the probe's keys in this directory between runs, as monitoring should: the relay then sees one hub and one admitted pair, within its per-address limits",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "relay",
+      "probe"
+    ],
+    "cliFields": [
+      {
+        "key": "url",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "connect",
+        "flag": "--connect",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "timeout",
+        "flag": "--timeout",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "state",
+        "flag": "--state",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:relay url",
+    "title": "twr relay url",
+    "description": "Print the relay URL hubs use for this relay's configuration, with its pin when the relay's key is self-signed",
+    "group": "CLI · relay",
+    "fields": [
+      {
+        "key": "config",
+        "label": "config",
+        "type": "text",
+        "description": "",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "relay",
+      "url"
+    ],
+    "cliFields": [
+      {
+        "key": "config",
+        "flag": "--config",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
     "id": "cli:remote",
     "title": "twr remote",
     "description": "`mosh HOST -- twr ARGS...` (with `--ssh`: `ssh -t HOST -- twr ARGS...`) with `twr speak --ssh HOST` running beside it, in the background (its output in `speak.log` in twr's data directory), stopped when the session ends",

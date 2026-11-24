@@ -579,9 +579,9 @@ select {
   [data-mobile="true"] .conversation-scroll {
     padding: 8px 12px 12px;
   }
-  [data-mobile="true"] .latest-user-message > button,
-  [data-mobile="true"] .latest-user-empty {
-    padding-inline: 12px;
+  /* In the phone's text column: the history's 12px inset. */
+  [data-mobile="true"] .latest-user-message {
+    width: calc(100% - 24px);
   }
   [data-mobile="true"] .dialog {
     width: 100%;

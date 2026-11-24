@@ -8,6 +8,7 @@ mod dial_in;
 mod loops;
 mod phone;
 mod pretty;
+mod relay;
 mod runner_link;
 mod runner_update;
 mod speech;
@@ -611,6 +612,13 @@ enum Cmd {
     Account {
         #[command(subcommand)]
         cmd: accounts::AccountCmd,
+    },
+    /// Run, install or check a twr relay: the service that passes phone connections through
+    /// to hubs without decrypting them, relays linked runners with iroh, and keeps their
+    /// address records (docs/relay.md). `twr relay serve --install` sets one up on a server.
+    Relay {
+        #[command(subcommand)]
+        cmd: relay::RelayCmd,
     },
     /// Run this box as a runner: connect to a hub over WebSocket and run its threads here.
     /// Stops the runtimes gracefully on SIGINT / SIGTERM. `twr runner install-token <box>`
@@ -1797,6 +1805,11 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         clap_complete::generate(*shell, &mut command, "twr", &mut std::io::stdout());
         return Ok(ExitCode::SUCCESS);
     }
+    // A relay is a server of its own: no twr home, config or hub.
+    let cli = match cli.cmd {
+        Some(Cmd::Relay { cmd }) => return relay::run(cmd).await,
+        cmd => Cli { cmd, ..cli },
+    };
     // An SSH box's relay and daemon need no twr home: every path comes from the box's
     // environment (the relay) or the relay (the daemon).
     let cli = match cli.cmd {
@@ -2414,6 +2427,7 @@ async fn run_simple(cmd: Cmd, paths: Paths, socket: PathBuf) -> anyhow::Result<(
         | Cmd::Mcp
         | Cmd::ClaudeMemoryGuard { .. }
         | Cmd::Runner { .. }
+        | Cmd::Relay { .. }
         | Cmd::Update { .. }
         | Cmd::Boxes { .. }
         | Cmd::Loop { .. }

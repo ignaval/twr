@@ -241,6 +241,26 @@ async fn the_card_says_what_goes_and_only_the_user_answers_it() {
         json!([{"thread": id, "name": "api", "lifecycle": life(&hub, &id)}])
     );
     assert_eq!(ext["asked_by"], "user:test");
+    // The card in short, as clients get it on the item.
+    let item = hub
+        .attention_list(false)
+        .into_iter()
+        .find(|i| i["attn_id"] == card["attn_id"])
+        .unwrap();
+    assert_eq!(item["delete"], ext["brief"]);
+    assert_eq!(
+        item["delete"]["title"], "Delete thread api (project proj)?",
+        "{item}"
+    );
+    assert_eq!(
+        item["delete"]["threads"],
+        json!([{
+            "name": "api",
+            "project": "proj",
+            "risk": "1 uncommitted file, 1 unpushed commit"
+        }]),
+        "{item}"
+    );
 
     // The orchestrator neither answers nor dismisses it.
     let e = answer(&hub, &card, "Delete", &Caller::Orchestrator).unwrap_err();

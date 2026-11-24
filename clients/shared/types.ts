@@ -60,6 +60,27 @@ export interface Attention {
    * `AttentionItem::offline_since`, RFC 3339): its notice on the hub's thread, or a thread's
    * stall while the connection was down. */
   offline_since?: string;
+  /** A delete card in short (twr-core `DeleteBrief`): shown before its whole summary. */
+  delete?: DeleteBrief;
+}
+/** A delete card in short (twr-core `DeleteBrief`, `AttentionItem::delete`). */
+export interface DeleteBrief {
+  /** The question: "Delete 5 threads?". */
+  title: string;
+  /** Why this card replaces another one. */
+  note?: string;
+  threads: {
+    name: string;
+    project?: string;
+    /** What deleting it loses: "2 unpushed commits, 3 uncommitted files". */
+    risk: string;
+    /** It cannot be deleted as things are (the summary says why). */
+    refused?: boolean;
+    /** It loses nothing not kept elsewhere or in the trash. */
+    clean?: boolean;
+  }[];
+  /** What goes for good, and how long the trash keeps the rest. */
+  total?: string;
 }
 export interface ViewState {
   threads: Thread[];

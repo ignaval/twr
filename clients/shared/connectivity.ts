@@ -64,10 +64,17 @@ export function offlineThreads(attention: readonly Attention[]): number {
 
 /** The heading of an attention card: what kind of item it is. */
 export function attentionKindLabel(
-  item: Pick<Attention, "reason" | "loop_stuck" | "offline_since">,
+  item: Pick<Attention, "reason" | "loop_stuck" | "offline_since"> &
+    Partial<Pick<Attention, "thread" | "proposal" | "options" | "delete">>,
 ): string {
   if (item.loop_stuck) return "Loop stuck";
   if (isOffline(item)) return "No internet";
+  // A delete card is the hub asking to confirm what goes, not a question to answer in words.
+  if (
+    item.delete ||
+    (item.thread === "hub" && item.proposal && item.options?.includes("Delete"))
+  )
+    return "Confirm deletion";
   if (item.reason === "permission") return "Permission requested";
   if (item.reason === "question") return "Question for you";
   return item.reason;
