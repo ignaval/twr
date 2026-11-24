@@ -9159,12 +9159,13 @@ fn removal_notes(
     (removed, kept, after)
 }
 
-/// What removing `default` does to phone pairing, when phones are paired with this machine,
-/// an invitation is open or `twr phone` set the gateway up (its directory, `mobile/` beside the
-/// config file): the phone gateway serves the phones through `default`'s hub, which is gone
-/// until `twr ws new default` makes it again. The pairings stay in that directory, which a
-/// removal never touches, and work again then. `None`: nothing to say (nothing is read that
-/// isn't there).
+/// What removing `default` does to phones, when phones are paired with this machine, an
+/// invitation is open or `twr phone` set the gateway up (its directory, `mobile/` beside the
+/// config file): until `twr ws new default` makes it again, pairing and managing phones (which
+/// go through `default`'s hub), pushes about `default`, and starting the gateway (which starts
+/// `default`'s hub first) stop. A gateway that already runs keeps serving the paired phones'
+/// other workspaces. The pairings stay in that directory, which a removal never touches.
+/// `None`: nothing to say (nothing is read that isn't there).
 fn phone_pairing_note(root: &Paths) -> Option<String> {
     let dir = root.root().config_file.with_file_name("mobile");
     let (devices, open) = if dir.join("devices.json").exists() {
@@ -9178,18 +9179,17 @@ fn phone_pairing_note(root: &Paths) -> Option<String> {
         .ok()
         .flatten()
         .is_some();
-    let what = match devices {
+    let phones = match devices {
         0 if !open && !set_up => return None,
-        0 => "pairing a phone (`twr phone`) stops".to_string(),
-        n => format!(
-            "pairing a phone (`twr phone`) and the {n} paired phone{} stop",
-            if n == 1 { "" } else { "s" }
-        ),
+        0 => String::new(),
+        1 => " (the paired phone keeps its pairing)".to_string(),
+        n => format!(" (the {n} paired phones keep their pairings)"),
     };
     Some(format!(
-        "{what} working until `twr ws new {DEFAULT_WORKSPACE}` makes it again: the phone \
-         gateway serves phones through this workspace's hub (the pairings stay, and work \
-         again then)"
+        "until `twr ws new {DEFAULT_WORKSPACE}` makes it again, pairing and managing phones \
+         (`twr phone`), pushes about this workspace and starting the phone gateway stop: they \
+         go through this workspace's hub. A gateway that runs keeps serving the other \
+         workspaces{phones}"
     ))
 }
 
@@ -10793,7 +10793,8 @@ mod tests {
         auth.pair(&code, "phone").unwrap();
         let said = notes(&root);
         assert!(
-            said.contains("the 1 paired phone stop working until `twr ws new default`"),
+            said.contains("pairing and managing phones (`twr phone`), pushes about this workspace")
+                && said.contains("(the paired phone keeps its pairing)"),
             "{said}"
         );
         // A named workspace's removal leaves pairing alone, and says nothing of it.
