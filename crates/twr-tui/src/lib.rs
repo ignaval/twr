@@ -942,6 +942,17 @@ pub const HISTORY_ENTRY_MAX: usize = 16 * 1024;
 /// which its hub made: never made here, so a save left over once the workspace was removed
 /// (`twr ws rm`) does not make it again.
 pub fn save_history(path: &Path, entries: &[String]) -> std::io::Result<()> {
+    save_history_of(path, entries, None)
+}
+
+/// [`save_history`] into the workspace that was `generation` as its session started
+/// ([`twr_core::workspaces::dir_generation`]): none once it was removed and another made with
+/// its id, which a save that waited for the removal's lock would otherwise write into.
+fn save_history_of(
+    path: &Path,
+    entries: &[String],
+    generation: Option<&str>,
+) -> std::io::Result<()> {
     use std::io::Write;
     let removed = || {
         path.parent()
@@ -960,6 +971,13 @@ pub fn save_history(path: &Path, entries: &[String]) -> std::io::Result<()> {
     lock.lock()?;
     if removed() {
         return Err(gone());
+    }
+    if let (Some(was), Some(dir)) = (generation, path.parent()) {
+        if twr_core::workspaces::dir_generation(dir).as_deref() != Some(was) {
+            return Err(std::io::Error::other(
+                "its workspace was removed and another made with its name",
+            ));
+        }
     }
     let mut f = twr_core::paths::open_private_append(path)?;
     // A last line a crash left unfinished is ended first: the new lines start their own.
@@ -2326,11 +2344,14 @@ fn spawn_history_writer(
     Option<std::thread::JoinHandle<()>>,
 ) {
     let (tx, rx) = std::sync::mpsc::channel::<Vec<String>>();
+    // Which workspace this session's history is of: a save never goes into another made
+    // since with its id.
+    let generation = path.parent().and_then(twr_core::workspaces::dir_generation);
     let writer = std::thread::Builder::new()
         .name("twr-history".into())
         .spawn(move || {
             for added in rx {
-                if let Err(e) = save_history(&path, &added) {
+                if let Err(e) = save_history_of(&path, &added, generation.as_deref()) {
                     status.send((format!("input history: {e}"), false));
                 }
             }
@@ -2984,6 +3005,19 @@ pub async fn run_with(
     let mut input = Input::terminal()?;
     let (late_tx, late_rx) = mpsc::unbounded_channel::<StatusMsg>();
     let (ws_done_tx, ws_done_rx) = mpsc::unbounded_channel();
+    // A workspace change that has to wait for another (`twr ws rm` asking its question in
+    // another terminal) says so in the status line rather than seeming to hang.
+    {
+        let tx: mpsc::UnboundedSender<(String, Option<Vec<WsEntry>>)> = ws_done_tx.clone();
+        twr_core::workspaces::on_registry_wait(move || {
+            let _ = tx.send((
+                "waiting for another change to the workspaces to finish (a `twr ws` command \
+                 elsewhere, maybe asking a question)..."
+                    .into(),
+                None,
+            ));
+        });
+    }
     let (saved_tx, saved_rx) = mpsc::unbounded_channel::<Saved>();
     let (saves, settings_writer) = spawn_settings_writer(saved_tx);
     let own = speaker::Place {
@@ -6346,6 +6380,13 @@ mod tests {
         assert!(save_history(&path, &["lost".into()]).is_err());
         assert!(!path.exists());
         std::fs::remove_file(dir.path().join("sub").join("workspace-removed")).unwrap();
+        // A session's saves go into its own workspace only: not one made since with its id.
+        std::fs::write(dir.path().join("sub/workspace-generation"), "g1\n").unwrap();
+        save_history_of(&path, &["mine".into()], Some("g1")).unwrap();
+        std::fs::write(dir.path().join("sub/workspace-generation"), "g2\n").unwrap();
+        assert!(save_history_of(&path, &["stale".into()], Some("g1")).is_err());
+        assert_eq!(load_history(&path), ["mine"]);
+        std::fs::remove_file(&path).unwrap();
         save_history(&path, &["a \"quoted\" line".into(), "/help".into()]).unwrap();
         assert_eq!(load_history(&path), ["a \"quoted\" line", "/help"]);
         let many: Vec<String> = (0..2 * app::HISTORY_MAX).map(|i| i.to_string()).collect();

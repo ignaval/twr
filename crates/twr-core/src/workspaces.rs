@@ -258,9 +258,10 @@ impl Drop for RegistryLock {
 }
 
 impl RegistryLock {
-    /// Takes the lock of `root`'s registry, waiting for another holder (they hold it only
-    /// while they check and write a few small files). Makes the root's data directory, private,
-    /// when there is none yet.
+    /// Takes the lock of `root`'s registry, waiting for another holder (they hold it while
+    /// they check and write a few small files, and `twr ws rm` while its question waits): as
+    /// it starts to wait it calls the hook [`on_registry_wait`] set, which says so. Makes the
+    /// root's data directory, private, when there is none yet.
     pub fn take(root: &Paths) -> anyhow::Result<RegistryLock> {
         let root = root.root();
         crate::paths::ensure_private_dir(&root.data_dir)?;
@@ -271,10 +272,40 @@ impl RegistryLock {
             .write(true)
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
-        file.lock()
-            .with_context(|| format!("locking {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if let Some(hook) = WAIT_HOOK
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                {
+                    hook();
+                }
+                file.lock()
+                    .with_context(|| format!("locking {}", path.display()))?;
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("locking {}", path.display()))
+            }
+        }
         Ok(RegistryLock { file })
     }
+}
+
+type WaitHook = Box<dyn Fn() + Send + Sync>;
+
+/// What this process does when a change to the workspaces waits for another's
+/// ([`RegistryLock::take`]); none at first.
+static WAIT_HOOK: std::sync::RwLock<Option<WaitHook>> = std::sync::RwLock::new(None);
+
+/// Sets what this process does when a workspace change has to wait for another process's
+/// (`twr ws rm` asking its question in another terminal, say): `twr ws` prints that it waits,
+/// the TUI says it in its status line, rather than seeming to hang.
+pub fn on_registry_wait(hook: impl Fn() + Send + Sync + 'static) {
+    *WAIT_HOOK
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
 }
 
 /// Why `name` can't be the name of workspace `own` (an id; `None`: a new workspace) in the
@@ -315,11 +346,16 @@ pub fn name_conflict(all: &[Entry], own: Option<&str>, name: &str) -> Option<Str
 /// for one made before twr kept one, its directory's device, inode and birth time (one made
 /// again since has a token, so never the same). `None` when neither can be read.
 pub fn generation(ws: &Paths) -> Option<String> {
+    dir_generation(&ws.data_dir)
+}
+
+/// [`generation`] of the workspace whose data directory is `dir`.
+pub fn dir_generation(dir: &Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
-    if let Ok(t) = std::fs::read_to_string(ws.data_dir.join(GENERATION_FILE)) {
+    if let Ok(t) = std::fs::read_to_string(dir.join(GENERATION_FILE)) {
         return Some(t.trim().to_string());
     }
-    let dir = std::fs::metadata(&ws.data_dir).ok()?;
+    let dir = std::fs::metadata(dir).ok()?;
     let born = dir
         .created()
         .ok()
@@ -419,13 +455,13 @@ pub fn create(root: &Paths, name: &str) -> anyhow::Result<Created> {
 fn clear_root_leftovers(root: &Paths) -> anyhow::Result<()> {
     let aside = move_root_owned_aside(root)?;
     if let Some(aside) = aside {
-        std::fs::remove_dir_all(&aside).with_context(|| format!("removing {}", aside.display()))?;
+        remove_tree(&aside).with_context(|| format!("removing {}", aside.display()))?;
     }
     for e in std::fs::read_dir(&root.data_dir)?.flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
         if n.starts_with(".rm-default-") && e.file_type().is_ok_and(|t| t.is_dir()) {
-            std::fs::remove_dir_all(e.path())
-                .with_context(|| format!("removing {}", e.path().display()))?;
+            // (The removal that left it may be deleting it at this moment.)
+            remove_tree(&e.path()).with_context(|| format!("removing {}", e.path().display()))?;
         }
     }
     Ok(())
@@ -462,6 +498,16 @@ pub fn runner_spool_why(root: &Paths, doing: &str) -> Option<String> {
         dir.join(&spool).display(),
         dir = dir.display(),
     ))
+}
+
+/// Deletes the directory `path` and what is in it, a removal's aside one: what another
+/// process deletes at the same time (the removal that moved it, or `twr ws new default`
+/// clearing leftovers) is not an error.
+pub fn remove_tree(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        r => r,
+    }
 }
 
 /// The name a removal moves workspace `id`'s files aside to, `.rm-<id>-<pid>-<nanoseconds>`:
@@ -768,6 +814,45 @@ mod tests {
         assert!(!root.data_dir.join("orch-mcp-1.json").exists());
         assert!(root.data_dir.join("keep.bak").exists());
         assert!(root.data_dir.join("accounts").is_dir());
+        assert!(root.workspace("a").unwrap().exists());
+    }
+
+    /// Deleting an aside directory another process deleted first is no error.
+    #[test]
+    fn an_aside_directory_gone_meanwhile_is_no_error() {
+        let (d, _root) = home();
+        let aside = d.path().join(".rm-default-1-2");
+        std::fs::create_dir_all(aside.join("worktrees")).unwrap();
+        remove_tree(&aside).unwrap();
+        assert!(!aside.exists());
+        remove_tree(&aside).unwrap();
+    }
+
+    /// A change that has to wait for another (one holding the registry lock, `twr ws rm`
+    /// asking its question) says so through the hook as it starts to wait, then goes on once
+    /// the other lets go.
+    #[test]
+    fn a_change_that_waits_for_another_says_so() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static WAITS: AtomicUsize = AtomicUsize::new(0);
+        on_registry_wait(|| {
+            WAITS.fetch_add(1, Ordering::SeqCst);
+        });
+        let (_d, root) = home();
+        let held = RegistryLock::take(&root).unwrap();
+        let before = WAITS.load(Ordering::SeqCst);
+        let creating = {
+            let root = root.clone();
+            std::thread::spawn(move || create(&root, "a").map(|_| ()))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while WAITS.load(Ordering::SeqCst) == before {
+            assert!(std::time::Instant::now() < deadline, "never said it waits");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!root.workspace("a").unwrap().exists());
+        drop(held);
+        creating.join().unwrap().unwrap();
         assert!(root.workspace("a").unwrap().exists());
     }
 

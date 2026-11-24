@@ -1599,8 +1599,14 @@ fn main() -> ExitCode {
         // Resolved once: the hub serves that id too (`run` resolves `-w` again, and a name
         // may go to another workspace meanwhile).
         if let Ok(paths) = Paths::from_env_in(cli.workspace.as_deref()) {
-            std::env::set_var(WORKSPACE_ENV, paths.workspace_id());
-            cli.workspace = Some(paths.workspace_id().to_string());
+            // Nothing chosen and no default workspace: left as it is, for `run` to say why
+            // (there is no default), not that `default` does not exist.
+            let chosen = cli.workspace.is_some()
+                || std::env::var_os(WORKSPACE_ENV).is_some_and(|v| !v.is_empty());
+            if chosen || paths.exists() {
+                std::env::set_var(WORKSPACE_ENV, paths.workspace_id());
+                cli.workspace = Some(paths.workspace_id().to_string());
+            }
         }
     }
     // A runner serves whichever hub it connects to: no workspace of this machine is its, and
@@ -8398,6 +8404,13 @@ async fn control(socket: &Path, follow: bool, since: u64, pretty: bool) -> anyho
 /// `twr ws`: lists, creates, renames or removes the root's workspaces, or shows or sets the
 /// default one (whichever workspace `paths` is in).
 async fn ws(cmd: Option<WsCmd>, paths: &Paths) -> anyhow::Result<()> {
+    // A change that has to wait for another (`twr ws rm` asking in another terminal) says so.
+    twr_core::workspaces::on_registry_wait(|| {
+        errln!(
+            "twr: waiting for another change to the workspaces to finish (a `twr ws` command \
+             elsewhere, maybe asking a question)..."
+        );
+    });
     let cmd = cmd.unwrap_or(WsCmd::List {
         json: false,
         detail: false,
@@ -9478,7 +9491,8 @@ impl CheckedRemoval {
         // Nothing takes a `.rm-` directory for a workspace: deleted without the locks, which
         // others may need meanwhile.
         if let Some(aside) = aside {
-            std::fs::remove_dir_all(&aside)
+            // (A `twr ws new default` clearing leftovers at once may take it first.)
+            twr_core::workspaces::remove_tree(&aside)
                 .with_context(|| format!("removing {}", aside.display()))?;
         }
         // A socket file a hub that died left is left too: the next hub there replaces it, and
@@ -10205,8 +10219,15 @@ async fn plan_removal_of(
                 anyhow::Ok(Some((ws_threads(&ws2)?, trash_items(&ws2)?)))
             })
             .await??;
+            // A hub holds its lock without answering on its socket: it runs on another socket
+            // (`--socket`), or is starting or stopping.
             let Some((log, trash)) = read else {
-                return refused("its hub is starting or stopping: try again in a moment".into());
+                return refused(format!(
+                    "a hub of it is running on another socket, or starting or stopping: stop it \
+                     with `twr -w {} hub stop` (or `twr --socket <path> hub stop`), or try again \
+                     in a moment",
+                    ws.workspace_id()
+                ));
             };
             let trash = trash.max(log.trash);
             if log.threads.is_empty() && trash == 0 {

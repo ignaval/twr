@@ -80,14 +80,18 @@ pub fn workspace_sockets(
     } else if names.is_empty() {
         vec![paths.workspace_id().to_string()]
     } else {
-        // Each by its id, whichever name it was given by.
-        let mut ids = Vec::new();
+        // Each by its id, whichever name it was given by, and once (`a acme` where `acme` is
+        // `a`'s new name are one workspace), in the order given.
+        let mut ids: Vec<String> = Vec::new();
         for name in names {
             let ws = root.find_workspace(name)?;
             if !ws.exists() {
                 anyhow::bail!("there is no workspace {name} (`twr ws` lists them)");
             }
-            ids.push(ws.workspace_id().to_string());
+            let id = ws.workspace_id().to_string();
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
         }
         ids
     };
@@ -1280,6 +1284,24 @@ pub async fn remote(args: Remote, paths: &Paths) -> anyhow::Result<std::process:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `twr speech feed a b acme`, where `acme` is `a`'s new name, feeds `a` once, in the
+    /// order given.
+    #[test]
+    fn a_workspace_named_twice_is_fed_once() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        twr_core::workspaces::create(&root, "a").unwrap();
+        twr_core::workspaces::create(&root, "b").unwrap();
+        twr_core::workspaces::rename(&root, "a", "acme").unwrap();
+        let names: Vec<String> = ["a", "b", "acme"].map(String::from).to_vec();
+        let fed: Vec<String> = workspace_sockets(&root, &names, false)
+            .unwrap()
+            .into_iter()
+            .map(|(w, _)| w)
+            .collect();
+        assert_eq!(fed, ["a", "b"]);
+    }
 
     fn words(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
