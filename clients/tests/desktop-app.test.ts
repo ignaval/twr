@@ -296,6 +296,33 @@ describe("diagnostics redaction gaps", () => {
       "REQUEST_TOO_LARGE",
     );
   });
+  it("covers twelve-character codes in any grouping, pairing links and pin proofs", () => {
+    for (const code of [
+      "EABCDEFGHJKM",
+      "K7MQ-2WXR-9PAB",
+      "k7mq2wxr9pab",
+      "K7MQ 2WXR 9PAB",
+      "K7MQ2W-XR9PAB",
+    ])
+      expect(redact(`{"code":"${code}"}`)).toBe('{"code":"[redacted]"}');
+    // Twelve letters with one no code has (O) stay readable as an error constant.
+    expect(redact('{"code":"ECONNREFUSED"}')).toBe('{"code":"ECONNREFUSED"}');
+    const text = [
+      "Your code is K7MQ-2WXR-9PAB, typed as k7mq-2wxr-9pab or K7MQ 2WXR 9PAB.",
+      "Open twr://pair#eyJ0eXBlIjoidHdyLXBhaXIifQ to pair.",
+      '{"proof":"Q2hhbGxlbmdlUHJvb2ZWYWx1ZTEyMzQ1Njc4OTAxMjM0NTY3"}',
+      "pin_proof=Q2hhbGxlbmdlUHJvb2ZWYWx1ZTEyMzQ1Njc4OTAxMjM0NTY3",
+    ].join("\n");
+    const result = redact(text);
+    for (const secret of ["K7MQ", "k7mq", "eyJ0eXBl", "Q2hhbGxlbmdl"])
+      expect(result).not.toContain(secret);
+    expect(result).toContain("twr://pair#[redacted] to pair.");
+    expect(result).toContain("Your code is [redacted-code], typed as");
+    // The scheme without an invitation, and ordinary words, stay.
+    expect(redact("twr phone started; HTTP GET /health")).toBe(
+      "twr phone started; HTTP GET /health",
+    );
+  });
   it("keeps a Linux login entry pointing at a renamed AppImage", () => {
     const dir = mkdtempSync(join(tmpdir(), "twr-autostart-refresh-"));
     onTestFinished(() => rmSync(dir, { recursive: true, force: true }));

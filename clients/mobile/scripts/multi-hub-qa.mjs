@@ -105,7 +105,7 @@ export async function multiHubQA({
     await page.getByRole("button", { name: /Pair.*hub/i }).click();
     await page.getByLabel("Hub name", { exact: true }).fill("Second hub QA");
     await page
-      .getByLabel("Hub URL", { exact: true })
+      .getByLabel("Hub address", { exact: true })
       .fill("http://127.0.0.1:47323");
     await page.getByLabel("Pairing code", { exact: true }).fill(code);
     await page

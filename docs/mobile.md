@@ -23,20 +23,57 @@ Native QA prefers runtime 27.0 for phone/tablet and 27.1 for Duo. When that runt
 Start a debug gateway from your own terminal:
 
 ```sh
-target/debug/twr-mobile-gateway --development --pair --allow-terminal --allow-admin --binary-dir target/debug
+target/debug/twr gateway --development --pair --allow-terminal --allow-admin
 ```
 
-On Android, run `adb reverse tcp:47321 tcp:47321`. Pair with `http://127.0.0.1:47321` and the one-use code printed in your terminal. iOS Simulator can reach the Mac's loopback directly. Plain HTTP is permitted only by debug builds and only for loopback. Pairing uses a 10-character, 50-bit code (case insensitive), expiring after five minutes and five incorrect attempts. Anyone who can reach the pairing endpoint can consume those attempts; generate a fresh code if pairing is interrupted. The gateway takes 10 pairing requests a minute from one address (an IPv4 address or an IPv6 /64) and 60 from all, and answers 429 past them; a pairing request has 35 seconds. An address whose socket upgrades presented 30 unknown tokens in a minute gets 429 until the minute ends. Before a device's socket is authenticated, its connection counts against 16 per address and 128 in all (beyond them a new connection is closed at once), and is closed when it sends nothing within 10 seconds, takes more than 10 seconds over a request head (an idle keep-alive connection included) or is still unauthenticated after two minutes. Run `--pair --pair-only` to create a new code without starting another listener.
+On Android, run `adb reverse tcp:47321 tcp:47321`. Pair with `http://127.0.0.1:47321` and the one-use code printed in your terminal. iOS Simulator can reach the Mac's loopback directly. Plain HTTP is permitted only by debug builds and only for loopback. Pairing uses a 12-character, 60-bit code, shown as `ABCD-EFGH-JK23` and accepted in any case with or without the dashes, expiring after five minutes and five incorrect attempts. Anyone who can reach the pairing endpoint can consume those attempts; generate a fresh code if pairing is interrupted. The gateway takes 10 pairing requests a minute from one address (an IPv4 address or an IPv6 /64) and 60 from all, counting pin-proof requests (`/v1/pair/proof`) with them, and answers 429 past them; a pairing request has 35 seconds. An address whose socket upgrades presented 30 unknown tokens in a minute gets 429 until the minute ends. Before a device's socket is authenticated, its connection counts against 16 per address and 128 in all (beyond them a new connection is closed at once), and is closed when it sends nothing within 10 seconds, takes more than 10 seconds over a request head (an idle keep-alive connection included) or is still unauthenticated after two minutes. Run `--pair --pair-only` to create a new code without starting another listener.
 
-## Remote hubs
+## Pairing a phone
 
-Run the release gateway beside the hub with a certificate trusted by the phone:
+On the hub's computer (over SSH, if it's a server), run:
 
 ```sh
-twr-mobile-gateway --listen 0.0.0.0:47321 --tls-cert /absolute/cert.pem --tls-key /absolute/key.pem --pair --allow-terminal --allow-admin
+twr phone
 ```
 
-Use the DNS name covered by that certificate when pairing. A private VPN such as Tailscale can provide reachability; it does not replace HTTPS certificate validation. No hosted relay is included. The gateway reloads its certificate and key when they change, checking every 5 seconds or at once on SIGHUP, with no restart; a renewal it cannot read or load keeps the previous certificate and shows as failed in gateway status. No gateway autostart service is installed in this release. The gateway and bundled CLI/bridge must come from the same build. The desktop bundle includes the gateway; Arch also installs its command. On macOS it is available in the app's embedded shell or inside `twr.app/Contents/Resources/bin`.
+It starts the phone gateway if it isn't running and shows a QR code, a one-use code (`ABCD-EFGH-JK23`), the addresses it offers and when the code expires. On the phone, choose **Pair a hub → Scan QR code** and confirm the names. `twr phone` waits until the phone pairs, then prints its name: a name you don't expect means someone else took the code, so revoke it. Ctrl-C cancels the code. In the TUI, `/phone` does the same in a panel (Esc cancels; `c` copies the link). `--read-only`, `--terminal` and `--admin` (and `/phone read-only|operate|terminal|admin`) choose the access the phone gets, as described below; the default is read and operate. `twr phone` refuses an agent, and shows the code only on a terminal (`--json` prints it as JSON lines for a launcher instead).
+
+**No certificate or domain is needed.** The gateway makes its own key the first time it runs (`identity-key.pem`, a P-256 key, with a self-signed certificate it renews itself, in the `mobile` folder of twr's configuration directory, 0600), and the QR code carries that key's fingerprint. The phone accepts only that key, on every address and every connection, and sends nothing (no code, no token) until the hub has proved it holds it. A device answering at one of the addresses with any other key gets "this is another device, not <hub>". The phone shows the fingerprint under the hub's **Key and addresses**.
+
+**Addresses.** The invitation lists up to eight addresses to try: `--address HOST[:PORT]` first (a DNS name or a forwarded port, saved for later), then this machine's public addresses, its tailnet addresses (Tailscale's 100.64.0.0/10 and `fd7a:115c:a1e0::/48`) and its LAN addresses. The phone tries the one that worked last on the network it's on first, the others a quarter of a second later, skips LAN addresses on mobile data, and remembers what worked. While connected, the gateway tells the phone its current addresses, so a new home address or IP needs no new pairing. When the phone changes network (Wi-Fi to mobile data, say), it reconnects at once.
+
+The phone must reach the gateway's port, 47321, at one of those addresses:
+
+- **A server with a public address:** nothing to do on most providers. Where the provider blocks incoming connections (AWS, Google Cloud, Azure and Oracle do by default), allow TCP 47321 in its firewall; with `ufw` on, `sudo ufw allow 47321/tcp`.
+- **A computer at home:** works on the same Wi-Fi, and from anywhere over Tailscale or another VPN to that computer. Away from home without one, forward the port on your router and give `--address` (it can't work behind carrier-grade NAT).
+- When no address works, the phone says which ones it tried and why (didn't answer, refused, another device's key).
+
+iOS asks once for **Local Network** access the first time the app connects to a LAN address.
+
+**Typed pairing.** Without a camera (or on the phone that runs the SSH session itself), choose **Pair a hub**, enter the hub's address (`192.168.1.20`, `server.example` or `host:port`) and the code. The phone then checks, before it sends the code, that the hub knows the code: the hub answers a challenge with a proof made from it (Argon2id, then HMAC over its key's fingerprint), which nobody without the code can make for another key. The phone pins the key it checked. A mistyped code and someone in the middle look the same: "The code doesn't match the hub at …".
+
+The QR code and **Copy invitation** carry the same invitation; `twr phone` also prints it as a `twr://pair#…` link, which opens the app's pairing form when tapped. The link holds the one-use code: send it only to your own phone (another app that registered `twr://` could otherwise receive it first; the device name `twr phone` prints shows if that happened).
+
+**The gateway runs on its own.** `twr phone` starts it detached; it keeps running when you log out of SSH, and a hub that starts while a phone is paired (or a code is open) starts it again, listening where it listened when you last ran `twr phone`. Only `twr phone` turns that on: a gateway the desktop app or a bare `twr gateway` starts never does. `twr phone off` stops it and keeps it off, and so does stopping it from the desktop app; `twr phone` turns it back on. `TWR_GATEWAY_AUTOSTART=off` keeps a hub from starting it. Its log is `gateway.log` in the same `mobile` folder. Without `--tls-cert` the gateway listens on all addresses (`0.0.0.0:47321` and `[::]:47321`); `twr gateway --listen` chooses others. `twr gateway` is the gateway itself, in the foreground, for advanced setups.
+
+```sh
+twr phone devices          # paired phones
+twr phone revoke <id>      # revoke one (its id or the start of it): disconnected at once
+twr phone off              # stop the gateway and keep it off
+twr phone rekey            # a new key: every phone is revoked and pairs again
+```
+
+## A hub with its own certificate
+
+To keep using a certificate the phone trusts (certificate mode, as in earlier releases), run the gateway beside the hub with it:
+
+```sh
+twr gateway --listen 0.0.0.0:47321 --tls-cert /absolute/cert.pem --tls-key /absolute/key.pem --pair --allow-terminal --allow-admin
+```
+
+Pair with its `https://` address, using the DNS name covered by that certificate. A hub paired this way stays checked against the phone's trusted certificates, and its credentials never move to a pinned key (nor the reverse). No hosted relay is included yet. The gateway reloads its certificate and key when they change, checking every 5 seconds or at once on SIGHUP, with no restart; a renewal it cannot read or load keeps the previous certificate and shows as failed in gateway status. A certificate-mode gateway doesn't start with the hub. `twr gateway` comes with every twr; the desktop bundle also includes it as `twr-mobile-gateway`, which must come from the same build as the bundled CLI and bridge, and Arch installs that command too. On macOS it is available in the app's embedded shell or inside `twr.app/Contents/Resources/bin`.
+
+## Access and revocation
 
 Pairing grants read and operate by default; `--read-only` creates a read-only invitation. The desktop sharing wizard exposes the same access levels. `--allow-terminal` permits remote shells, attach, jobs and interactive CLI flows, and threads whose runtime is a command line (`pty:<command>`, `acp:<command>`, for a new thread, a move or the orchestrator). Without it a device picks only a built-in agent runtime (Claude Code, Codex, Grok Build, with an account) or a `[runtimes.<name>]` preset you configured, or leaves the runtime to the project's. `--allow-admin` permits accounts, boxes, configuration and mode changes, and the hub holds every path to a mode change to it: `twr mode`, a new thread in a mode other than `manual`, `plan`, `read-only` or `dontAsk`, a short command such as "set api to bypass" (refused, nothing sent), the orchestrator acting on the device's message (it is refused the change), and Confirm on a card that changes a mode (the card stays open for you or an admin device). Without admin a device also starts threads only in a configured project, or in a folder or git repository that isn't (and doesn't hold) your home folder and keeps clear of twr's data, `TWR_HOME` and credentials folders such as `~/.ssh`; anywhere else is refused with what to do instead. A folder outside git is fine, such as `~/notes`. Moving a thread to another runtime (yourself, or by asking the orchestrator for a move it would put on a card) and opening or moving a thread outside an account pin need admin the same way. Configuration can name commands the hub runs (such as `[notify] command`), so admin includes command execution and requires `--allow-terminal` (the gateway refuses an invitation with admin but not terminal). The only twr commands the gateway runs for a device outside a terminal are `twr ws list [--json]` (read) and `twr ws new <name>` (operate), exactly so: any other subcommand, flag (`ws list --detail`, which prints every hub's threads and requests as you read them, included) or argument is refused, and the rest of the CLI runs in a remote terminal, which needs terminal. These are owner-granted capabilities: operate can direct agents under the hub's configured permissions, so it is not an OS sandbox or a guarantee that no code runs. The hub validates each device identity, request scope and approval revision. Owner-side pairing cannot be delegated to a device. List or revoke access with `--list-devices` and `--revoke DEVICE_ID`. Revocation disconnects clients and cleans up their remote terminals. The socket upgrade answers 401 only for a token no paired device has, which clients take as revoked; when the device list cannot be read (an I/O error, say), it answers 503 and clients retry, while open sockets and remote terminals stay and their requests are refused until the list reads again. An Origin the gateway does not accept is 403. Forgetting a hub on the phone removes local credentials. Use **Revoke this device** in the connected hub settings to invalidate access on the host too. The desktop command palette includes pairing, listing and revoking devices.
 
@@ -187,6 +224,15 @@ The signed paths have not run with real credentials: Xcode's signing and the upl
 Both stores also ask for things outside the repository: a privacy policy ([privacy.md](privacy.md)), screenshots, the stores' own privacy forms, and a way for their reviewers to use an app that does nothing until it is paired with a hub.
 
 ## Verification status
+
+Pairing by key is checked without a phone in three places:
+
+- `clients/scripts/real-gateway-qa.sh` pairs the desktop's transport with a real `twr gateway` in a scratch home on loopback, from a scanned invitation and by typed address, and opens the socket by pin.
+- `clients/mobile/android/scripts/test-pinning.sh` runs the Android pairing classes' JUnit tests (the shared vectors, a TLS 1.3 server with a self-signed key, the pinned OkHttp client) with plain `javac`, and Gradle's `testDebugUnitTest` runs them in CI.
+- `clients/mobile/ios/scripts/test-argon2.sh` checks the iOS app's Argon2id against the vectors with the host's C compiler.
+
+Not yet verified for pairing by key: the Swift code (it hasn't been compiled since the change: Xcode and `AppTests` will), the Android plugin on a device or emulator, and real phones on mobile data.
+
 
 Remote push can be disabled for a hub from its settings. Forget unregisters this device's push tokens when the hub is reachable; if it is offline, the app warns that host-side revocation is still needed. Forget and Revoke both remove that hub's local drafts and editor sessions.
 

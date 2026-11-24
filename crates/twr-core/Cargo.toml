@@ -10,6 +10,8 @@ description = "Core types for twr: events, reducers, attention stack, adapter tr
 
 [dependencies]
 subtle = "2.6.1"
+# Phone pairing's typed-code proof key (`phone_pairing`): the same Argon2id twr-link uses.
+argon2 = "0.5"
 uuid.workspace = true
 anyhow.workspace = true
 chrono.workspace = true

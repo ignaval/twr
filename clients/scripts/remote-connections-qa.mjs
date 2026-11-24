@@ -144,7 +144,10 @@ try {
           listener({ message: { type: "authenticated", framing: true } });
       },
       disconnect: async () => {},
-      addListener: async (_event, listener) => {
+      updateRoutes: async () => {},
+      addListener: async (event, listener) => {
+        // Network events never fire in this fixture.
+        if (event !== "message") return { remove: async () => {} };
         listeners.add(listener);
         return { remove: async () => listeners.delete(listener) };
       },
@@ -171,6 +174,9 @@ try {
   await page.goto(`http://127.0.0.1:${server.address().port}/index.html`);
   await page.getByRole("button", { name: /^Computer: .+ — switch$/ }).click();
   await page.getByRole("tab", { name: "Let other devices connect" }).click();
+  // Certificate mode is under Advanced; the default needs no certificate.
+  await page.getByText("Advanced", { exact: true }).click();
+  await page.getByLabel("Use my own certificate").check();
   await page
     .getByLabel("Public HTTPS address")
     .fill("https://host.example:47321");

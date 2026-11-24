@@ -35,6 +35,8 @@ mod loops_tests;
 pub mod md;
 pub mod notify;
 pub mod order;
+pub mod phone;
+pub mod qr;
 pub mod queue;
 #[cfg(test)]
 mod reconnect_tests;
@@ -512,6 +514,8 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
         Action::Quit
         | Action::Runner { .. }
         | Action::CancelRunner { .. }
+        | Action::Phone { .. }
+        | Action::CancelPhone
         | Action::Copy { .. }
         | Action::Mouse(_)
         | Action::Workspace { .. }
@@ -3235,6 +3239,8 @@ where
         followed: followed_tx.clone(),
     };
     let private_results = results.view.clone();
+    // Stops the `twr phone` that `/phone` runs ([`crate::phone::run`]).
+    let mut phone_stop: Option<tokio::sync::oneshot::Sender<()>> = None;
     let calls = HubCalls {
         socket: socket.clone(),
         client: Some(calls),
@@ -3665,6 +3671,27 @@ where
                                     }.await;
                                     if !cancel {let mut value=result.unwrap_or_else(|e:anyhow::Error|serde_json::json!({"error":format!("{e:#}")}));value["generation"]=generation.into();if let Err(tokio::sync::mpsc::error::SendError((_,value)))=sender.send(("runner.local",value)) {if let (Ok(paths),Some(session))=(twr_core::paths::Paths::from_env(),value["session"].as_str()){let _=twr_link::bootstrap::request(&paths,&twr_link::service::Request::CancelPairing{session:Some(session.into())}).await;}}}
                                 }).abort_handle());
+                                continue;
+                            }
+                            Action::Phone { generation, level } => {
+                                // One invitation at a time: an older run's is cancelled.
+                                if let Some(stop) = phone_stop.take() {
+                                    let _ = stop.send(());
+                                }
+                                let (stop, stopped) = tokio::sync::oneshot::channel();
+                                phone_stop = Some(stop);
+                                let sender = private_results.clone();
+                                let send = move |mut value: serde_json::Value| {
+                                    value["generation"] = generation.into();
+                                    let _ = sender.send(("phone.local", value));
+                                };
+                                ctx.all_callers.push(tokio::spawn(crate::phone::run(level, send, stopped)).abort_handle());
+                                continue;
+                            }
+                            Action::CancelPhone => {
+                                if let Some(stop) = phone_stop.take() {
+                                    let _ = stop.send(());
+                                }
                                 continue;
                             }
                             Action::Copy { text } => {

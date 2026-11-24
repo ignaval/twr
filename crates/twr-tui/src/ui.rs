@@ -159,6 +159,8 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
         if state.view.loop_editor.is_some() {
             crate::loops::render(frame, body, state, &mut panes);
         }
+    } else if let Some(panel) = &state.view.phone {
+        crate::phone::render(frame, body, panel);
     } else if let Some(panel) = &state.view.runner {
         frame.render_widget(ratatui::widgets::Clear, body);
         frame.render_widget(

@@ -4328,3 +4328,20 @@ kbd {
   width: min(100%, 360px);
   accent-color: var(--accent);
 }
+/* A pinned hub's key and addresses (HubKey.tsx). */
+.hub-key {
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+.hub-key > summary {
+  cursor: pointer;
+  margin-top: 4px;
+  color: var(--muted);
+}
+.hub-key code {
+  user-select: all;
+}
+.hub-key ul {
+  margin: 4px 0;
+  padding-left: 20px;
+}

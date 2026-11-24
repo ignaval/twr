@@ -44,7 +44,7 @@ async fn client(socket: &std::path::Path) -> Result<Client> {
     }
     let hello = c.hello(params).await?;
     // Never disguise an agent-launched process as a user. The hub remains authoritative.
-    twr_app::runtime::ensure_user(&hello)?;
+    crate::runtime::ensure_user(&hello)?;
     Ok(c)
 }
 
@@ -52,7 +52,7 @@ async fn control(
     socket: PathBuf,
     tx: mpsc::Sender<Value>,
     state: watch::Sender<Value>,
-    presentation: Arc<std::sync::Mutex<twr_app::Presentation>>,
+    presentation: Arc<std::sync::Mutex<crate::Presentation>>,
 ) {
     loop {
         let result: Result<()> = async {
@@ -178,7 +178,7 @@ async fn run_call(
     streams: Arc<
         tokio::sync::Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
     >,
-    presentation: Arc<std::sync::Mutex<twr_app::Presentation>>,
+    presentation: Arc<std::sync::Mutex<crate::Presentation>>,
     looking: watch::Sender<bool>,
 ) {
     let result: Result<Value> = async {
@@ -230,7 +230,7 @@ async fn run_call(
             let config = Config::load_from(&paths)?;
             anyhow::ensure!(config.socket_path(&paths) == socket, "Configuration changed the socket. Reconnect to the workspace to use it.");
             let binary = PathBuf::from(call.params["binary"].as_str().context("Bundled executable required")?);
-            return twr_app::runtime::ensure_hub(&paths, &socket, &binary).await;
+            return crate::runtime::ensure_hub(&paths, &socket, &binary).await;
         }
         if call.method == "desktop.config.set" {
             use twr_core::config_edit::Scalar;
@@ -295,7 +295,7 @@ async fn run_call(
                             _ => { if let Ok(c) = client(&stream_socket).await { hydrate = c; } }
                         }
                         let mut event=serde_json::to_value(&item.event)?;
-                        twr_app::present_event(&mut event);
+                        crate::present_event(&mut event);
                         stream_tx.send(json!({"type":"thread","thread":stream_thread,"subscription":subscription,"event":event})).await?;
                     }
                     anyhow::bail!("Transcript connection closed")
@@ -306,7 +306,7 @@ async fn run_call(
             map.insert(thread, handle);
             return Ok(json!({"ok":true}));
         }
-        twr_app::validate_call(&call.method, &call.params)?;
+        crate::validate_call(&call.method, &call.params)?;
         if matches!(call.method.as_str(), "attention.respond" | "attention.dismiss") {
             let id = call.params["attn_id"].as_str().context("Request ID required")?;
             anyhow::ensure!(!presentation.lock().unwrap().incomplete.contains(id), "Load and review the full request before answering it.");
@@ -359,7 +359,7 @@ async fn run_call(
                     if twr_core::blob::has_capped(&ev["data"]) {
                         let _ = tokio::time::timeout(Duration::from_secs(5), twr_core::blob::hydrate_deep(&mut ev["data"], &mut c)).await;
                     }
-                    twr_app::present_event(&mut ev);
+                    crate::present_event(&mut ev);
                     let size=serde_json::to_vec(&ev)?.len();
                     if !events.is_empty() && bytes+size>1024*1024 {break;}
                     bytes+=size;
@@ -386,10 +386,11 @@ async fn run_call(
     let _ = tx.send(response).await;
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// The bridge for `workspace`, on stdin and stdout until stdin ends: what `twr-desktop-bridge
+/// <workspace>` and `twr desktop-bridge <workspace>` run.
+pub async fn run(workspace: String) -> Result<()> {
     // Before anything starts a hub: it must not inherit the app's crash handler.
-    twr_app::runtime::forget_inherited_crash_handler();
+    crate::runtime::forget_inherited_crash_handler();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     if std::env::var_os("TWR_MOBILE_TRANSPORT").is_some() {
         let line = lines
@@ -407,7 +408,6 @@ async fn main() -> Result<()> {
         anyhow::ensure!(token.len() == 64, "Invalid device credential");
         let _ = DEVICE_TOKEN.set(token.to_owned());
     }
-    let workspace = std::env::args().nth(1).unwrap_or_else(|| "default".into());
     let paths = Arc::new(Paths::from_env_in(Some(&workspace))?);
     let config = Config::load_from(&paths);
     let socket = config
@@ -448,7 +448,7 @@ async fn main() -> Result<()> {
             }
         })
     });
-    let presentation = Arc::new(std::sync::Mutex::new(twr_app::Presentation::default()));
+    let presentation = Arc::new(std::sync::Mutex::new(crate::Presentation::default()));
     let control = (!read_only).then(|| {
         tokio::spawn(control(
             socket.clone(),

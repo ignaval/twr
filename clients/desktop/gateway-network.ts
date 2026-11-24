@@ -1,6 +1,10 @@
 import { request as httpsRequest } from "node:https";
 import { request as httpRequest } from "node:http";
-import { checkServerIdentity, getCACertificates } from "node:tls";
+import {
+  checkServerIdentity,
+  getCACertificates,
+  type TLSSocket,
+} from "node:tls";
 import { isIP } from "node:net";
 
 /** Use the OS trust store for HTTP pairing and WebSockets, with Node's default roots. */
@@ -18,6 +22,9 @@ export interface GatewayRequest {
   timeout?: number;
   connect?: { host: string; port: number };
   ca?: string[];
+  /** A TLS socket whose key was already checked against a pin (pinned-tls.ts): the
+   * request is written on it, and nothing here validates certificates. */
+  socket?: TLSSocket;
 }
 /** Bounded JSON, no redirects, mandatory TLS validation against the public hostname. */
 export function gatewayRequest(
@@ -33,12 +40,19 @@ export function gatewayRequest(
       if (finished) return;
       finished = true;
       clearTimeout(timer);
+      // One request per pinned connection: it closes with its answer.
+      options.socket?.destroy();
       if (error) reject(error);
       else resolve(value!);
     };
-    const request = (url.protocol === "https:" ? httpsRequest : httpRequest)(
+    const pinned = options.socket;
+    const request = (
+      url.protocol === "https:" && !pinned ? httpsRequest : httpRequest
+    )(
       {
-        protocol: url.protocol,
+        ...(pinned
+          ? { createConnection: () => pinned, protocol: "http:" }
+          : { protocol: url.protocol }),
         hostname: options.connect?.host || identity,
         port:
           options.connect?.port ||
@@ -55,7 +69,7 @@ export function gatewayRequest(
               }
             : {}),
         },
-        ...(url.protocol === "https:"
+        ...(url.protocol === "https:" && !pinned
           ? {
               ca: options.ca || systemCAs(),
               servername: isIP(identity) ? undefined : identity,
@@ -87,7 +101,10 @@ export function gatewayRequest(
               data: JSON.parse(Buffer.concat(chunks).toString("utf8")),
             });
           } catch {
-            complete(new Error("The gateway returned invalid JSON"));
+            // A refusal's status says enough when its body is no JSON (a bare 404).
+            if (pinned && response.statusCode && response.statusCode !== 200)
+              complete(undefined, { status: response.statusCode, data: {} });
+            else complete(new Error("The gateway returned invalid JSON"));
           }
         });
       },

@@ -7,12 +7,17 @@ import { errorMessage } from "../shared/errors";
 import { handleRovingKey } from "../shared/a11y";
 import {
   encodeInvitation,
-  parseInvitation,
+  gatewayMode,
+  invitationText as invitationCopy,
+  type CreatedInvitation,
+  type GatewayCheck,
   type GatewaySettings,
   type GatewayStatus,
-  type Invitation,
 } from "../shared/connections";
 import type { Hub } from "../shared/remote";
+import { displayCode, displayPin, displayRoute } from "../shared/phone-pairing";
+import { pairErrorText } from "../shared/pair-form";
+import { HubKeyDetails } from "../shared/HubKey";
 import {
   fieldsFromInvitation,
   pairRequest,
@@ -120,7 +125,9 @@ export function Connections({
   const [vaultError, setVaultError] = useState(false);
   const [resetHubs, setResetHubs] = useState(false);
   const [notice, setNotice] = useState("");
-  const [invitation, setInvitation] = useState<Invitation>();
+  const [invitation, setInvitation] = useState<CreatedInvitation>();
+  // What the last start or restart verified: a pinned gateway's key and routes.
+  const [verified, setVerified] = useState<GatewayCheck>();
   const [qr, setQr] = useState("");
   const invitationPanel = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -138,12 +145,17 @@ export function Connections({
   const loaded = useRef<Partial<PairFields>>(undefined);
   const [manual, setManual] = useState(false);
   const [settings, setSettings] = useState<GatewaySettings>({
+    // No certificate: the gateway serves its own key, which devices pin.
+    mode: "pinned",
     url: "",
     listen: DEFAULT_LISTEN,
     cert: "",
     key: "",
     scopes: "operate",
   });
+  const certificateMode = gatewayMode(settings) === "certificate";
+  // Use my own certificate lives under Advanced, open when it is the saved choice.
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [checked, setChecked] = useState(false);
   const [scopes, setScopes] = useState<GatewaySettings["scopes"]>("operate");
   const [restartRequired, setRestartRequired] = useState(false);
@@ -183,6 +195,7 @@ export function Connections({
       .then((saved) => {
         if (saved) {
           setSettings(saved);
+          if (gatewayMode(saved) === "certificate") setAdvancedOpen(true);
           setScopes(saved.scopes);
           setChecked(false);
         }
@@ -223,7 +236,7 @@ export function Connections({
     try {
       await job();
     } catch (e) {
-      setError(errorMessage(e));
+      setError(pairErrorText(e));
     } finally {
       setBusy(false);
     }
@@ -231,6 +244,7 @@ export function Connections({
   function update(key: keyof GatewaySettings, value: string) {
     setSettings((old) => ({ ...old, [key]: value }));
     setChecked(false);
+    setVerified(undefined);
     setRestartRequired(false);
     setConfirmRestart(false);
     void cancelInvitation().catch((e) => setError(errorMessage(e)));
@@ -379,8 +393,10 @@ export function Connections({
                   <div>
                     <strong>{hub.name}</strong>
                     <small>
-                      {hub.url} · {hub.scopes.join(", ")}
+                      {hub.pin && hub.route ? displayRoute(hub.route) : hub.url}{" "}
+                      · {hub.scopes.join(", ")}
                     </small>
+                    <HubKeyDetails hub={hub} />
                   </div>
                   <button
                     disabled={busy || active?.id === hub.id}
@@ -431,18 +447,12 @@ export function Connections({
                     if (request.manual) setManual(true);
                     return;
                   }
-                  const fields = request.fields;
                   void run(async () => {
                     let hub: Hub;
                     try {
-                      hub = await window.twrRemote.pair({
-                        url: fields.url,
-                        code: fields.code.trim(),
-                        hubName: fields.hubName,
-                        name: fields.name,
-                      });
+                      hub = await window.twrRemote.pair(request.request);
                     } catch (e) {
-                      setPairError(errorMessage(e));
+                      setPairError(pairErrorText(e));
                       return;
                     }
                     await refresh();
@@ -453,7 +463,8 @@ export function Connections({
                 <h3>Pair with another computer</h3>
                 <p>
                   On that computer, open Let other devices connect and create an
-                  invitation. Copy it and paste it here.
+                  invitation. Copy it and paste it here, or enter its address
+                  and code under Enter details manually.
                 </p>
                 <label>
                   Paste invitation
@@ -463,7 +474,7 @@ export function Connections({
                     spellCheck={false}
                     autoCapitalize="none"
                     autoCorrect="off"
-                    placeholder='{"type":"twr-pair", …}'
+                    placeholder="twr://pair#…"
                     onChange={(e) => {
                       const text = e.target.value;
                       setInvitationText(text);
@@ -483,16 +494,25 @@ export function Connections({
                       maxLength: 80,
                       placeholder: "Workstation",
                     })}
-                    {pairField("url", "HTTPS hub URL", {
-                      type: "url",
-                      placeholder: "https://workstation.example:47321",
+                    {pairField("url", "Hub address", {
+                      placeholder: "192.168.1.20 or workstation.local:47321",
                       autoCapitalize: "none",
                       autoCorrect: "off",
+                      spellCheck: false,
+                      title:
+                        "A name or IP address, with :port if it isn't 47321. A hub with its own certificate: its https:// address.",
                     })}
                     {pairField("code", "One-use code", {
                       autoComplete: "off",
-                      autoCapitalize: "none",
+                      autoCapitalize: "characters",
                       spellCheck: false,
+                      placeholder: "ABCD-EFGH-JK23",
+                      // Shown as XXXX-XXXX-XXXX however it was typed.
+                      onBlur: () =>
+                        setPairFields((old) => ({
+                          ...old,
+                          code: displayCode(old.code.trim()),
+                        })),
                     })}
                     {pairField("name", "This device", { maxLength: 80 })}
                   </div>
@@ -510,9 +530,10 @@ export function Connections({
           ) : (
             <>
               <p>
-                Let your phone or another computer use this computer's hub over
-                HTTPS. The hub keeps running after you close the app, until this
-                computer restarts.
+                Let your phone or another computer use this computer's hub. They
+                connect over TLS and check this computer's key, so no
+                certificate is needed. The hub keeps running after you close the
+                app, until this computer restarts.
               </p>
               <div className="gateway-status">
                 <p role="status">{gatewayLine}</p>
@@ -556,15 +577,16 @@ export function Connections({
                 noValidate
                 onSubmit={(event) => {
                   event.preventDefault();
-                  const missing = !settings.url.trim()
-                    ? "Enter the public HTTPS address."
-                    : !settings.cert.trim()
-                      ? "Choose the TLS certificate."
-                      : !settings.key.trim()
-                        ? "Choose the TLS private key."
-                        : !settings.listen.trim()
-                          ? "Enter the IP and port to listen on, under Advanced."
-                          : "";
+                  const missing =
+                    certificateMode && !settings.url.trim()
+                      ? "Enter the public HTTPS address, under Advanced."
+                      : certificateMode && !settings.cert.trim()
+                        ? "Choose the TLS certificate, under Advanced."
+                        : certificateMode && !settings.key.trim()
+                          ? "Choose the TLS private key, under Advanced."
+                          : !settings.listen.trim()
+                            ? "Enter the IP and port to listen on, under Advanced."
+                            : "";
                   if (missing) {
                     setNotice("");
                     setError(missing);
@@ -578,50 +600,80 @@ export function Connections({
                     });
                     setRestartRequired(!!result.restartRequired);
                     setChecked(!result.restartRequired);
+                    setVerified(result.restartRequired ? undefined : result);
                     await probeGateway();
                     setNotice(
                       result.advisory ||
-                        "Local TLS, hostname and gateway identity checks passed. Check the address from your other device before pairing.",
+                        (certificateMode
+                          ? "Local TLS, hostname and gateway identity checks passed. Check the address from your other device before pairing."
+                          : "The gateway is running and presented this computer's key. Create an invitation to pair a device."),
                     );
                   });
                 }}
               >
                 <ol className="setup-steps">
                   <li>
-                    <h3>Address and certificate</h3>
+                    <h3>
+                      {certificateMode
+                        ? "Address and certificate"
+                        : "How devices reach this computer"}
+                    </h3>
                     <p>
-                      Use an address your other device can reach, and a TLS
-                      certificate it trusts.
+                      {certificateMode
+                        ? "Use an address your other device can reach, and a TLS certificate it trusts."
+                        : "Devices on the same network, or on a VPN such as Tailscale, connect to one of this computer's addresses. The invitation lists them."}
                     </p>
-                    <label>
-                      Public HTTPS address
-                      <input
-                        aria-required="true"
-                        type="url"
-                        disabled={busy}
-                        value={settings.url}
-                        onChange={(e) => update("url", e.target.value)}
-                        placeholder="https://workstation.example:47321"
-                      />
-                    </label>
-                    <PemFileField
-                      label="TLS certificate path"
-                      kind="certificate"
-                      value={settings.cert}
-                      disabled={busy}
-                      placeholder="/absolute/path/fullchain.pem"
-                      onChange={(value) => update("cert", value)}
-                    />
-                    <PemFileField
-                      label="TLS private key path"
-                      kind="private key"
-                      value={settings.key}
-                      disabled={busy}
-                      placeholder="/absolute/path/privkey.pem"
-                      onChange={(value) => update("key", value)}
-                    />
-                    <details className="connection-advanced">
+                    <details
+                      className="connection-advanced"
+                      open={advancedOpen}
+                      onToggle={(e) => setAdvancedOpen(e.currentTarget.open)}
+                    >
                       <summary>Advanced</summary>
+                      <label className="checkbox-row">
+                        <input
+                          type="checkbox"
+                          disabled={busy}
+                          checked={certificateMode}
+                          onChange={(e) =>
+                            update(
+                              "mode",
+                              e.target.checked ? "certificate" : "pinned",
+                            )
+                          }
+                        />
+                        Use my own certificate
+                      </label>
+                      {certificateMode && (
+                        <>
+                          <label>
+                            Public HTTPS address
+                            <input
+                              aria-required="true"
+                              type="url"
+                              disabled={busy}
+                              value={settings.url}
+                              onChange={(e) => update("url", e.target.value)}
+                              placeholder="https://workstation.example:47321"
+                            />
+                          </label>
+                          <PemFileField
+                            label="TLS certificate path"
+                            kind="certificate"
+                            value={settings.cert}
+                            disabled={busy}
+                            placeholder="/absolute/path/fullchain.pem"
+                            onChange={(value) => update("cert", value)}
+                          />
+                          <PemFileField
+                            label="TLS private key path"
+                            kind="private key"
+                            value={settings.key}
+                            disabled={busy}
+                            placeholder="/absolute/path/privkey.pem"
+                            onChange={(value) => update("key", value)}
+                          />
+                        </>
+                      )}
                       <label>
                         Listen IP and port
                         <input
@@ -696,6 +748,7 @@ export function Connections({
                       });
                       setRestartRequired(!!result.restartRequired);
                       setChecked(!result.restartRequired);
+                      setVerified(result.restartRequired ? undefined : result);
                       setConfirmRestart(false);
                       await probeGateway();
                       setNotice(
@@ -715,6 +768,34 @@ export function Connections({
                   Restarting disconnects phones and closes their gateway
                   terminal sessions. The independent hub keeps running.
                 </p>
+              )}
+              {(verified?.pin || gatewayStatus?.pin) && (
+                <div
+                  className="gateway-key"
+                  role="group"
+                  aria-label="Gateway key"
+                >
+                  <p>
+                    This computer's key:{" "}
+                    <code>
+                      {displayPin((verified?.pin || gatewayStatus?.pin)!)}
+                    </code>
+                  </p>
+                  {!!(verified?.routes || gatewayStatus?.routes)?.length && (
+                    <>
+                      <p>Devices can reach it at:</p>
+                      <ul aria-label="Addresses">
+                        {(verified?.routes || gatewayStatus?.routes || [])
+                          .filter((route) => route.startsWith("tls:"))
+                          .map((route) => (
+                            <li key={route}>
+                              <code>{displayRoute(route)}</code>
+                            </li>
+                          ))}
+                      </ul>
+                    </>
+                  )}
+                </div>
               )}
               {checked && (
                 <button
@@ -749,13 +830,37 @@ export function Connections({
                       another computer, copy the invitation and paste it under
                       Connect to another computer.
                     </p>
-                    <code>{invitation.code}</code>
-                    <p>{invitation.url}</p>
+                    {invitation.version === 2 ? (
+                      <>
+                        <code>{displayCode(invitation.code)}</code>
+                        <p>
+                          No camera? On the other device, enter the code and one
+                          of these addresses:
+                        </p>
+                        <ul
+                          className="invitation-routes"
+                          aria-label="Addresses"
+                        >
+                          {invitation.routes
+                            .filter((route) => route.startsWith("tls:"))
+                            .map((route) => (
+                              <li key={route}>
+                                <code>{displayRoute(route)}</code>
+                              </li>
+                            ))}
+                        </ul>
+                      </>
+                    ) : (
+                      <>
+                        <code>{invitation.code}</code>
+                        <p>{invitation.url}</p>
+                      </>
+                    )}
                     <button
                       type="button"
                       onClick={() =>
                         void window.twrLocal
-                          .copyText(encodeInvitation(invitation))
+                          .copyText(invitationCopy(invitation))
                           .then(() =>
                             setNotice(
                               "Invitation copied. Paste it on the other computer within five minutes.",
@@ -802,6 +907,7 @@ export function Connections({
                 void run(async () => {
                   await window.twrRemote.stopGateway();
                   setChecked(false);
+                  setVerified(undefined);
                   setRestartRequired(false);
                   setConfirmRestart(false);
                   setInvitation(undefined);

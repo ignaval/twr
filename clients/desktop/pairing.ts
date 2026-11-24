@@ -1,7 +1,24 @@
 import { parseInvitation } from "../shared/connections";
 import { errorMessage } from "../shared/errors";
+import { displayRoute, looksLikeInvitation } from "../shared/phone-pairing";
+import {
+  PAIR_LIMITS,
+  addressProblem,
+  hubNameFor,
+  invitationAddresses,
+  invitationCode,
+  invitationHubName,
+  isCertificateAddress,
+  requestFromAddress,
+  requestFromInvitation,
+} from "../shared/pair-form";
+import type { PairRequest } from "../shared/remote";
 
-/** The Pair form's fields (Connections.tsx › Connect to another computer). */
+export { PAIR_LIMITS, hubNameFor };
+
+/** The Pair form's fields (Connections.tsx › Connect to another computer). `url` is the
+ * hub address: a host or IP address (typed, pinned pairing) or an `https://` URL
+ * (certificate mode). */
 export interface PairFields {
   hubName: string;
   url: string;
@@ -9,29 +26,28 @@ export interface PairFields {
   name: string;
 }
 
-/** A name for the hub an invitation comes from: its host's first label ("workstation" for
- * `https://workstation.example:47321`), an IP address whole. */
-export function hubNameFor(url: string): string {
-  const host = new URL(url).hostname.replace(/^\[|\]$/g, "");
-  if (/^[\d.]+$/.test(host) || host.includes(":")) return host;
-  return host.split(".")[0] || host;
-}
-
 /** The fields a pasted invitation fills: its address and code, and a hub name when the
  * form has none yet. Undefined for text that isn't an invitation at all (typing in the
- * box); an error for one that is but is wrong. */
+ * box); an error for one that is but is wrong. A version 2 invitation pairs by its key
+ * and all its routes; the address shown is its first. */
 export function fieldsFromInvitation(
   text: string,
   current: PairFields,
 ): PairFields | undefined {
   const raw = text.trim();
-  if (!raw.startsWith("{")) return undefined;
+  if (!looksLikeInvitation(raw)) return undefined;
   const invitation = parseInvitation(raw);
+  const address = invitationAddresses(invitation)[0];
   return {
     ...current,
-    url: invitation.url,
-    code: invitation.code,
-    hubName: current.hubName.trim() || hubNameFor(invitation.url),
+    url:
+      invitation.version === 2
+        ? address
+          ? displayRoute(address)
+          : ""
+        : invitation.url,
+    code: invitationCode(invitation),
+    hubName: current.hubName.trim() || invitationHubName(invitation),
   };
 }
 
@@ -51,10 +67,6 @@ export function missingPairFields(fields: PairFields): string | undefined {
   }.`;
 }
 
-/** Most characters of a one-use code, a hub name and a device name (what
- * `twrRemote.pair` takes). */
-export const PAIR_LIMITS = { codeMin: 4, code: 128, name: 80 };
-
 /** What is wrong with details that are all there, in words (the limits `twrRemote.pair`
  * checks), or nothing when they can be sent. */
 export function pairFieldProblem(fields: {
@@ -63,24 +75,20 @@ export function pairFieldProblem(fields: {
   hubName: string;
   name: string;
 }): string | undefined {
-  const code = fields.code.trim();
-  const again = " Copy it again from the invitation on the other computer.";
-  if (code.length < PAIR_LIMITS.codeMin)
-    return "The one-use code is too short." + again;
-  if (code.length > PAIR_LIMITS.code)
-    return "The one-use code is too long." + again;
+  const names = nameProblem(fields);
+  if (names) return names;
+  const problem = addressProblem(fields.url, fields.code);
+  if (!problem) return undefined;
+  return isCertificateAddress(fields.url) && /one-use code/.test(problem)
+    ? problem + " Copy it again from the invitation on the other computer."
+    : problem;
+}
+
+function nameProblem(fields: { hubName: string; name: string }) {
   if (fields.hubName.trim().length > PAIR_LIMITS.name)
     return `The hub name is too long. Use at most ${PAIR_LIMITS.name} characters.`;
   if (fields.name.trim().length > PAIR_LIMITS.name)
     return `This device's name is too long. Use at most ${PAIR_LIMITS.name} characters.`;
-  let url: URL | undefined;
-  try {
-    url = new URL(fields.url.trim());
-  } catch {
-    url = undefined;
-  }
-  if (!url || !/^https?:$/.test(url.protocol))
-    return "The hub URL isn't a web address. Enter it as the invitation shows it, such as https://workstation.example:47321.";
   return undefined;
 }
 
@@ -98,14 +106,17 @@ export function withoutInvitation(
 }
 
 /** What **Pair and connect** sends. With text in Paste invitation, what that text says now:
- * text that isn't a valid invitation is refused, whatever an earlier one filled in. Without,
- * the details entered by hand. `manual`: the error names a detail to enter by hand. */
+ * text that isn't a valid invitation is refused, whatever an earlier one filled in; a
+ * version 2 one pairs by its key. Without, the details entered by hand: an `https://`
+ * address in certificate mode, a host or IP address by typed pairing. `manual`: the error
+ * names a detail to enter by hand. */
 export function pairRequest(
   invitationText: string,
   fields: PairFields,
-): { fields: PairFields } | { error: string; manual: boolean } {
+):
+  | { fields: PairFields; request: PairRequest }
+  | { error: string; manual: boolean } {
   const pasted = !!invitationText.trim();
-  let request = fields;
   if (pasted) {
     const again =
       " Copy it again on the other computer, or clear Paste invitation to enter the details manually.";
@@ -116,7 +127,15 @@ export function pairRequest(
           error: "The pasted text isn't a twr invitation." + again,
           manual: false,
         };
-      request = filled;
+      const missing = missingPairFields(filled) ?? nameProblem(filled);
+      if (missing) return { error: missing, manual: true };
+      return {
+        fields: filled,
+        request: requestFromInvitation(
+          parseInvitation(invitationText.trim()),
+          filled,
+        ),
+      };
     } catch (error) {
       return {
         error: `The pasted invitation can't be used: ${errorMessage(error).replace(/\.$/, "")}.${again}`,
@@ -124,6 +143,10 @@ export function pairRequest(
       };
     }
   }
-  const missing = missingPairFields(request) ?? pairFieldProblem(request);
-  return missing ? { error: missing, manual: pasted } : { fields: request };
+  const missing = missingPairFields(fields) ?? pairFieldProblem(fields);
+  if (missing) return { error: missing, manual: false };
+  return {
+    fields,
+    request: requestFromAddress(fields.url, fields.code, fields),
+  };
 }

@@ -423,6 +423,18 @@ select {
   display: flex;
   gap: 12px;
 }
+.pair-form label > small {
+  font-weight: 400;
+}
+/* A scanned version 2 invitation, in place of the address and code fields. */
+.pair-scanned {
+  display: grid;
+  gap: 8px;
+  overflow-wrap: anywhere;
+}
+.pair-scanned p {
+  margin: 0;
+}
 .hub-connect {
   display: grid;
   width: 100%;

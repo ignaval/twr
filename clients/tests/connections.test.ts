@@ -111,7 +111,10 @@ describe("pasting an invitation into Connect to another computer", () => {
   it("pairs with what the pasted text says now, never an earlier invitation", () => {
     const text = encodeInvitation(invitation);
     const filled = fieldsFromInvitation(text, empty)!;
-    expect(pairRequest(text, filled)).toEqual({ fields: filled });
+    expect(pairRequest(text, filled)).toMatchObject({
+      fields: filled,
+      request: { url: invitation.url, code: invitation.code },
+    });
     // Replaced with something else: refused, though the fields still hold the old one.
     const other = pairRequest("not an invitation", filled);
     expect(other).toMatchObject({ manual: false });
@@ -125,7 +128,7 @@ describe("pasting an invitation into Connect to another computer", () => {
     // The invitation in the box wins over an address typed under the manual details.
     expect(
       pairRequest(text, { ...filled, url: "https://elsewhere.example" }),
-    ).toEqual({ fields: filled });
+    ).toMatchObject({ fields: filled, request: { url: invitation.url } });
     // Nothing pasted: the details entered by hand.
     const manual = {
       hubName: "Lab",
@@ -133,7 +136,15 @@ describe("pasting an invitation into Connect to another computer", () => {
       code: "zzzz-1111",
       name: "laptop",
     };
-    expect(pairRequest("  ", manual)).toEqual({ fields: manual });
+    expect(pairRequest("  ", manual)).toEqual({
+      fields: manual,
+      request: {
+        url: manual.url,
+        code: manual.code,
+        name: manual.name,
+        hubName: manual.hubName,
+      },
+    });
     expect(pairRequest("", empty)).toEqual({
       error: missingPairFields(empty),
       manual: false,
@@ -205,9 +216,34 @@ describe("details entered by hand", () => {
     expect(pairFieldProblem({ ...manual, name: "n".repeat(81) })).toBe(
       "This device's name is too long. Use at most 80 characters.",
     );
-    expect(pairFieldProblem({ ...manual, url: "lab:47321" })).toMatch(
-      /^The hub URL isn't a web address\./,
+    expect(pairFieldProblem({ ...manual, url: "https://" })).toMatch(
+      /^The hub address isn't a web address\./,
     );
+    // A host or IP address is typed pairing: it needs a twelve-character code.
+    expect(pairFieldProblem({ ...manual, url: "lab:47321" })).toMatch(
+      /^The pairing code has 12 letters and digits/,
+    );
+    expect(
+      pairFieldProblem({ ...manual, url: "lab:47321", code: "abcd efgh jk23" }),
+    ).toBeUndefined();
+    expect(pairFieldProblem({ ...manual, url: "lab:99999" })).toMatch(
+      /^The hub address can't be used/,
+    );
+    expect(
+      pairRequest("", {
+        ...manual,
+        url: "192.168.1.20",
+        code: "abcd-efgh-jk23",
+      }),
+    ).toEqual({
+      fields: { ...manual, url: "192.168.1.20", code: "abcd-efgh-jk23" },
+      request: {
+        address: "192.168.1.20",
+        code: "ABCDEFGHJK23",
+        name: "laptop",
+        hubName: "Lab",
+      },
+    });
     // Pair and connect refuses it before asking the main process.
     expect(pairRequest("", { ...manual, code: "abc" })).toEqual({
       error: pairFieldProblem({ ...manual, code: "abc" }),

@@ -647,7 +647,7 @@ async function exerciseRemoteForget(page, history) {
     .getByLabel("Hub name", { exact: true })
     .fill("Disposable forget QA");
   await dialog
-    .getByLabel("HTTPS hub URL", { exact: true })
+    .getByLabel("Hub address", { exact: true })
     .fill(`http://127.0.0.1:${port}`);
   await dialog
     .getByLabel("One-use code", { exact: true })

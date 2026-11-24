@@ -19,3 +19,9 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# Bouncy Castle (bcprov), for typed pairing's Argon2id (tools.twr.mobile.dev.pairing.PairingProof).
+# The app calls Argon2BytesGenerator directly, not through a JCA provider, and nothing on that
+# path loads classes by name, so R8 traces what it needs without keep rules. Other bcprov classes
+# refer to JNDI (LDAP certificate stores), which Android lacks; R8 would otherwise stop on them.
+-dontwarn javax.naming.**
