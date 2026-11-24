@@ -9617,7 +9617,27 @@ fn ws_threads(ws: &Paths) -> anyhow::Result<WsLog> {
     if !db.exists() {
         return Ok(WsLog::default());
     }
-    let store = twr_hub::store::Store::open(&db)?;
+    // Read as it is, never migrated: a preview, or a removal the user then declines, leaves
+    // the log as it found it. One of another twr's schema can't be read so.
+    {
+        let conn = twr_hub::store::connect_existing(&db)?;
+        let version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if !twr_hub::store::is_own_schema(version) {
+            let id = ws.workspace_id();
+            if version > twr_hub::store::ACCOUNTS_SCHEMA_VERSION {
+                bail!(
+                    "the log of workspace {id} is from a newer twr (schema {version}): remove \
+                     the workspace with that twr"
+                );
+            }
+            bail!(
+                "the log of workspace {id} is from an older twr (schema {version}): open the \
+                 workspace once with this twr (`twr -w {id} thread list`, which starts its hub \
+                 and brings its log up to date), stop its hub, then remove the workspace"
+            );
+        }
+    }
+    let store = twr_hub::store::Store::open_existing(&db)?;
     let events = store.load_all()?;
     let mut items = std::collections::HashSet::new();
     for e in &events {
@@ -10250,7 +10270,14 @@ async fn plan_removal_of(
         return refused(why);
     }
     // What `twr ws rm` lists before it asks, the same lines.
-    let (.., goes) = removal_listing(root, &ws, conversation, Some(config))?;
+    // (It walks the workspace's files: off the async workers.)
+    let goes = {
+        let (root, ws, config) = (root.clone(), ws.clone(), config.clone());
+        tokio::task::spawn_blocking(move || {
+            removal_listing(&root, &ws, conversation, Some(&config)).map(|(.., goes)| goes)
+        })
+        .await??
+    };
     let mut lines = vec![String::new()];
     lines.extend(
         ws_rm_listing(&name, &ws.data_dir, &goes)
@@ -10940,6 +10967,42 @@ mod tests {
         assert!(!root.root_removed());
         server.abort();
         hub.shutdown().await;
+    }
+
+    /// A preview of a removal, and a removal checked then declined, read a stopped
+    /// workspace's log as it is: one of an older schema is refused, not migrated.
+    #[tokio::test]
+    async fn a_removal_preview_never_migrates_a_log() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        let a = twr_core::workspaces::create(&root, "a").unwrap().paths;
+        {
+            let hub = twr_hub::Hub::open(twr_hub::HubOptions::new(a.db_file(), Config::default()))
+                .await
+                .unwrap();
+            hub.shutdown().await;
+        }
+        let version = |v: Option<i32>| {
+            let conn = twr_hub::store::connect(&a.db_file()).unwrap();
+            if let Some(v) = v {
+                conn.pragma_update(None, "user_version", v).unwrap();
+            }
+            conn.pragma_query_value(None, "user_version", |r| r.get::<_, i32>(0))
+                .unwrap()
+        };
+        version(Some(8));
+        let plan = plan_removal_of(&root, "a", &Config::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(plan.contains("from an older twr (schema 8)"), "{plan}");
+        let e = remove_workspace(&root, RemovalOf::Selector("a"), None, Consent::Yes)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("older twr"), "{e}");
+        assert_eq!(version(None), 8);
+        assert!(a.data_dir.is_dir());
     }
 
     /// The TUI's Delete shows what `twr ws rm` lists before it asks: worktree directories left
