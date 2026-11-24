@@ -9474,7 +9474,12 @@ impl CheckedRemoval {
             let marker = ws.removed_marker();
             twr_core::workspaces::write_atomic(&marker, "removed\n")
                 .with_context(|| format!("writing {}", marker.display()))?;
-            twr_core::workspaces::move_root_owned_aside(&root)?
+            let aside = twr_core::workspaces::move_root_owned_aside(&root)?;
+            // From now on, what appears under its names is not its own: `twr ws new default`
+            // never deletes it unasked.
+            twr_core::workspaces::mark_root_moved(&root)
+                .with_context(|| format!("writing {}", marker.display()))?;
+            aside
         } else {
             // Moved aside first (a name no workspace can have), so a half-removed directory is
             // never taken for the workspace.
@@ -9520,7 +9525,7 @@ fn history_lock(ws: &Paths) -> anyhow::Result<WorkspaceLock> {
 /// twr's data directory (its `runner-<box>.db`): its worktrees and trash are `default`'s
 /// directories too, which the removal would take.
 fn runner_in_root_why(root: &Paths) -> Option<String> {
-    twr_core::workspaces::runner_spool_why(root, "remove the workspace")
+    twr_core::workspaces::runner_spool_why(root, true)
 }
 
 /// Why workspace `name` can't be removed while messages are queued for its orchestrator:
@@ -10815,6 +10820,45 @@ mod tests {
                 .unwrap(),
             (1, false)
         );
+    }
+
+    /// `twr ws new default` never deletes what came under `default`'s names after its removal
+    /// (a `twr runner` keeping its data in twr's data directory, say): it refuses, listing it,
+    /// and its spool's refusal names what the runner left too. Empty, it goes.
+    #[tokio::test]
+    async fn making_default_again_keeps_what_came_after_its_removal() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        std::fs::create_dir_all(&root.data_dir).unwrap();
+        twr_core::workspaces::create(&root, "a").unwrap();
+        remove_workspace(&root, RemovalOf::Selector("default"), None, Consent::Yes)
+            .await
+            .unwrap();
+        let file = root.data_dir.join("worktrees/p/t/file");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "a thread's work").unwrap();
+        std::fs::write(root.data_dir.join("runner-gpu.db"), "").unwrap();
+        let e = twr_core::workspaces::create(&root, "default")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("runner-gpu.db"), "{e}");
+        assert!(e.contains("worktrees/ (1 file, 15 bytes) stays"), "{e}");
+        assert!(!e.contains("loses only"), "{e}");
+        std::fs::remove_file(root.data_dir.join("runner-gpu.db")).unwrap();
+        let e = twr_core::workspaces::create(&root, "default")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("came after it was removed") && e.contains("worktrees/ (1 file, 15 bytes)"),
+            "{e}"
+        );
+        assert!(file.exists());
+        assert!(root.root_removed());
+        // Emptied, it is no one's: it goes, and `default` is made again.
+        std::fs::remove_file(&file).unwrap();
+        twr_core::workspaces::create(&root, "default").unwrap();
+        assert!(!root.root_removed());
+        assert!(!root.data_dir.join("worktrees").exists());
     }
 
     /// Removing `default` says when revoked runners haven't acknowledged their revocation:

@@ -405,9 +405,8 @@ pub fn create(root: &Paths, name: &str) -> anyhow::Result<Created> {
             bail!(why);
         }
         crate::paths::check_socket_path(&root.socket)?;
-        // What a removal cut short left goes (`worktrees/` and `trash/` among it), which a
-        // `twr runner` keeping its data here would use as its own.
-        if let Some(why) = runner_spool_why(&root, "make the workspace again") {
+        // A `twr runner` keeping its data here uses `worktrees/` and `trash/` as its own.
+        if let Some(why) = runner_spool_why(&root, false) {
             bail!(why);
         }
         clear_root_leftovers(&root)?;
@@ -451,11 +450,57 @@ pub fn create(root: &Paths, name: &str) -> anyhow::Result<Created> {
 }
 
 /// What the root slot's removal left in the root's data directory when it stopped half way
-/// (its own entries, a `.rm-default-*` directory): removed, before it is made again.
+/// (a `.rm-default-*` directory, or its own entries when it stopped before it moved them):
+/// removed, before it is made again. Never what appeared under `default`'s names after the
+/// removal moved its own aside ([`ROOT_MOVED`]), a `twr runner`'s `worktrees/` say: an empty
+/// one goes, and one that holds anything refuses, listed, for the user to move or delete.
 fn clear_root_leftovers(root: &Paths) -> anyhow::Result<()> {
-    let aside = move_root_owned_aside(root)?;
-    if let Some(aside) = aside {
-        remove_tree(&aside).with_context(|| format!("removing {}", aside.display()))?;
+    if root_moved(root) {
+        let later = later_entries(root)?;
+        let full: Vec<&(String, u64, u64)> = later.iter().filter(|(_, _, b)| *b > 0).collect();
+        if !full.is_empty() {
+            let listed: Vec<String> = full
+                .iter()
+                .map(|(n, files, bytes)| {
+                    let slash = if root.data_dir.join(n).is_dir() {
+                        "/"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "{n}{slash} ({files} file{}, {})",
+                        if *files == 1 { "" } else { "s" },
+                        crate::git::human_bytes(*bytes)
+                    )
+                })
+                .collect();
+            bail!(
+                "{} holds files under `default`'s names that came after it was removed (a \
+                 `twr runner` keeping its data there, say, whose worktrees may hold a thread's \
+                 work): {}. Move them elsewhere, or delete them if nothing in them is needed, \
+                 then make the workspace again",
+                root.data_dir.display(),
+                listed.join(", ")
+            );
+        }
+        for (n, _, _) in &later {
+            let path = root.data_dir.join(n);
+            let gone = if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+                remove_tree(&path)
+            } else {
+                std::fs::remove_file(&path).or_else(|e| {
+                    (e.kind() == std::io::ErrorKind::NotFound)
+                        .then_some(())
+                        .ok_or(e)
+                })
+            };
+            gone.with_context(|| format!("removing {}", path.display()))?;
+        }
+    } else {
+        let aside = move_root_owned_aside(root)?;
+        if let Some(aside) = aside {
+            remove_tree(&aside).with_context(|| format!("removing {}", aside.display()))?;
+        }
     }
     for e in std::fs::read_dir(&root.data_dir)?.flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
@@ -465,6 +510,59 @@ fn clear_root_leftovers(root: &Paths) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The second line of [`REMOVED_FILE`] once the removal moved the root slot's own entries
+/// aside ([`mark_root_moved`]): from then on, anything under their names in the root's data
+/// directory came after the removal, not from the workspace it removed.
+pub const ROOT_MOVED: &str = "moved";
+
+/// Records in [`REMOVED_FILE`] that the root slot's removal moved its own entries aside
+/// ([`move_root_owned_aside`]), as it does right after (still under its locks).
+pub fn mark_root_moved(root: &Paths) -> std::io::Result<()> {
+    write_atomic(&root.removed_marker(), &format!("removed\n{ROOT_MOVED}\n"))
+}
+
+/// Whether the root slot's removal got as far as moving its own entries aside.
+fn root_moved(root: &Paths) -> bool {
+    std::fs::read_to_string(root.removed_marker())
+        .is_ok_and(|t| t.lines().any(|l| l.trim() == ROOT_MOVED))
+}
+
+/// What is in the root's data directory under the root slot's names ([`root_owned`]): each
+/// one's name, how many files it holds and their bytes.
+fn later_entries(root: &Paths) -> anyhow::Result<Vec<(String, u64, u64)>> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(&root.data_dir)
+        .with_context(|| format!("reading {}", root.data_dir.display()))?
+        .flatten()
+    {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if root_owned(&n) {
+            let (files, bytes) = tree_size(&e.path());
+            out.push((n, files, bytes));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// How many files are under `path` (or `path`, a file) and their bytes, symlinks counted as
+/// themselves and never followed; what can't be read counts as nothing.
+pub fn tree_size(path: &Path) -> (u64, u64) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return (0, 0);
+    };
+    if !meta.is_dir() {
+        return (1, meta.len());
+    }
+    std::fs::read_dir(path)
+        .map(|d| {
+            d.flatten()
+                .map(|e| tree_size(&e.path()))
+                .fold((0, 0), |(f, b), (f2, b2)| (f + f2, b + b2))
+        })
+        .unwrap_or((0, 0))
 }
 
 /// The spool of a `twr runner` keeping its data in the root's data directory (its default),
@@ -477,25 +575,59 @@ pub fn runner_spool(root: &Paths) -> Option<String> {
         .find(|n| n.starts_with("runner-") && n.ends_with(".db"))
 }
 
-/// Why `default` can't be removed or made again while a `twr runner`'s spool is in the
-/// root's data directory (its default `--data-dir`), whether that runner runs or not: the
-/// spool holds what it has not delivered to its hub, and its worktrees and trash there are
-/// `default`'s directories too. What to do, then `doing`. `None`: no spool is there.
-pub fn runner_spool_why(root: &Paths, doing: &str) -> Option<String> {
+/// Why `default` can't be removed (`removing`) or made again while a `twr runner`'s spool is
+/// in the root's data directory (its default `--data-dir`), whether that runner runs or not:
+/// the spool holds what it has not delivered to its hub, and its worktrees and trash there are
+/// `default`'s directories too, which hold its threads' files. What to do. `None`: no spool is
+/// there.
+pub fn runner_spool_why(root: &Paths, removing: bool) -> Option<String> {
     let spool = runner_spool(root)?;
     let dir = root.root().data_dir;
     let name = spool
         .strip_prefix("runner-")
         .and_then(|s| s.strip_suffix(".db"))
         .unwrap_or(&spool);
+    // What of its directories holds files now (its threads' worktrees, their trash).
+    let held: Vec<String> = ["worktrees", "trash", "loops"]
+        .iter()
+        .filter_map(|d| {
+            let (files, bytes) = tree_size(&dir.join(d));
+            (bytes > 0).then(|| {
+                format!(
+                    "{d}/ ({files} file{}, {})",
+                    if files == 1 { "" } else { "s" },
+                    crate::git::human_bytes(bytes)
+                )
+            })
+        })
+        .collect();
+    let rest = if held.is_empty() {
+        String::new()
+    } else if removing {
+        format!(
+            ", and what it left in {} goes with `default`, which lists it before it asks",
+            held.join(", ")
+        )
+    } else {
+        format!(
+            "; what it left in {} stays, and `twr ws new {DEFAULT_WORKSPACE}` refuses to take it \
+             as `default`'s own until you move it elsewhere or delete it",
+            held.join(", ")
+        )
+    };
     Some(format!(
         "a `twr runner` for box {name} keeps its data in {dir}: its spool {spool}, which holds \
          what it has not delivered to its hub yet (and the agents it started), and its \
          worktrees and trash, which are `default`'s directories too. If that runner runs, or \
          will again, start it with a `--data-dir` of its own once its hub has what it holds \
-         (it delivers it when it connects); if it never will, deleting {} loses only what it \
-         never delivered. Then {doing}",
+         (it delivers it when it connects); if it never will, deleting {} loses what it never \
+         delivered{rest}. Then {}",
         dir.join(&spool).display(),
+        if removing {
+            "remove the workspace"
+        } else {
+            "make the workspace again"
+        },
         dir = dir.display(),
     ))
 }
