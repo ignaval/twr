@@ -405,51 +405,83 @@ pub fn cancellable<T>(
     f()
 }
 
-/// The removals of this process past their checks, by workspace name: from the first thing
-/// they change to the end of their deletion ([`Removing`]). A process that quits waits for
-/// them (the TUI), so none is cut off half deleted.
-static REMOVING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// The removals of a process past their checks, by workspace name, from the first thing they
+/// change to the end of their deletion ([`Removing`]), and whether it is closing: a process
+/// that quits waits for those it lists (the TUI), and once it closes, none begins, so none is
+/// cut off half deleted. [`REMOVALS`] is the process's own.
+pub struct Removals(std::sync::Mutex<(bool, Vec<String>)>);
 
-/// A removal past its checks, while it lives ([`removals_in_progress`]).
-pub struct Removing(String);
+/// This process's removals ([`Removals`]): only the TUI's quit closes it.
+pub static REMOVALS: Removals = Removals::new();
 
-impl Removing {
-    /// Marks workspace `name`'s removal as past its checks until this is dropped.
-    pub fn begin(name: &str) -> Removing {
-        REMOVING
+impl Default for Removals {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Removals {
+    pub const fn new() -> Removals {
+        Removals(std::sync::Mutex::new((false, Vec::new())))
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, (bool, Vec<String>)> {
+        self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(name.to_string());
-        Removing(name.to_string())
     }
+
+    /// Marks workspace `name`'s removal as past its checks until the guard is dropped: refused
+    /// once the process is closing, before the removal changes anything.
+    pub fn begin(&'static self, name: &str) -> anyhow::Result<Removing> {
+        let mut state = self.state();
+        if state.0 {
+            bail!("workspace {name} not deleted: twr is quitting; delete it again");
+        }
+        state.1.push(name.to_string());
+        Ok(Removing {
+            set: self,
+            name: name.to_string(),
+        })
+    }
+
+    /// Closes it (no removal begins from now on) and says which are past their checks, in one
+    /// step: each is either listed here, to be waited for, or never begins.
+    pub fn close(&self) -> Vec<String> {
+        let mut state = self.state();
+        state.0 = true;
+        state.1.clone()
+    }
+
+    /// The removals past their checks now, by name.
+    pub fn in_progress(&self) -> Vec<String> {
+        self.state().1.clone()
+    }
+}
+
+/// A removal past its checks, while it lives ([`Removals::begin`]).
+pub struct Removing {
+    set: &'static Removals,
+    name: String,
 }
 
 impl Drop for Removing {
     fn drop(&mut self) {
-        let mut all = REMOVING
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(i) = all.iter().position(|n| *n == self.0) {
-            all.remove(i);
+        let mut state = self.set.state();
+        if let Some(i) = state.1.iter().position(|n| *n == self.name) {
+            state.1.remove(i);
         }
     }
 }
 
-/// The workspaces this process is removing past their checks ([`Removing`]), by name.
-pub fn removals_in_progress() -> Vec<String> {
-    REMOVING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-}
-
-/// Deletes what a removal that is no longer running left set aside: the `.rm-<id>-<pid>-<ns>`
+/// What a removal that is no longer running left set aside: the `.rm-<id>-<pid>-<ns>`
 /// directories ([`aside_name`]) in the workspaces' directory and the root's data directory
 /// whose process is gone (its removal was killed, or cut off). One whose process runs, or
-/// whose process can't be told, is left; so is one that can't be deleted, which `twr ws rm`
-/// and `twr ws new` try again. Callers hold the registry lock and are off any async worker.
-pub fn sweep_asides(root: &Paths) {
+/// whose process can't be told, is left. Looked at under the registry lock; deleted after it
+/// ([`delete_asides`]), off any async worker.
+pub fn stale_asides(root: &Paths) -> Vec<PathBuf> {
     let root = root.root();
+    let mut out = Vec::new();
     for dir in [root.workspaces_dir(), root.data_dir.clone()] {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -459,11 +491,19 @@ pub fn sweep_asides(root: &Paths) {
             let Some(pid) = aside_pid(&n) else {
                 continue;
             };
-            if !e.file_type().is_ok_and(|t| t.is_dir()) || process_runs(pid) {
-                continue;
+            if e.file_type().is_ok_and(|t| t.is_dir()) && !process_runs(pid) {
+                out.push(e.path());
             }
-            let _ = remove_tree(&e.path());
         }
+    }
+    out
+}
+
+/// Deletes the aside directories [`stale_asides`] found, without any lock: nothing takes one
+/// for a workspace. One that can't be deleted is left, for the next `twr ws new` or `rm`.
+pub fn delete_asides(stale: Vec<PathBuf>) {
+    for path in stale {
+        let _ = remove_tree(&path);
     }
 }
 
@@ -580,13 +620,23 @@ pub struct Created {
 /// Creates workspace `name` in `root`, under the registry lock: a data directory of its own
 /// (private, like every data directory) named `name`, its id; or, for `default`, the root
 /// slot again once it was removed (what its removal left half done is removed first). The
-/// first workspace made while there is no default becomes the default. Callers refuse agents.
+/// first workspace made while there is no default becomes the default. What removals no
+/// longer running left set aside ([`stale_asides`]) is deleted once the lock is let go.
+/// Callers refuse agents, and keep it off async workers: it may wait for the lock, and delete.
 pub fn create(root: &Paths, name: &str) -> anyhow::Result<Created> {
-    use std::os::unix::fs::DirBuilderExt;
     let root = root.root();
-    let _lock = RegistryLock::take(&root)?;
-    // What removals no longer running left set aside goes first.
-    sweep_asides(&root);
+    let lock = RegistryLock::take(&root)?;
+    let stale = stale_asides(&root);
+    let made = create_locked(&root, name);
+    drop(lock);
+    delete_asides(stale);
+    made
+}
+
+/// [`create`], under the registry lock.
+fn create_locked(root: &Paths, name: &str) -> anyhow::Result<Created> {
+    use std::os::unix::fs::DirBuilderExt;
+    let root = root.clone();
     let all = root.workspaces()?;
     if name == DEFAULT_WORKSPACE {
         if !root.root_removed() {
@@ -1216,7 +1266,9 @@ mod tests {
         for d in [&live, &dead, &old, &root_dead] {
             std::fs::create_dir_all(d.join("worktrees")).unwrap();
         }
-        sweep_asides(&root);
+        let stale = stale_asides(&root);
+        assert!(live.exists() && old.exists() && dead.exists());
+        delete_asides(stale);
         assert!(live.exists() && old.exists());
         assert!(!dead.exists() && !root_dead.exists());
         assert!(root.workspace("a").unwrap().exists());
@@ -1227,10 +1279,27 @@ mod tests {
     /// A removal past its checks is listed while it runs, and no longer once it is done.
     #[test]
     fn a_removal_in_progress_is_listed_while_it_runs() {
-        let guard = Removing::begin("listed-while-it-runs");
-        assert!(removals_in_progress().contains(&"listed-while-it-runs".to_string()));
+        static SET: Removals = Removals::new();
+        let guard = SET.begin("listed-while-it-runs").unwrap();
+        assert_eq!(SET.in_progress(), ["listed-while-it-runs"]);
         drop(guard);
-        assert!(!removals_in_progress().contains(&"listed-while-it-runs".to_string()));
+        assert!(SET.in_progress().is_empty());
+    }
+
+    /// Closing lists the removals already past their checks, which go on, and none begins
+    /// after it.
+    #[test]
+    fn once_closed_no_removal_begins() {
+        static SET: Removals = Removals::new();
+        let before = SET.begin("began-before").unwrap();
+        assert_eq!(SET.close(), ["began-before"]);
+        let e = SET.begin("after").err().unwrap().to_string();
+        assert!(e.contains("not deleted: twr is quitting"), "{e}");
+        assert_eq!(SET.in_progress(), ["began-before"]);
+        drop(before);
+        assert!(SET.in_progress().is_empty());
+        // Another set closing leaves the process's own open.
+        assert!(REMOVALS.begin("unclosed").is_ok());
     }
 
     /// Deleting an aside directory another process deleted first is no error.

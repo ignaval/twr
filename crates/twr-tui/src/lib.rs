@@ -842,12 +842,19 @@ fn save_seen(state: &mut AppState, file: Option<&Path>) -> Option<tokio::task::J
 }
 
 /// Waits for the removals of workspaces this process has past their checks
-/// ([`twr_core::workspaces::removals_in_progress`]), saying so on `out` once, with no time
-/// limit: quitting never cuts one off half deleted. One still in its checks was given up.
+/// ([`twr_core::workspaces::REMOVALS`]), saying so on `out` once, with no time limit: quitting
+/// never cuts one off half deleted. It closes them first, so one still in its checks never
+/// begins to change anything (it was given up).
 fn finish_removals(out: &mut dyn std::io::Write) {
+    finish_removals_in(&twr_core::workspaces::REMOVALS, out);
+}
+
+/// [`finish_removals`], of `set`.
+fn finish_removals_in(set: &twr_core::workspaces::Removals, out: &mut dyn std::io::Write) {
+    // Each removal is either listed here or never begins.
+    let mut left = set.close();
     let mut said = false;
     loop {
-        let left = twr_core::workspaces::removals_in_progress();
         if left.is_empty() {
             return;
         }
@@ -860,6 +867,7 @@ fn finish_removals(out: &mut dyn std::io::Write) {
             said = true;
         }
         std::thread::sleep(Duration::from_millis(50));
+        left = set.in_progress();
     }
 }
 
@@ -4459,20 +4467,25 @@ mod asks_tests {
 
 #[cfg(test)]
 mod tests {
-    /// Quitting waits for a removal past its checks, however long it takes, and says so.
+    /// Quitting waits for a removal past its checks, however long it takes, and says so; one
+    /// that gets past its checks after that is refused, so it never begins.
     #[test]
     fn quitting_waits_for_a_removal_past_its_checks() {
+        static SET: twr_core::workspaces::Removals = twr_core::workspaces::Removals::new();
         let removing = std::thread::spawn(|| {
-            let _r = twr_core::workspaces::Removing::begin("slow-to-delete");
+            let _r = SET.begin("slow-to-delete").unwrap();
             std::thread::sleep(Duration::from_millis(1500));
         });
         // (Until it began.)
-        while !twr_core::workspaces::removals_in_progress().contains(&"slow-to-delete".into()) {
+        while !SET.in_progress().contains(&"slow-to-delete".into()) {
             std::thread::sleep(Duration::from_millis(5));
         }
         let start = std::time::Instant::now();
         let mut said = Vec::new();
-        finish_removals(&mut said);
+        finish_removals_in(&SET, &mut said);
+        assert!(SET.in_progress().is_empty());
+        let late = SET.begin("too-late").err().unwrap().to_string();
+        assert!(late.contains("twr is quitting; delete it again"), "{late}");
         assert!(
             start.elapsed() >= Duration::from_millis(1000),
             "{:?}",

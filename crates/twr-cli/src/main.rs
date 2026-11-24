@@ -8434,7 +8434,7 @@ async fn ws(cmd: Option<WsCmd>, paths: &Paths) -> anyhow::Result<()> {
     }
     match cmd {
         WsCmd::List { json, detail } => ws_list(paths, json, detail).await,
-        WsCmd::New { name } => ws_new(paths, &name),
+        WsCmd::New { name } => ws_new(paths, &name).await,
         WsCmd::Rename { name, new_name } => {
             let r = twr_core::workspaces::rename(&paths.root(), &name, &new_name)?;
             outln!("{}", renamed_line(&r));
@@ -8683,9 +8683,11 @@ async fn ws_status(socket: &Path, name: &str, detail: bool) -> Value {
     }
 }
 
-/// `twr ws new`: makes the workspace ([`create_workspace`]).
-fn ws_new(paths: &Paths, name: &str) -> anyhow::Result<()> {
-    let made = create_workspace(&paths.root(), name)?;
+/// `twr ws new`: makes the workspace ([`create_workspace`]), off the async workers (it may
+/// wait for the registry lock, and delete what stale removals left).
+async fn ws_new(paths: &Paths, name: &str) -> anyhow::Result<()> {
+    let (root, owned) = (paths.root(), name.to_string());
+    let made = tokio::task::spawn_blocking(move || create_workspace(&root, &owned)).await??;
     outln!("{}", created_line(name, &made));
     Ok(())
 }
@@ -9317,10 +9319,25 @@ async fn remove_workspace(
     // The rest blocks (locks, the log read, the deletion): off the async workers. The
     // question, when there is one, is asked with both locks held.
     let generation = generation.map(str::to_string);
-    let checked = tokio::task::spawn_blocking(move || {
+    let (stale, checked) = tokio::task::spawn_blocking(move || {
         check_removal(root, ws, name, generation.as_deref(), config)
     })
-    .await??;
+    .await?;
+    let done = remove_checked(checked, consent).await;
+    // What removals no longer running left set aside, found under the registry lock, is
+    // deleted once it is let go, whatever came of this one.
+    if !stale.is_empty() {
+        tokio::task::spawn_blocking(move || twr_core::workspaces::delete_asides(stale)).await?;
+    }
+    done
+}
+
+/// [`remove_workspace`] once checked: asks (`consent`), then removes.
+async fn remove_checked(
+    checked: anyhow::Result<CheckedRemoval>,
+    consent: Consent<'_>,
+) -> anyhow::Result<Vec<String>> {
+    let checked = checked?;
     match consent {
         Consent::Yes => {}
         Consent::Ask(ask) => {
@@ -9361,21 +9378,38 @@ struct CheckedRemoval {
 
 /// [`remove_workspace`] from the registry lock on: checks that workspace `ws` (named `name`
 /// when it was found) can be removed, and says what removing it takes, with the locks held.
+/// With it, what removals no longer running left set aside, found under the registry lock
+/// ([`twr_core::workspaces::stale_asides`]) for the caller to delete once it is let go.
 fn check_removal(
     root: Paths,
     ws: Paths,
     name: String,
     generation: Option<&str>,
     config: Option<Config>,
+) -> (Vec<PathBuf>, anyhow::Result<CheckedRemoval>) {
+    let registry = match twr_core::workspaces::RegistryLock::take(&root) {
+        Ok(registry) => registry,
+        Err(e) => return (Vec::new(), Err(e)),
+    };
+    let stale = twr_core::workspaces::stale_asides(&root);
+    let checked = check_locked(root, ws, name, generation, config, registry);
+    (stale, checked)
+}
+
+/// [`check_removal`] under the registry lock (`registry`).
+fn check_locked(
+    root: Paths,
+    ws: Paths,
+    name: String,
+    generation: Option<&str>,
+    config: Option<Config>,
+    registry: twr_core::workspaces::RegistryLock,
 ) -> anyhow::Result<CheckedRemoval> {
     let running = || {
         anyhow!(
             "the hub of workspace {name} is running: stop it first with `twr -w {name} hub stop`"
         )
     };
-    let registry = twr_core::workspaces::RegistryLock::take(&root)?;
-    // What removals no longer running left set aside goes first.
-    twr_core::workspaces::sweep_asides(&root);
     // Again under the lock: removed, or renamed into another's name, meanwhile.
     if !ws.exists() || ws.display_name() != name {
         bail!("workspace {name} changed meanwhile: try again (`twr ws` lists them)");
@@ -9472,8 +9506,17 @@ fn removal_listing(
 
 impl CheckedRemoval {
     /// Removes the workspace, and deletes what it moved aside once the locks are let go; the
-    /// lines saying what it did.
+    /// lines saying what it did. Refused, unchanged, once this process quits (the TUI's,
+    /// [`twr_core::workspaces::REMOVALS`]).
     fn remove(self) -> anyhow::Result<Vec<String>> {
+        self.remove_in(&twr_core::workspaces::REMOVALS)
+    }
+
+    /// [`CheckedRemoval::remove`], past its checks in `set`.
+    fn remove_in(
+        self,
+        set: &'static twr_core::workspaces::Removals,
+    ) -> anyhow::Result<Vec<String>> {
         let CheckedRemoval {
             root,
             ws,
@@ -9506,9 +9549,10 @@ impl CheckedRemoval {
                 ws.workspace_id()
             );
         }
-        // Past its checks: from here a process that quits waits for it (the TUI), so it is
-        // never cut off half deleted.
-        let _removing = twr_core::workspaces::Removing::begin(&name);
+        // Past its checks, before it changes anything: from here a process that quits waits
+        // for it (the TUI), so it is never cut off half deleted; one quitting already refuses
+        // it, unchanged.
+        let _removing = set.begin(&name)?;
         // What a TUI saves of its input history waits meanwhile, then finds the workspace
         // gone (`twr_tui::save_history`): it never makes it again.
         let history = history_lock(&ws)?;
@@ -11148,14 +11192,18 @@ mod tests {
         let root = Paths::with_home(home.path());
         std::fs::create_dir_all(&root.data_dir).unwrap();
         let name = root.display_name();
-        let checked = check_removal(root.clone(), root.clone(), name.clone(), None, None).unwrap();
+        let checked = check_removal(root.clone(), root.clone(), name.clone(), None, None)
+            .1
+            .unwrap();
         // The runner starts meanwhile: its spool, and a thread's worktree.
         std::fs::write(root.data_dir.join("runner-gpu.db"), "").unwrap();
         let e = checked.remove().unwrap_err().to_string();
         assert!(e.contains("a `twr runner` for box gpu"), "{e}");
         assert!(!root.root_removed());
         std::fs::remove_file(root.data_dir.join("runner-gpu.db")).unwrap();
-        let checked = check_removal(root.clone(), root.clone(), name, None, None).unwrap();
+        let checked = check_removal(root.clone(), root.clone(), name, None, None)
+            .1
+            .unwrap();
         let work = root.data_dir.join("worktrees/p/t");
         std::fs::create_dir_all(&work).unwrap();
         std::fs::write(work.join("file"), "a thread's work").unwrap();
@@ -11166,6 +11214,45 @@ mod tests {
         );
         assert!(!root.root_removed());
         assert!(work.join("file").exists());
+    }
+
+    /// A removal that gets past its checks once the process quits (the TUI's quit closed its
+    /// removals) is refused before it changes anything: the workspace, and the default, stay.
+    #[test]
+    fn a_removal_after_the_quit_changes_nothing() {
+        static CLOSED: twr_core::workspaces::Removals = twr_core::workspaces::Removals::new();
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        std::fs::create_dir_all(&root.data_dir).unwrap();
+        let a = twr_core::workspaces::create(&root, "a").unwrap().paths;
+        // The default, which its removal would forget.
+        std::fs::write(
+            root.data_dir.join(twr_core::workspaces::DEFAULT_FILE),
+            "a\n",
+        )
+        .unwrap();
+        let checked = check_removal(root.clone(), a.clone(), "a".into(), None, None)
+            .1
+            .unwrap();
+        CLOSED.close();
+        let e = checked.remove_in(&CLOSED).unwrap_err().to_string();
+        assert!(
+            e.contains("not deleted: twr is quitting; delete it again"),
+            "{e}"
+        );
+        assert!(a.exists() && a.display_name() == "a");
+        assert_eq!(root.default_id().as_deref(), Some("a"));
+        let left: Vec<_> = std::fs::read_dir(root.workspaces_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["a"]);
+        assert!(CLOSED.in_progress().is_empty());
+        // The locks went with it: it is removed once asked again (the process's own removals
+        // are open).
+        let (_, checked) = check_removal(root.clone(), a.clone(), "a".into(), None, None);
+        checked.unwrap().remove().unwrap();
+        assert!(!a.exists());
     }
 
     /// The TUI's Delete plan of a stopped workspace whose lock is held says why: another
