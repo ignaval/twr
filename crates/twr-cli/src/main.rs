@@ -9124,6 +9124,9 @@ fn removal_notes(
         if let Some(phones) = phone_pairing_note(root) {
             after.push(phones);
         }
+        if let Some(revoked) = pending_revocations_note(root) {
+            after.push(revoked);
+        }
     }
     if root.default_id().as_deref() == Some(id) {
         // What the default is once it is gone ([`twr_core::workspaces::forget_default`]).
@@ -9175,6 +9178,27 @@ fn phone_pairing_note(root: &Paths) -> Option<String> {
          gateway serves phones through this workspace's hub (the pairings stay, and work \
          again then)"
     ))
+}
+
+/// What removing `default` does to runners removed (`twr box remove`) that have not
+/// acknowledged it yet (the runner service's `pending_revocations`): the service retries them
+/// through this workspace's link to the runners, so they wait while it is gone and are
+/// retried once `twr ws new default` makes it again (the runner checks the machine that
+/// paired it, not the workspace). `None`: none waits.
+fn pending_revocations_note(root: &Paths) -> Option<String> {
+    let state = twr_link::state::Machine::of(root).load().ok()?;
+    match state.pending_revocations.len() {
+        0 => None,
+        n => Some(format!(
+            "{n} runner{} you removed (`twr box remove`) {} not acknowledged it yet: the \
+             runner service tells {} through this workspace, so {} until `twr ws new \
+             {DEFAULT_WORKSPACE}` makes it again",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "has" } else { "have" },
+            if n == 1 { "it" } else { "them" },
+            if n == 1 { "that waits" } else { "those wait" },
+        )),
+    }
 }
 
 /// The memory notes of the orchestrator of `ws` (the user's notes, so removal says them).
@@ -10776,6 +10800,38 @@ mod tests {
                 .unwrap(),
             (1, false)
         );
+    }
+
+    /// Removing `default` says when revoked runners haven't acknowledged their revocation:
+    /// the runner service retries through it, so they wait until it is made again.
+    #[test]
+    fn removing_default_names_revocations_that_wait() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        std::fs::create_dir_all(&root.data_dir).unwrap();
+        assert_eq!(pending_revocations_note(&root), None);
+        let mut state = twr_link::state::State::default();
+        state.pending_revocations.insert(
+            "gpu".into(),
+            twr_link::state::Runner {
+                addresses: Vec::new(),
+                endpoint: "e".into(),
+                relay: "r".into(),
+                receipt: "x".into(),
+                committed: true,
+            },
+        );
+        twr_link::state::Machine::of(&root).save(&state).unwrap();
+        let note = removal_notes(&root, &root, 0, None).2.join("\n");
+        assert!(
+            note.contains("1 runner you removed (`twr box remove`) has not acknowledged it yet"),
+            "{note}"
+        );
+        let a = twr_core::workspaces::create(&root, "a").unwrap().paths;
+        assert!(!removal_notes(&root, &a, 0, None)
+            .2
+            .join(" ")
+            .contains("revoked"));
     }
 
     /// An in-process hub of `paths` on its socket, serving until dropped.
