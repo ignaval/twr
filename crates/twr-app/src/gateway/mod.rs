@@ -231,11 +231,37 @@ mod socket_tests {
         twr_core::workspaces::create(&root, "a").unwrap();
         twr_core::workspaces::create(&root, "b").unwrap();
         twr_core::workspaces::rename(&root, "a", "acme").unwrap();
-        assert!(selects(&root, "acme", "a"));
-        assert!(selects(&root, "a", "a"));
-        assert!(!selects(&root, "b", "a"));
-        assert!(!selects(&root, "nope", "a"));
-        assert!(same_workspace("a", "a"));
+        // An older app connects by the name and stamps its calls with it.
+        assert_eq!(connect_id(&root, "acme", false).unwrap(), "a");
+        assert!(same_workspace("acme", "a", "acme"));
+        assert!(same_workspace("a", "a", "acme"));
+        // Not a name the connection wasn't made with, even one that selects it.
+        assert!(!same_workspace("acme", "a", "a"));
+        assert!(!same_workspace("b", "a", "acme"));
+        assert!(!same_workspace("nope", "a", "a"));
+        assert!(same_workspace("a", "a", "a"));
+    }
+
+    /// A phone reconnecting with the id it was given never lands on another workspace renamed
+    /// into that id's name once its own is gone, and a call stamped for the one that went is
+    /// not for it.
+    #[test]
+    fn a_stored_id_never_follows_its_name_to_another_workspace() {
+        let home = tempfile::tempdir().unwrap();
+        let root = twr_core::paths::Paths::with_home(home.path());
+        twr_core::workspaces::create(&root, "a").unwrap();
+        twr_core::workspaces::create(&root, "b").unwrap();
+        assert_eq!(connect_id(&root, "a", true).unwrap(), "a");
+        // `a` removed, and `b` renamed `a`.
+        std::fs::remove_dir_all(root.workspace("a").unwrap().data_dir).unwrap();
+        twr_core::workspaces::rename(&root, "b", "a").unwrap();
+        let e = connect_id(&root, "a", true).unwrap_err().to_string();
+        assert!(e.contains("there is no workspace a"), "{e}");
+        // By name (a first connect, an older app) it is `b` now, as named...
+        assert_eq!(connect_id(&root, "a", false).unwrap(), "b");
+        // ...and a connection to `b` made by its id refuses a call stamped `a`.
+        assert!(!same_workspace("a", "b", "b"));
+        assert!(same_workspace("a", "b", "a"));
     }
     #[test]
     fn launcher_pairing_flags_cannot_expand_read_only_invitations() {
@@ -1123,19 +1149,26 @@ fn by_id(id: &str) -> Result<twr_core::paths::Paths> {
         .existing_by_id(id)
 }
 
-/// Whether a call stamped with workspace `requested` (a phone's selector: an older app
-/// stamps the name it connected with, a renamed workspace's original name say) is for the
-/// workspace `connected` (an id) the connection serves.
-fn same_workspace(requested: &str, connected: &str) -> bool {
-    requested == connected
-        || twr_core::paths::Paths::from_env_in(Some(twr_core::paths::DEFAULT_WORKSPACE))
-            .is_ok_and(|p| selects(&p, requested, connected))
+/// Whether a call stamped with workspace `requested` is for the workspace `connected` (an id)
+/// the connection serves: its id, or exactly the selector the connection was made with
+/// (`selector`: an older app stamps the name it connected with, a renamed workspace's
+/// original name say). Never another name that selects it now: a stamp made for a workspace
+/// since removed would follow its name onto the one renamed into it.
+fn same_workspace(requested: &str, connected: &str, selector: &str) -> bool {
+    requested == connected || requested == selector
 }
 
-/// Whether `requested`, a name or an id, selects the workspace with id `connected` in `root`.
-fn selects(root: &twr_core::paths::Paths, requested: &str, connected: &str) -> bool {
-    root.find_workspace(requested)
-        .is_ok_and(|w| w.exists() && w.workspace_id() == connected)
+/// The id of the workspace a phone's `connect` of `workspace` in `root` is to: with `by_id`
+/// (an app reconnecting with the id the gateway gave it), the workspace kept by that id while
+/// it exists, never another only named so now; without (a first connect by name, an older
+/// app), the one it selects, by id first, else by name.
+fn connect_id(root: &twr_core::paths::Paths, workspace: &str, by_id: bool) -> Result<String> {
+    let ws = if by_id {
+        root.existing_by_id(workspace)?
+    } else {
+        root.find_workspace(workspace)?
+    };
+    Ok(ws.workspace_id().to_string())
 }
 
 /// A connection to the default workspace's hub as this user (the gateway's own).
@@ -1515,7 +1548,10 @@ struct Call {
     workspace: Option<String>,
 }
 struct WorkspaceConnection {
+    /// The workspace's id.
     workspace: String,
+    /// What the app connected with: the id, or a name of the workspace ([`same_workspace`]).
+    selector: String,
     bridge: Option<Arc<Companion>>,
 }
 struct Session {
@@ -1640,6 +1676,7 @@ impl Session {
         let p = &call.params;
         let connection = self.connection.read().await;
         let workspace = connection.workspace.clone();
+        let selector = connection.selector.clone();
         let selected_bridge = connection.bridge.clone();
         drop(connection);
         let bridge = || {
@@ -1652,7 +1689,7 @@ impl Session {
                 || call
                     .workspace
                     .as_ref()
-                    .is_none_or(|requested| same_workspace(requested, &workspace)),
+                    .is_none_or(|requested| same_workspace(requested, &workspace, &selector)),
             "Workspace changed; review the destination before retrying"
         );
         match call.method.as_str() {
@@ -1667,10 +1704,12 @@ impl Session {
                     anyhow::bail!(error);
                 }
                 // By its id, whichever of its names the phone used: what its hub, the inbox
-                // sources and the push observers name it by (a rename leaves it).
-                let id = twr_core::paths::Paths::from_env_in(Some(workspace))?
-                    .workspace_id()
-                    .to_string();
+                // sources and the push observers name it by (a rename leaves it). An app
+                // reconnecting with the id it was given (`by_id`) gets that workspace or none.
+                let root =
+                    twr_core::paths::Paths::from_env_in(Some(twr_core::paths::DEFAULT_WORKSPACE))?;
+                let selector = workspace.to_string();
+                let id = connect_id(&root, workspace, p["by_id"].as_bool() == Some(true))?;
                 let workspace = id.as_str();
                 let existing = {
                     let connection = self.connection.read().await;
@@ -1680,6 +1719,12 @@ impl Session {
                 };
                 if let Some(bridge) = existing.filter(|bridge| bridge.is_alive()) {
                     if bridge.call("hub.info", json!({})).await.is_ok() {
+                        {
+                            let mut connection = self.connection.write().await;
+                            if connection.workspace == workspace {
+                                connection.selector = selector.clone();
+                            }
+                        }
                         let paths = bridge.call("desktop.paths", json!({})).await?;
                         let cached = self.latest_state.lock().unwrap().clone();
                         if let Some(state) = cached {
@@ -1761,6 +1806,7 @@ impl Session {
                 self.latest_state.lock().unwrap().take();
                 *self.connection.write().await = WorkspaceConnection {
                     workspace: workspace.into(),
+                    selector,
                     bridge: Some(Arc::new(bridge)),
                 };
                 let _ = ready.send(());
@@ -2316,6 +2362,7 @@ async fn serve_socket(
                     token: token.clone(),
                     connection: RwLock::new(WorkspaceConnection {
                         workspace: "default".into(),
+                        selector: "default".into(),
                         bridge: None,
                     }),
                     connecting: Mutex::new(()),

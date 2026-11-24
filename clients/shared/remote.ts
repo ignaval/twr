@@ -129,6 +129,9 @@ export class RemoteHost {
   private framing = false;
   private bridgeReady = false;
   private confirmedWorkspace = false;
+  // The id the gateway last connected a workspace by: a reconnect with it asks for that
+  // workspace by id alone, never another named so since (one renamed into a removed one's id).
+  private connectedId: string | undefined;
   private connectionTail: Promise<unknown> = Promise.resolve();
   private foreground = true;
   private looking = true;
@@ -504,11 +507,18 @@ export class RemoteHost {
       await this.openSocket();
       this.nativeConnected = true;
     }
-    const result = await this.request("connect", { workspace }, 75000);
+    const byId = workspace === this.connectedId;
+    const result = await this.request(
+      "connect",
+      byId ? { workspace, by_id: true } : { workspace },
+      75000,
+    );
     // By the id the gateway connected it by (what its hub and the push name it by), whichever
     // of its names was asked for.
-    if (typeof result?.workspace === "string" && result.workspace)
+    if (typeof result?.workspace === "string" && result.workspace) {
       workspace = result.workspace;
+      this.connectedId = workspace;
+    }
     this.workspace = workspace;
     this.confirmedWorkspace = true;
     this.bridgeReady = true;

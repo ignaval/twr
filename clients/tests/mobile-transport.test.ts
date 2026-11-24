@@ -504,6 +504,34 @@ describe("mobile reconnect", () => {
     expect(fake.connect).toHaveBeenCalledTimes(1);
     await host.stop();
   });
+  it("reconnects by the id the gateway gave, never by a name", async () => {
+    const host = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    await host.start();
+    const connects: any[] = [];
+    fake.send.mockImplementation(async ({ message }) => {
+      const call = JSON.parse(message);
+      if (call.method === "connect") connects.push(call.params);
+      reply(
+        call.id,
+        call.method === "connect"
+          ? { workspace: "a", workspace_name: "acme" }
+          : {},
+      );
+    });
+    // Asked for by its name, connected by its id.
+    await host.api().connect("acme");
+    fake.listener({ message: { type: "transport-closed" } });
+    await host.resume();
+    expect(connects).toEqual([
+      { workspace: "acme" },
+      { workspace: "a", by_id: true },
+    ]);
+    await host.stop();
+  });
   it("serializes foreground recovery with an explicit workspace switch", async () => {
     const host = new RemoteHost(
       hub,
