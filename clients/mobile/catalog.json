@@ -5023,13 +5023,40 @@
   {
     "id": "cli:ws",
     "title": "twr ws",
-    "description": "List, create or remove workspaces: separate hubs on this machine, each with its own orchestrator, threads, worktrees and trash, sharing the config file. `twr -w <name> <command>` (or `TWR_WORKSPACE=<name>`) runs a command in one; `default` is the usual one. Without a subcommand, lists them",
+    "description": "List, create, rename or remove workspaces, or choose the default one: separate hubs on this machine, each with its own orchestrator, threads, worktrees and trash, sharing the config file. `twr -w <name> <command>` (or `TWR_WORKSPACE=<name>`) runs a command in one; without either, commands run in the default workspace. Without a subcommand, lists them",
     "group": "CLI · ws",
     "fields": [],
     "cli": [
       "ws"
     ],
     "cliFields": []
+  },
+  {
+    "id": "cli:ws default",
+    "title": "twr ws default",
+    "description": "Show the default workspace, which commands without `-w` (or `TWR_WORKSPACE`) and a bare `twr` open; with a name, make that workspace the default",
+    "group": "CLI · ws",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": false,
+        "description": "The workspace to make the default"
+      }
+    ],
+    "cli": [
+      "ws",
+      "default"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
   },
   {
     "id": "cli:ws list",
@@ -5074,7 +5101,7 @@
   {
     "id": "cli:ws new",
     "title": "twr ws new",
-    "description": "Create a workspace (1-32 of [a-z0-9-], starting and ending with a letter or digit). Its hub starts on first use: `twr -w <name>`",
+    "description": "Create a workspace (1-32 of [a-z0-9-], starting and ending with a letter or digit). Its hub starts on first use: `twr -w <name>`. `default` makes the workspace in twr's own data directory again once it was removed",
     "group": "CLI · ws",
     "fields": [
       {
@@ -5099,9 +5126,49 @@
     ]
   },
   {
+    "id": "cli:ws rename",
+    "title": "twr ws rename",
+    "description": "Rename a workspace, `default` too. Nothing moves: its hub may keep running, and its threads, worktrees, sessions and branches stay as they are. Its original name keeps selecting it (`-w`), so no other workspace can take that name",
+    "group": "CLI · ws",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": "The workspace, by its name or its original name"
+      },
+      {
+        "key": "new_name",
+        "label": "new name",
+        "type": "text",
+        "required": true,
+        "description": "Its new name"
+      }
+    ],
+    "cli": [
+      "ws",
+      "rename"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "new_name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
     "id": "cli:ws rm",
     "title": "twr ws rm",
-    "description": "Remove a workspace's data for good: its log, orchestrator conversation and memory, and history. Refused while its hub runs, while it has threads (delete them first) or while its trash holds deleted threads (`twr -w <name> trash empty --all`). Lists what goes and asks y/N on a terminal (without one, only with --yes). Branches stay in their repositories",
+    "description": "Remove a workspace for good, `default` too: its log, orchestrator conversation and memory, and its input history. Refused while its hub runs, while it has threads (delete them first) or while its trash holds deleted threads (`twr -w <name> trash empty --all`). Lists what goes and asks y/N on a terminal (without one, only with --yes). Branches stay in their repositories; the config file, boxes, accounts and the other workspaces stay too",
     "group": "CLI · ws",
     "fields": [
       {
