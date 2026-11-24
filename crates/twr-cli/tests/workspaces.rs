@@ -287,6 +287,17 @@ fn workspaces_are_separate_hubs_in_one_repository() {
     assert_eq!(row("a")["threads"], 2);
     assert_eq!(row("a")["current"], true);
     assert!(row("a").get("detail").is_none(), "{listed}");
+    // Each running hub says which engine it runs, as its `hub.info` does: here the same twr.
+    let info = serde_json::from_str::<Value>(&ok(home, &["-w", "a", "info", "--json"])).unwrap();
+    for name in ["default", "a"] {
+        assert_eq!(row(name)["version"], info["version"], "{listed}");
+        assert_eq!(row(name)["build"], info["build"], "{listed}");
+        assert_eq!(
+            row(name)["build"].as_str().map(str::len),
+            Some(16),
+            "{listed}"
+        );
+    }
     // `--detail` adds what each hub listed: the same reads, printed whole.
     let detailed: Value =
         serde_json::from_str(&ok(home, &["ws", "list", "--json", "--detail"])).unwrap();

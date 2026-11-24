@@ -49,7 +49,14 @@ import {
 import type { DesktopAppearance, DesktopEvent } from "../shared/types";
 import { startWorkspace } from "../shared/workspaceTree";
 import { readOmarchyTheme, watchOmarchyTheme } from "./omarchy-theme";
-import { ENGINE_BINARIES, cleanupEngines, stageEngines } from "./engines";
+import {
+  ENGINE_BINARIES,
+  EngineDigests,
+  cleanupEngines,
+  stageEngines,
+} from "./engines";
+import { engineHubs } from "./engine-hubs";
+import { buildIdOf, engineDifference, type Engine } from "../shared/engineHubs";
 import { parseLoginEnvironment, runLoginShell } from "./login-env";
 import { discoverCatalog } from "./catalog";
 import { AppServices } from "./app-services";
@@ -127,6 +134,8 @@ let openingTerminals = 0;
 let remoteTransport: DesktopTransport;
 let services: AppServices | undefined;
 let hubVersion: string | undefined;
+// The bundled twr's build id (`hub.info`'s `build` of a hub it started), once staged.
+let engineBuild: string | undefined;
 let voice: DesktopVoice | undefined;
 let voices: DesktopVoices | undefined;
 // The microphone is granted only after the user turned voice mode on (`voice-arm`), and only
@@ -294,6 +303,18 @@ async function findBinaries() {
   // A packaged build ships its engines' digests; a development checkout's
   // binaries change under it, so they are always hashed.
   const stable = await stageEngines(dir, root, app.isPackaged);
+  // Staging just hashed it, so this reads the digest index rather than the file. A hub's
+  // `build` names its engine where the version cannot: a distribution package rebuilt from a
+  // later commit keeps the version.
+  try {
+    engineBuild = buildIdOf(
+      await new EngineDigests(join(root, "digests.json")).digest(
+        join(stable, "twr"),
+      ),
+    );
+  } catch {
+    engineBuild = undefined;
+  }
   setTimeout(
     () =>
       void cleanupEngines(
@@ -449,10 +470,18 @@ async function connectWorkspace(
       .catch(() => {});
     saveDesktopSettings({ workspace });
     hubVersion = hubInfo.version;
+    const difference = engineDifference(
+      { version: paths.version, build: engineBuild },
+      hubInfo,
+    );
     return {
       ...paths,
+      build: engineBuild,
       hubVersion: hubInfo.version,
-      versionMismatch: hubInfo.version !== paths.version,
+      hubBuild: hubInfo.build,
+      // "version" or "build": see shared/engineHubs.
+      engineDifference: difference,
+      versionMismatch: !!difference,
     };
   } catch (error) {
     // Retain the companion for config repair, while blocking workspace-bound commands.
@@ -621,6 +650,25 @@ function register() {
       ),
     ),
   );
+  // The hubs of every running workspace whose engine is not the app's: after an upgrade
+  // they keep running the old one until stopped. The listing reads each hub's `hub.info`
+  // itself, so no bridge is opened for it.
+  handleWithEnvironment("engine-hubs", async () => {
+    if (!workspaceReady || !bridge) return [];
+    const live = bridge;
+    const version = (await live.call("desktop.paths")).version;
+    const engine: Engine = { version, build: engineBuild };
+    const listing = JSON.parse(
+      (
+        await exec(binaries.twr, ["ws", "list", "--json"], {
+          env: env(),
+          timeout: 5000,
+          maxBuffer: 1024 * 1024,
+        })
+      ).stdout,
+    );
+    return engineHubs(listing?.workspaces ?? listing, engine);
+  });
   handle("remote-list", () => remoteTransport.listHubs());
   handle("remote-pair", (request) => remoteTransport.pair(request));
   handle("remote-connect", (request) => remoteTransport.connect(request));

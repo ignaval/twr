@@ -8,6 +8,7 @@ import type {
 import type { DesktopConnections } from "../shared/connections";
 const api: DesktopAPI = {
   inboxSources: () => ipcRenderer.invoke("twr:inbox-sources"),
+  engineHubs: () => ipcRenderer.invoke("twr:engine-hubs"),
   sendMessage: (message) => ipcRenderer.invoke("twr:send-message", message),
   secureRead: (key) => ipcRenderer.invoke("twr:secure-read", key),
   secureWrite: (key, value) =>
