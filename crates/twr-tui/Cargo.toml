@@ -25,6 +25,9 @@ tokio.workspace = true
 libc.workspace = true
 # `terminal_setup`: alacritty.toml, read and checked before it is written.
 toml.workspace = true
+# `qr`: a phone invitation's QR code, drawn with half blocks (`/phone`, `twr phone`). Only the
+# encoder: no image or SVG renderer.
+qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 tempfile.workspace = true

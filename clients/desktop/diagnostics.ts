@@ -9,6 +9,12 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
+/** Whether `value` is a twelve-character pairing code once spaces and `-` are gone,
+ * in any case and any grouping. */
+function isPairingCode(value: string): boolean {
+  return /^[A-HJ-NP-Z2-9]{12}$/i.test(value.replace(/[ -]/g, ""));
+}
+
 /**
  * Remove secrets and identifying paths before text reaches the log or the
  * clipboard. The log never leaves the machine unless the user copies it.
@@ -33,13 +39,32 @@ export function redact(text: string, home?: string) {
       /([?&#](?:code|token|key|sig|signature|access_token|id_token|state)=)[^&#\s]+/gi,
       "$1[redacted]",
     )
-    // One-use pairing invitations carry a "code" string: ten characters of
-    // A-Z/2-9 (twr-core devices.rs). Error constants ("REQUEST_TOO_LARGE",
-    // "ENOENT") stay readable; any ten-character code is always redacted.
+    // A pairing link carries the whole invitation, its code included, in the fragment.
+    .replace(/\btwr:\/\/pair#[A-Za-z0-9_=-]*/gi, "twr://pair#[redacted]")
+    // One-use pairing invitations carry a "code" string: twelve characters of
+    // ABCDEFGHJKLMNPQRSTUVWXYZ23456789 in any grouping (docs/design/phone-pairing.md),
+    // or ten of A-Z/2-9 from older hubs. Error constants ("REQUEST_TOO_LARGE",
+    // "ENOENT", "ECONNREFUSED") stay readable; anything a code could be is redacted.
     .replace(/("code"\s*:\s*)"([^"]*)"/g, (match, prefix, code) =>
-      code.length !== 10 && (/_/.test(code) || /^E[A-Z]+$/.test(code))
+      !isPairingCode(code) &&
+      code.length !== 10 &&
+      (/_/.test(code) || /^E[A-Z]+$/.test(code))
         ? match
         : `${prefix}"[redacted]"`,
+    )
+    // A code as displayed, XXXX-XXXX-XXXX (any case), or typed with spaces, anywhere.
+    .replace(
+      /\b[A-HJ-NP-Z2-9]{4} [A-HJ-NP-Z2-9]{4} [A-HJ-NP-Z2-9]{4}\b/g,
+      "[redacted-code]",
+    )
+    .replace(
+      /\b[a-hj-np-z2-9]{4}-[a-hj-np-z2-9]{4}-[a-hj-np-z2-9]{4}\b/gi,
+      "[redacted-code]",
+    )
+    // A pin proof, as /v1/pair/proof answers it or a log line names it.
+    .replace(
+      /(["']?\b(?:pin[_-]?)?proof(?:[_-]?key)?["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[A-Za-z0-9_=-]{16,})/gi,
+      "$1[redacted]",
     )
     // Well-known credential shapes.
     .replace(/\bsk-[A-Za-z0-9_-]{16,}/g, "[redacted-key]")

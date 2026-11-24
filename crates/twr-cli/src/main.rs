@@ -6,6 +6,7 @@ mod accounts;
 mod boxes;
 mod dial_in;
 mod loops;
+mod phone;
 mod pretty;
 mod relay;
 mod runner_link;
@@ -910,6 +911,47 @@ enum Cmd {
         #[arg(long, hide = true, value_name = "PATH", requires = "daemon")]
         log: Option<PathBuf>,
     },
+    /// Pair a phone with this machine's hubs: shows a QR code and a one-use code for the twr
+    /// app, and waits until the phone pairs (Ctrl-C cancels the code).
+    ///
+    /// It starts the phone gateway, which then runs on its own, and starts with a hub while a
+    /// phone is paired. `twr phone devices` lists the paired phones, `twr phone revoke <id>`
+    /// revokes one, `twr phone off` stops the gateway and keeps it off, and `twr phone rekey`
+    /// makes it a new key (every phone pairs again).
+    #[command(args_conflicts_with_subcommands = true)]
+    Phone {
+        #[command(subcommand)]
+        cmd: Option<phone::PhoneCmd>,
+        /// Grant read access only.
+        #[arg(long, conflicts_with_all = ["terminal", "admin"])]
+        read_only: bool,
+        /// Grant remote shells, attach and jobs too.
+        #[arg(long)]
+        terminal: bool,
+        /// Grant accounts, boxes, configuration and modes too, and terminal access, which they
+        /// include (configuration can name commands the hub runs).
+        #[arg(long)]
+        admin: bool,
+        /// The address invitations offer first: a DNS name, or a forwarded host:port. Saved
+        /// for later invitations; an empty one offers none.
+        #[arg(long, value_name = "HOST[:PORT]")]
+        address: Option<String>,
+        /// Print the invitation as a JSON line, then how it ended as another; no terminal
+        /// needed.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the phones' gateway in the foreground (advanced: `twr phone` starts it for you).
+    ///
+    /// Without --tls-cert it serves its own key, which paired phones pin.
+    Gateway(twr_app::gateway::Args),
+    /// A device's companion, which the gateway runs: the desktop bridge for a workspace, on
+    /// stdin and stdout.
+    #[command(name = "desktop-bridge", hide = true)]
+    DesktopBridge {
+        #[arg(default_value = "default")]
+        workspace: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1732,6 +1774,31 @@ fn workspace_hint() -> &'static str {
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     refuse_runner_socket(&cli)?;
     refuse_bulk_stop_socket(&cli)?;
+    // The gateway and the companion it runs find their own paths (the default workspace's,
+    // the companion's named one).
+    let cli = match cli.cmd {
+        Some(Cmd::Gateway(args)) => {
+            twr_app::gateway::run(args, twr_app::gateway::Programs::Twr).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Cmd::DesktopBridge { workspace }) => {
+            twr_app::bridge::run(workspace).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Cmd::Phone { cmd: Some(cmd), .. }) => return phone::command(cmd).await,
+        Some(Cmd::Phone {
+            cmd: None,
+            read_only,
+            terminal,
+            admin,
+            address,
+            json,
+        }) => {
+            let level = phone::level(read_only, terminal, admin);
+            return phone::pair(level, address.as_deref(), json).await;
+        }
+        cmd => Cli { cmd, ..cli },
+    };
     // From the command definition alone: no twr home, config or hub.
     if let Some(Cmd::Completions { shell }) = &cli.cmd {
         let mut command = <Cli as clap::CommandFactory>::command();
@@ -2371,6 +2438,9 @@ async fn run_simple(cmd: Cmd, paths: Paths, socket: PathBuf) -> anyhow::Result<(
         | Cmd::Remote { .. }
         | Cmd::TerminalSetup { .. }
         | Cmd::Completions { .. }
+        | Cmd::Gateway(_)
+        | Cmd::DesktopBridge { .. }
+        | Cmd::Phone { .. }
         | Cmd::Account { .. }
         | Cmd::Thread {
             cmd: ThreadCmd::New { .. },
@@ -3526,6 +3596,25 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
                 test_gate(&gate, LOOP_GATE_ENV);
             }
         }));
+    }
+    // The phone gateway, while phones are paired with it (`twr phone`): started on its own,
+    // once this hub answers; never by a test's throwaway hub, nor a named workspace's (the
+    // gateway serves every workspace from the default one's hub).
+    if paths.workspace.is_none() {
+        let socket = socket.clone();
+        tokio::spawn(async move {
+            let started = async {
+                let program = twr_app::phone::this_program()?;
+                twr_app::phone::autostart(&program, &socket, trusted).await
+            };
+            match started.await {
+                Ok(twr_app::phone::Autostart::Start) => tracing::info!("started the phone gateway"),
+                Ok(twr_app::phone::Autostart::Dormant(why)) => {
+                    tracing::debug!("the phone gateway is not started: {why}")
+                }
+                Err(e) => tracing::warn!("the phone gateway could not be started: {e:#}"),
+            }
+        });
     }
     if trusted && std::env::var_os(HUB_STOP_GATE_ENV).is_some() {
         opts.socket_removed_hook = Some(std::sync::Arc::new(|| {

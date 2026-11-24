@@ -2467,6 +2467,11 @@ export default function App({
         case "Runner":
           setSection("boxes");
           break;
+        case "Phone":
+          // The TUI's /phone; the apps pair phones elsewhere (docs/mobile.md).
+          throw new Error(
+            "To pair a phone, use Let other devices connect in the hub switcher's Computers dialog on the desktop, or run twr phone on the hub's computer.",
+          );
         case "Accounts":
           setSection("accounts");
           break;

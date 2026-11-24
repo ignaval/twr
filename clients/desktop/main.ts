@@ -478,6 +478,11 @@ function register() {
     },
     !app.isPackaged,
   );
+  // A change of this computer's addresses reconnects a pinned hub at once.
+  remoteTransport.watchNetwork((value) => {
+    if (window && !window.isDestroyed())
+      window.webContents.send("twr:remote-network", value);
+  });
   // Created once the engines are staged; every gateway handler waits for them.
   let gatewaySetup: GatewaySetup | undefined;
   const gateway = () =>
@@ -582,6 +587,9 @@ function register() {
   handle("remote-send", (request) => remoteTransport.send(request));
   handle("remote-disconnect", () => remoteTransport.disconnect());
   handle("remote-remove", (request) => remoteTransport.removeHub(request));
+  handle("remote-update-routes", (request) =>
+    remoteTransport.updateRoutes(request),
+  );
   handle("remote-reset", () => remoteTransport.resetSavedHubs());
   handleWithEnvironment("gateway-status", () => gateway().status());
   handleWithEnvironment("gateway-cancel-invitation", () =>

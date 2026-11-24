@@ -1938,7 +1938,7 @@ export async function pairInApp(driver, { url, code, name }) {
   );
   await run.ev(
     `async (a) => {
-      const values = { hubName: a.name, url: a.url, code: a.code, name: a.name };
+      const values = { hubName: a.name, address: a.url, code: a.code, name: a.name };
       for (const [key, value] of Object.entries(values)) {
         const input = document.querySelector('input[name="' + key + '"]');
         Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, value);

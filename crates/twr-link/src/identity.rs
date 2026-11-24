@@ -21,6 +21,12 @@ pub struct Certificate {
     pub machine_signature: String,
     pub workspace_signature: String,
 }
+/// The iroh `EndpointId` of the Ed25519 secret key `secret`, as iroh prints one (hex): what the
+/// phone gateway's invitations carry as `iroh` (docs/design/phone-pairing.md).
+pub fn endpoint_id(secret: &[u8; 32]) -> String {
+    iroh::SecretKey::from_bytes(secret).public().to_string()
+}
+
 impl Binding {
     fn bytes(&self) -> Result<Vec<u8>> {
         let mut bytes = b"twr workspace link certificate v1\0".to_vec();

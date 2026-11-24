@@ -130,6 +130,10 @@ jobs:
       - name: JVM unit tests
         working-directory: clients/mobile/android
         run: ./gradlew --no-daemon testDebugUnitTest
+      # The iOS app's vendored Argon2id, built with the host's C compiler and checked against
+      # the pairing vectors Rust generates (docs/design/phone-pairing.md). No Xcode needed.
+      - name: iOS Argon2id against the pairing vectors
+        run: bash clients/mobile/ios/scripts/test-argon2.sh
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:

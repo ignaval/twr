@@ -437,7 +437,7 @@ final class RemoteHubTests: XCTestCase {
           """)
         try await until("return !!document.querySelector('input[name=code]')")
         _ = try await js("""
-          const values={hubName:'Simulator QA',url:hubURL,code,name:'iOS Simulator'};
+          const values={hubName:'Simulator QA',address:hubURL,code,name:'iOS Simulator'};
           for(const [key,value] of Object.entries(values)){
             const input=document.querySelector('input[name="'+key+'"]');
             Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,value);
