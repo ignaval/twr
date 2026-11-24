@@ -51,6 +51,7 @@ pub struct Args {
     /// serves its own key, which phones pin (pinned mode).
     #[arg(long, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
+    /// The private key of --tls-cert's certificate, in PEM.
     #[arg(long, requires = "tls_cert")]
     tls_key: Option<PathBuf>,
     /// Pinned mode: the address invitations offer first, a DNS name or a forwarded
