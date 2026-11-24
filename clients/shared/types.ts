@@ -167,9 +167,19 @@ export interface FilePickRequest {
   title?: string;
   filters?: { name: string; extensions: string[] }[];
 }
+/** A running workspace hub whose engine differs from the app's (`shared/engineHubs`). */
+export interface EngineHub {
+  workspace: string;
+  /** `"version"`: another twr version; `"build"`: the same version, another build. */
+  difference: "version" | "build";
+  version: string;
+  build?: string;
+}
 export interface DesktopAPI {
   sendMessage?(message: import("./offline").DurableMessage): Promise<Json>;
   inboxSources?(): Promise<InboxSource[]>;
+  /** Every running workspace hub whose engine differs from the app's bundled one. */
+  engineHubs?(): Promise<EngineHub[]>;
   secureRead?(key: string): Promise<string | null>;
   secureWrite?(key: string, value: string): Promise<void>;
   secureDelete?(key: string): Promise<void>;

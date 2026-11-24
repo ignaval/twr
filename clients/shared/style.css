@@ -1195,11 +1195,16 @@ kbd {
 }
 /* In a short window the column has no room for both: header, bar, the history's minimum and
    the composer leave a waiting request no height at all, its answers unreachable. A request
-   for this conversation takes the bar's place until it is answered. */
+   for this conversation takes the bar's place until it is answered, and the notices above
+   (shared/StatusStrip.tsx), which never shrink, keep to two lines meanwhile: a notice that
+   wraps in a narrow window took the rest, leaving the request 3 px. They scroll. */
 @media (max-height: 660px) {
   .content-column:has(.conversation-attention:not(:empty))
     .latest-user-message {
     display: none;
+  }
+  .main-shell:has(.conversation-attention:not(:empty)) > .status-strip {
+    max-height: 56px;
   }
 }
 .conversation-scroll {
