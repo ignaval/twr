@@ -200,6 +200,17 @@ impl Paths {
         Ok(by_id)
     }
 
+    /// The paths of the workspace whose id is `id`, while it exists: by id alone, never a
+    /// workspace only named so (once `id`'s workspace is removed, another may be renamed into
+    /// it). For what is kept by id and must reach that workspace or none.
+    pub fn existing_by_id(&self, id: &str) -> anyhow::Result<Paths> {
+        let ws = self.root().workspace(id)?;
+        if !ws.exists() {
+            bail!("there is no workspace {id}");
+        }
+        Ok(ws)
+    }
+
     /// The default workspace's paths ([`Paths::default_id`]); `None` when there is none.
     pub fn default_workspace(&self) -> Option<Paths> {
         let id = self.default_id()?;
@@ -947,6 +958,21 @@ mod tests {
         assert!(root.data_dir.join("keep.bak").exists());
         assert!(root.data_dir.join("accounts").is_dir());
         assert!(root.workspace("a").unwrap().exists());
+    }
+
+    /// A workspace kept by id is reached by id alone: once it is removed and another is
+    /// renamed into its id, the id names none, though `-w` with it names the other.
+    #[test]
+    fn an_id_kept_reaches_its_workspace_or_none() {
+        let (_d, root) = home();
+        create(&root, "a").unwrap();
+        create(&root, "b").unwrap();
+        assert_eq!(root.existing_by_id("a").unwrap().workspace_id(), "a");
+        std::fs::remove_dir_all(root.workspace("a").unwrap().data_dir).unwrap();
+        rename(&root, "b", "a").unwrap();
+        assert_eq!(root.find_workspace("a").unwrap().workspace_id(), "b");
+        assert!(root.existing_by_id("a").is_err());
+        assert_eq!(root.existing_by_id("b").unwrap().workspace_id(), "b");
     }
 
     /// Deleting an aside directory another process deleted first is no error.

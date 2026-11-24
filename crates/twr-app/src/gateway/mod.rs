@@ -221,6 +221,22 @@ pub(crate) fn socket_message(event: &Value) -> Message {
 #[cfg(test)]
 mod socket_tests {
     use super::*;
+    /// A call stamped with the name an older phone app connected by (a renamed workspace's
+    /// name, or its original name, an alias) is for the workspace connected by id; another
+    /// workspace's name or id is not.
+    #[test]
+    fn a_call_by_a_workspace_s_name_is_for_its_id() {
+        let home = tempfile::tempdir().unwrap();
+        let root = twr_core::paths::Paths::with_home(home.path());
+        twr_core::workspaces::create(&root, "a").unwrap();
+        twr_core::workspaces::create(&root, "b").unwrap();
+        twr_core::workspaces::rename(&root, "a", "acme").unwrap();
+        assert!(selects(&root, "acme", "a"));
+        assert!(selects(&root, "a", "a"));
+        assert!(!selects(&root, "b", "a"));
+        assert!(!selects(&root, "nope", "a"));
+        assert!(same_workspace("a", "a"));
+    }
     #[test]
     fn launcher_pairing_flags_cannot_expand_read_only_invitations() {
         let args =
@@ -1100,6 +1116,28 @@ mod socket_tests {
         assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), small);
     }
 }
+/// The workspace kept by id `id` (a phone's connection, a push observer, the inbox's ids),
+/// while it exists: never another workspace only named so (`Paths::existing_by_id`).
+fn by_id(id: &str) -> Result<twr_core::paths::Paths> {
+    twr_core::paths::Paths::from_env_in(Some(twr_core::paths::DEFAULT_WORKSPACE))?
+        .existing_by_id(id)
+}
+
+/// Whether a call stamped with workspace `requested` (a phone's selector: an older app
+/// stamps the name it connected with, a renamed workspace's original name say) is for the
+/// workspace `connected` (an id) the connection serves.
+fn same_workspace(requested: &str, connected: &str) -> bool {
+    requested == connected
+        || twr_core::paths::Paths::from_env_in(Some(twr_core::paths::DEFAULT_WORKSPACE))
+            .is_ok_and(|p| selects(&p, requested, connected))
+}
+
+/// Whether `requested`, a name or an id, selects the workspace with id `connected` in `root`.
+fn selects(root: &twr_core::paths::Paths, requested: &str, connected: &str) -> bool {
+    root.find_workspace(requested)
+        .is_ok_and(|w| w.exists() && w.workspace_id() == connected)
+}
+
 /// A connection to the default workspace's hub as this user (the gateway's own).
 pub async fn owner_client() -> Result<twr_core::client::Client> {
     // A unit test's gateway has a hub of its own or none: never this machine's.
@@ -1574,7 +1612,7 @@ impl Session {
         let names = workspaces.clone();
         let stream = futures::stream::iter(workspaces).map(|workspace| async move {
             let result = tokio::time::timeout(Duration::from_secs(3), async {
-                let paths = twr_core::paths::Paths::from_env_in(Some(&workspace))?;
+                let paths = by_id(&workspace)?;
                 let config = twr_core::config::Config::load_from(&paths)?;
                 read_inbox_workspace(&config.socket_path(&paths), &workspace, &self.device, &self.token).await
             }).await;
@@ -1614,7 +1652,7 @@ impl Session {
                 || call
                     .workspace
                     .as_ref()
-                    .is_none_or(|requested| requested == &workspace),
+                    .is_none_or(|requested| same_workspace(requested, &workspace)),
             "Workspace changed; review the destination before retrying"
         );
         match call.method.as_str() {
@@ -1660,7 +1698,7 @@ impl Session {
                 }
                 let generation = self.bridge_generation.load(Ordering::SeqCst) + 1;
                 if self.device.scopes.iter().any(|s| s == "operate") {
-                    let paths = twr_core::paths::Paths::from_env_in(Some(workspace))?;
+                    let paths = by_id(workspace)?;
                     let config = twr_core::config::Config::load_from(&paths)?;
                     crate::runtime::ensure_hub(&paths, &config.socket_path(&paths), &server.binary)
                         .await?;
@@ -2160,7 +2198,7 @@ impl Session {
     /// file, `[speech]`'s choices of what is read and attention announcements (its engine
     /// settings are this machine's and play no part: the phone speaks). It ends once the device is revoked or loses `read`.
     fn voice_start(&self, server: &Server, workspace: &str) -> Result<remote::voice::Start> {
-        let paths = twr_core::paths::Paths::from_env_in(Some(workspace))?;
+        let paths = by_id(workspace)?;
         let root = paths.root();
         let mut config = twr_core::config::Config::load_from(&root)
             .map(|c| c.speech)
@@ -3281,13 +3319,15 @@ async fn start_observer(server: Shared, workspace: String) {
     });
 }
 async fn observe_push(server: &Server, workspace: &str) -> Result<()> {
+    // By id alone: a stored id whose workspace was removed reaches none, never one renamed
+    // into it since.
     use twr_core::{
         client::Client,
         client_state::{ClientFold, FOLD},
         config::Config,
         notify::{still_due, Held, Policy},
     };
-    let paths = twr_core::paths::Paths::from_env_in(Some(workspace))?;
+    let paths = by_id(workspace)?;
     let config = Config::load_from(&paths)?;
     let mut client = Client::connect(&config.socket_path(&paths)).await?;
     let hello = client.hello(json!({"client":"mobile-notify"})).await?;
