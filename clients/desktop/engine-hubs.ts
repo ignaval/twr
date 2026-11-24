@@ -1,6 +1,7 @@
 import type { EngineHub } from "../shared/types";
 import { BUILD_ID, engineDifference, type Engine } from "../shared/engineHubs";
 import { workspaceSchema } from "./validation";
+import { workspaceId, workspaceLabel } from "../shared/workspaceTree";
 
 /**
  * Every running workspace hub in `workspaces` (a `twr ws list --json` listing) whose engine
@@ -16,11 +17,14 @@ export function engineHubs(workspaces: unknown, app: Engine): EngineHub[] {
   const hubs: EngineHub[] = [];
   for (const row of workspaces) {
     if (!row || typeof row !== "object" || row.hub !== "running") continue;
-    const workspace = workspaceSchema.parse(row.name);
+    // Keyed by id, as the app's workspace is; named as shown (a renamed one's new name).
+    const workspace = workspaceSchema.parse(workspaceId(row));
+    const name = workspaceSchema.safeParse(workspaceLabel(row));
     const difference = engineDifference(app, row);
     if (!difference) continue;
     hubs.push({
       workspace,
+      ...(name.success && name.data !== workspace ? { name: name.data } : {}),
       difference,
       version: String(row.version),
       ...(typeof row.build === "string" && BUILD_ID.test(row.build)

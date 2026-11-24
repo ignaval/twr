@@ -74,7 +74,7 @@ export function engineNotice(
     const what = others.every((hub) => hub.difference === "build")
       ? "a different build of twr"
       : "a different twr version";
-    const names = listNames(others.map((hub) => hub.workspace));
+    const names = listNames(others.map((hub) => hub.name || hub.workspace));
     parts.push(
       others.length === 1
         ? `The hub of workspace ${names} also runs ${what} than the app bundles.`

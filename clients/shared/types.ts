@@ -172,7 +172,10 @@ export interface FilePickRequest {
 }
 /** A running workspace hub whose engine differs from the app's (`shared/engineHubs`). */
 export interface EngineHub {
+  /** The workspace's id, which keys it (`twr ws list --json`'s `id`). */
   workspace: string;
+  /** Its name as shown, when it is not its id (a renamed workspace). */
+  name?: string;
   /** `"version"`: another twr version; `"build"`: the same version, another build. */
   difference: "version" | "build";
   version: string;

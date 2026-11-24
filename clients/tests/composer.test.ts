@@ -389,7 +389,7 @@ describe("a workspace the app holds the id of", () => {
   it("is connected by that id alone: the bootstrap's, and a listed one's", async () => {
     const calls: [string, { byId?: boolean } | undefined][] = [];
     const app = await mount({
-      connect: async (workspace, options) => {
+      connect: async (workspace: string, options?: { byId?: boolean }) => {
         calls.push([workspace, options]);
         return { workspace };
       },
@@ -414,7 +414,7 @@ describe("a workspace given by name", () => {
       // The desktop app started with `TWR_WORKSPACE=acme`, `client-x`'s new name.
       boot: { workspace: "acme", typed: true },
       noLive: true,
-      connect: async (workspace, options) => {
+      connect: async (workspace: string, options?: { byId?: boolean }) => {
         calls.push([workspace, options]);
         if (calls.length === 1) throw new Error("config.toml: invalid TOML");
         return { workspace };
