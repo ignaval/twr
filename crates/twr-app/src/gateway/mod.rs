@@ -1628,6 +1628,12 @@ impl Session {
                 if let Some(error) = twr_core::paths::workspace_name_error(workspace) {
                     anyhow::bail!(error);
                 }
+                // By its id, whichever of its names the phone used: what its hub, the inbox
+                // sources and the push observers name it by (a rename leaves it).
+                let id = twr_core::paths::Paths::from_env_in(Some(workspace))?
+                    .workspace_id()
+                    .to_string();
+                let workspace = id.as_str();
                 let existing = {
                     let connection = self.connection.read().await;
                     (connection.workspace == workspace)

@@ -222,11 +222,14 @@ export function notices(items: AttentionSummaryItem[]): Notice[] {
   const wanted = items.filter(
     (item) => NOTIFIED_REASONS.has(item.reason) || item.card !== undefined,
   );
+  // A workspace is named as shown (a renamed one by its name), and targeted by its id.
+  const shown = (id: string) =>
+    wanted.find((item) => item.workspace === id)?.workspaceName || id;
   if (wanted.length > BURST_MAX) {
     const workspaces = [...new Set(wanted.map((item) => item.workspace))];
     const counts = workspaces.map(
-      (name) =>
-        `${wanted.filter((item) => item.workspace === name).length} in ${plain(name, 40)}`,
+      (id) =>
+        `${wanted.filter((item) => item.workspace === id).length} in ${plain(shown(id), 40)}`,
     );
     return [
       {
@@ -234,14 +237,14 @@ export function notices(items: AttentionSummaryItem[]): Notice[] {
         body:
           workspaces.length > 1
             ? list(counts)
-            : `In ${plain(workspaces[0], 40)}`,
+            : `In ${plain(shown(workspaces[0]), 40)}`,
         keys: wanted.map(itemKey),
         target: workspaces.length === 1 ? { workspace: workspaces[0] } : {},
       },
     ];
   }
   return wanted.map((item) => ({
-    title: `${plain(item.title, 80)} · ${plain(item.workspace, 40)}`,
+    title: `${plain(item.title, 80)} · ${plain(item.workspaceName || item.workspace, 40)}`,
     body: kind(item),
     keys: [itemKey(item)],
     target: { workspace: item.workspace, thread: item.thread },

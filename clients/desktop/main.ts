@@ -46,6 +46,7 @@ import {
   workspaceSchema,
 } from "./validation";
 import type { DesktopAppearance, DesktopEvent } from "../shared/types";
+import { startWorkspace } from "../shared/workspaceTree";
 import { readOmarchyTheme, watchOmarchyTheme } from "./omarchy-theme";
 import { ENGINE_BINARIES, cleanupEngines, stageEngines } from "./engines";
 import { parseLoginEnvironment, runLoginShell } from "./login-env";
@@ -99,6 +100,10 @@ if (app.isPackaged && process.env.TWR_DESKTOP_TEST_AUTOMATION !== "1") {
 let window: BrowserWindow;
 let bridge: Bridge | undefined;
 let workspace = process.env.TWR_WORKSPACE || "default";
+// The workspace saved from the last run, and whether the one to open at start was settled
+// (`bootstrap`, from `TWR_WORKSPACE`, that one or the default workspace).
+let savedWorkspaceName: string | undefined;
+let startSettled = !!process.env.TWR_WORKSPACE;
 let binaries: { twr: string; bridge: string; gateway: string };
 let quitting = false;
 let quitRequested = false;
@@ -402,13 +407,18 @@ async function connectWorkspace(next: string, generation: number) {
       current.close();
       throw new Error("This hub connection was closed");
     }
-    workspace = next;
+    // By the id its hub serves (`desktop.paths`), whichever of its names was asked for: what
+    // the app keys its drafts, outbox and terminals by.
+    workspace =
+      typeof paths?.workspace === "string" && paths.workspace
+        ? paths.workspace
+        : next;
     workspaceReady = true;
     emit({ type: "connection", connected: true });
     void current
       .call("notify.looking", { looking: window?.isFocused() || false })
       .catch(() => {});
-    saveDesktopSettings({ workspace: next });
+    saveDesktopSettings({ workspace });
     hubVersion = hubInfo.version;
     return {
       ...paths,
@@ -725,7 +735,32 @@ function register() {
           throw error;
         })),
   );
-  handle("bootstrap", () => ({
+  handle("bootstrap", async () => {
+    // Without `TWR_WORKSPACE`, the one shown last while it is still there, else the default
+    // workspace as `twr` resolves it (which need not be `default`, nor exist under that id).
+    if (!startSettled) {
+      startSettled = true;
+      let listing: unknown[] | undefined;
+      try {
+        await envReady;
+        const value = JSON.parse(
+          (
+            await exec(binaries.twr, ["ws", "list", "--json"], {
+              env: env(),
+              timeout: 5000,
+            })
+          ).stdout,
+        );
+        if (Array.isArray(value)) listing = value;
+      } catch {}
+      const chosen = workspaceSchema.safeParse(
+        startWorkspace(undefined, savedWorkspaceName, listing as any),
+      );
+      if (chosen.success) workspace = chosen.data;
+    }
+    return bootstrapInfo();
+  });
+  const bootstrapInfo = () => ({
     workspace,
     hostId: "local",
     platform: process.platform,
@@ -738,7 +773,7 @@ function register() {
       workspace: t.workspace,
       exited: t.exited,
     })),
-  }));
+  });
   handle("connect", connect);
   handle(
     "upload-request",
@@ -1372,7 +1407,10 @@ else {
         const savedWorkspace = workspaceSchema.safeParse(
           desktopSettings.workspace,
         );
-        if (savedWorkspace.success) workspace = savedWorkspace.data;
+        if (savedWorkspace.success) {
+          workspace = savedWorkspace.data;
+          savedWorkspaceName = savedWorkspace.data;
+        }
       }
       const savedAppearance = appearanceSchema.safeParse(
         desktopSettings.appearance,

@@ -128,6 +128,7 @@ export const attentionSummarySchema = z
         z
           .object({
             workspace: z.string().min(1).max(64),
+            workspaceName: label(64).optional(),
             thread: z.string().max(200),
             title: label(200),
             summary: label(300),

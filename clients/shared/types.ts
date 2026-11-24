@@ -155,7 +155,10 @@ export interface InboxSource {
   updatedAt?: number;
   hubId: string;
   hubName: string;
+  /** The workspace's id, which its hub reports as `workspace` (a rename leaves it). */
   workspace: string;
+  /** Its name as shown, when known (`twr ws list`); its id otherwise. */
+  workspaceName?: string;
   attention: Attention[];
   threads: Thread[];
   cached?: boolean;
@@ -254,7 +257,10 @@ export interface DesktopAPI {
 }
 /** One request waiting on the user, in a summary for the host app. */
 export interface AttentionSummaryItem {
+  /** Its workspace's id. */
   workspace: string;
+  /** Its workspace's name as shown, when it is not its id (a renamed workspace). */
+  workspaceName?: string;
   thread: string;
   /** The thread's name. */
   title: string;

@@ -505,6 +505,10 @@ export class RemoteHost {
       this.nativeConnected = true;
     }
     const result = await this.request("connect", { workspace }, 75000);
+    // By the id the gateway connected it by (what its hub and the push name it by), whichever
+    // of its names was asked for.
+    if (typeof result?.workspace === "string" && result.workspace)
+      workspace = result.workspace;
     this.workspace = workspace;
     this.confirmedWorkspace = true;
     this.bridgeReady = true;
