@@ -1039,12 +1039,6 @@ impl Inner {
             .filter(|n| twr_core::paths::workspace_name_error(n).is_none())
     }
 
-    /// `hub.info`'s `instance`: the workspace's name once it was renamed, read as it is asked,
-    /// else [`HubOptions::instance_name`].
-    fn instance(&self) -> String {
-        self.renamed().unwrap_or_else(|| self.instance_name.clone())
-    }
-
     fn core(&self) -> MutexGuard<'_, Core> {
         self.core.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -3169,6 +3163,12 @@ impl Hub {
         let suggest_unavailable = self.suggest_unavailable();
         // (Read once, on the first call: not under the core lock.)
         let build = twr_core::build_id();
+        // Its name as it is now (a file read): not under the core lock either.
+        let renamed = self.inner.renamed();
+        let instance = renamed
+            .clone()
+            .unwrap_or_else(|| self.inner.instance_name.clone());
+        let workspace_name = renamed.unwrap_or_else(|| self.workspace().to_string());
         let core = self.inner.core();
         json!({
             "boxes": boxes,
@@ -3187,9 +3187,9 @@ impl Hub {
             "listening": self.inner.listening.load(std::sync::atomic::Ordering::Relaxed),
             "pid": std::process::id(),
             "db": self.inner.db_path,
-            "instance": self.inner.instance(),
+            "instance": instance,
             "workspace": self.workspace(),
-            "workspace_name": self.workspace_name(),
+            "workspace_name": workspace_name,
             "started_at": self.inner.started_at,
             "threads": core.registry.len(),
             "control_head": core.gseq,
