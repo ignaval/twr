@@ -8425,8 +8425,9 @@ async fn ws_status(socket: &Path, name: &str, detail: bool) -> Value {
             .is_some_and(|i| i.starts_with("user:"));
         let threads = c.call("thread.list", Value::Null).await?;
         let items = c.call("attention.list", json!({ "all": true })).await?;
-        // The engine it runs: the desktop app compares it with its own after an upgrade.
-        let info = c.call("hub.info", json!({})).await?;
+        // The engine it runs: the desktop app compares it with its own after an upgrade. A
+        // hub that refuses it is still listed, without them.
+        let info = c.call("hub.info", json!({})).await.unwrap_or(Value::Null);
         anyhow::Ok(Some((threads, items, user, info)))
     })
     .await;
@@ -9625,7 +9626,8 @@ mod tests {
 
     /// `twr ws list --detail` prints a hub's lists only to a process the hub took for the user,
     /// as the desktop's read-only companion reads them: an agent's gets the counts it always
-    /// got and why there is no detail. It reads each hub once, and only the two lists.
+    /// got and why there is no detail. It reads each hub once: the two lists, and `hub.info` for
+    /// the engine it runs (its `version` and `build`, on every running row).
     #[tokio::test]
     async fn ws_detail_needs_the_hub_to_take_this_process_for_the_user() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -9652,6 +9654,7 @@ mod tests {
                             json!([{"attn_id": "a1", "reason": "question", "revision": 3}])
                         }
                         "thread.list" => json!([{"id": "t1", "name": "api", "status": "idle"}]),
+                        "hub.info" => json!({"version": "0.6.0", "build": "85ab7b43eecbe2ec"}),
                         _ => panic!("ws list called {method}"),
                     };
                     methods.push(method);
@@ -9670,8 +9673,14 @@ mod tests {
                 assert_eq!(calls, ["hello"]);
                 continue;
             }
-            assert_eq!(calls, ["hello", "thread.list", "attention.list"]);
+            assert_eq!(
+                calls,
+                ["hello", "thread.list", "attention.list", "hub.info"]
+            );
             assert_eq!(row["hub"], "running");
+            // The engine it runs, for the desktop app's notice.
+            assert_eq!(row["version"], "0.6.0");
+            assert_eq!(row["build"], "85ab7b43eecbe2ec");
             assert_eq!(row["threads"], 1);
             assert_eq!(row["waiting"], 1);
             if detail {
