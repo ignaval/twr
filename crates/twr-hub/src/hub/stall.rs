@@ -49,6 +49,12 @@
 //! gets neither a stalled item nor a hung-turn card, for at most
 //! [`COMPACTING_HOLD_SECS`] from the compaction's start ([`compaction_holds`]); past that its
 //! silence counts as any other.
+//! While the hub's machine has no internet connection (`hub::net`), a thread on its own box
+//! gets no hung-turn card (interrupting it would not help), and its stall is raised with
+//! `ext.twr.offline = {since}` and the cause first ("No internet connection since 14:02: no
+//! activity for 10 min; ..."), whether or not a prompt waits behind its turn; such stalls close
+//! when the connection is back. Once it is back, a thread's silence counts from then: no stall
+//! before `stall_after`, no hung-turn card before `hung_after`, since its return.
 //! Inventory heartbeats renew task liveness without resetting stalls or repeatedly resolving
 //! and raising them. A thread has at most one open stalled item. The check runs on a hub tick
 //! every `min(30 s, stall_after / 4)`; `stall_after_secs = 0` turns it off.
@@ -277,6 +283,19 @@ fn in_flight_clause(work: &Work) -> String {
     }
 }
 
+/// The summary of a stall (`plain`, "No activity for 10 min; ...") of a thread whose box has
+/// had no internet connection since `since` (`hub::net`): the cause first.
+fn offline_stall_summary(plain: &str, since: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let plain = plain
+        .strip_prefix("No ")
+        .map_or_else(|| plain.to_string(), |r| format!("no {r}"));
+    format!(
+        "No internet connection since {}: {plain}. Its runtime cannot reach its model API until \
+         the connection is back.",
+        super::net::clock(since, now)
+    )
+}
+
 /// The tick period for `after`.
 pub(super) fn tick_period(after: Duration) -> Duration {
     (after / 4).clamp(TICK_MIN, TICK_MAX)
@@ -297,7 +316,9 @@ impl Core {
         };
         let now = Utc::now();
         let mut hung: Vec<(String, Hung, Option<String>)> = Vec::new();
-        let mut due: Vec<(String, Option<u64>, String)> = Vec::new();
+        // (thread, turn, summary, since when its box has had no internet connection)
+        type Due = (String, Option<u64>, String, Option<DateTime<Utc>>);
+        let mut due: Vec<Due> = Vec::new();
         for v in self.registry.list() {
             if v.attached.is_some()
                 || v.is_blocked()
@@ -306,7 +327,17 @@ impl Core {
             {
                 continue;
             }
-            if let Some(h) = self.hung_turn(v, now, hung_chrono, after_chrono)? {
+            // The hub's machine has no internet connection (`hub::net`): the runtime cannot
+            // reach its model API, so its silence is no hung turn, and its stall says why.
+            let offline = self.offline_for(v);
+            // Back since then: its silence counts from the connection's return.
+            let back = self.back_for(v).map(|b| now - b);
+            let hung_held = offline.is_some() || back.is_some_and(|b| b < hung_chrono);
+            if let Some(h) = (!hung_held)
+                .then(|| self.hung_turn(v, now, hung_chrono, after_chrono))
+                .transpose()?
+                .flatten()
+            {
                 let plain = self
                     .stalled
                     .get(&v.id)
@@ -318,15 +349,16 @@ impl Core {
             // A prompt waits behind its open turn: the hung-turn check decides, within
             // `hung_after` of its arrival.
             // (Not a turn being interrupted or taken back: no hung-turn card comes for it.)
-            let behind = v
-                .current_turn
-                .is_some_and(|t| self.hung.answered.get(&v.id) != Some(&t))
+            let behind = offline.is_none()
+                && v.current_turn
+                    .is_some_and(|t| self.hung.answered.get(&v.id) != Some(&t))
                 && !v.current_turn_interrupted
                 && !v.current_turn_withdrawn
                 && self.store.pending_count(&v.id)? > 0;
             if behind
                 || self.stalled.contains_key(&v.id)
                 || !v.last_activity.is_some_and(|t| now - t >= after_chrono)
+                || (offline.is_none() && back.is_some_and(|b| b < after_chrono))
                 // A job has its own timeout: only the runtime's own work stalls.
                 || !v.runtime_work()
                 // Its turn or its runtime's watcher waits on a job of its own.
@@ -343,7 +375,11 @@ impl Core {
             } else {
                 format!("{} from its background tasks", stall_summary(after))
             };
-            due.push((v.id.clone(), v.current_turn, summary));
+            let summary = match offline {
+                Some(since) => offline_stall_summary(&summary, since, now),
+                None => summary,
+            };
+            due.push((v.id.clone(), v.current_turn, summary, offline));
         }
         // A hung-turn card whose turn nothing waits behind any longer (the message was taken
         // back, the queue dropped): closed, saying so; its turn's work is as it was.
@@ -401,7 +437,7 @@ impl Core {
             );
             self.append_batch(hub, batch)?;
         }
-        for (thread, turn, summary) in due {
+        for (thread, turn, summary, offline) in due {
             self.append(
                 hub,
                 &thread,
@@ -412,6 +448,9 @@ impl Core {
                     reason: AttentionReason::Stalled,
                     summary,
                     options: vec!["dismiss".into()],
+                    ext: offline.and_then(|since| {
+                        twr_ext_map(json!({ OFFLINE_KEY: { "since": since.to_rfc3339() } }))
+                    }),
                     ..Default::default()
                 }),
             )?;

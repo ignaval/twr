@@ -236,6 +236,8 @@ impl Core {
             // Memory only: the hub's environment.
             account_native_dir: _,
             account_native_var: _,
+            // Memory only: the hub's internet connection (`hub::net`).
+            net: _,
         } = self;
         let snap = FoldSnapshot {
             registry,
@@ -789,6 +791,7 @@ pub(super) mod tests {
                 NotifyEvent::Error,
                 NotifyEvent::Review,
                 NotifyEvent::Hung,
+                NotifyEvent::Offline,
                 NotifyEvent::Stalled,
                 NotifyEvent::Report,
                 NotifyEvent::Reply,

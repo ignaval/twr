@@ -3503,6 +3503,12 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
         // The accounts' logins too (`account.status`), on the same terms.
         opts.account_probe = Some(twr_hub::hub::own_account_probe());
     }
+    // Whether the hub's machine reaches the internet (`hub::net`): never under a test's
+    // throwaway hub, whose machine may have no connection at all.
+    if !trusted {
+        let targets = twr_hub::hub::probe_targets(&opts.config.hub, |v| std::env::var(v).ok());
+        opts.net_probe = Some(twr_hub::hub::own_net_probe(targets));
+    }
     // A test's throwaway hub may be told what it found instead ([`TEST_AGENTS_ENV`]).
     if let Some(agents) = test_agents(trusted) {
         opts.agent_probe = Some(std::sync::Arc::new(move || {

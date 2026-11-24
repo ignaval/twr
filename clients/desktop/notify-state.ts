@@ -196,13 +196,15 @@ export const kind = (item: Pick<AttentionSummaryItem, "reason" | "card">) =>
       ? "Asks you to choose a loop's settings"
       : item.card === "loop_stuck"
         ? "Has a loop that is stuck"
-        : item.card === "confirm"
-          ? "Asks you to confirm what the orchestrator proposed"
-          : item.reason === "permission"
-            ? "Asks for permission"
-            : item.reason === "question"
-              ? "Has a question for you"
-              : "Needs you";
+        : item.card === "offline"
+          ? "Has no internet connection"
+          : item.card === "confirm"
+            ? "Asks you to confirm what the orchestrator proposed"
+            : item.reason === "permission"
+              ? "Asks for permission"
+              : item.reason === "question"
+                ? "Has a question for you"
+                : "Needs you";
 
 const list = (words: string[]) =>
   words.length <= 1

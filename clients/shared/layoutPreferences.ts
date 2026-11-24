@@ -127,3 +127,63 @@ export function textSizeChoices(
     ? [...choices, custom]
     : [...choices.slice(0, at), custom, ...choices.slice(at)];
 }
+
+export type TextSizeStep = "larger" | "smaller" | "reset";
+
+/** Ctrl (⌘ on Apple) with + or = (the + key without Shift), - or 0: a step of the text
+ * size shortcuts, or undefined for any other key. */
+export function textSizeShortcut(
+  event: Pick<KeyboardEvent, "key" | "ctrlKey" | "metaKey" | "altKey">,
+  mac: boolean,
+): TextSizeStep | undefined {
+  if (event.altKey || !(mac ? event.metaKey : event.ctrlKey)) return;
+  if (event.key === "+" || event.key === "=") return "larger";
+  if (event.key === "-" || event.key === "_") return "smaller";
+  if (event.key === "0") return "reset";
+}
+
+/** One step of the shortcuts: interface and code text each move a pixel within the
+ * bounds validateLayout keeps, so their difference holds until one reaches its end;
+ * reset returns both to the defaults. */
+export function steppedLayout(
+  prefs: LayoutPreferences,
+  step: TextSizeStep,
+): Pick<LayoutPreferences, "textSize" | "codeSize"> {
+  if (step === "reset")
+    return {
+      textSize: defaultLayout.textSize,
+      codeSize: defaultLayout.codeSize,
+    };
+  const by = step === "larger" ? 1 : -1;
+  const next = validateLayout({
+    ...prefs,
+    textSize: prefs.textSize + by,
+    codeSize: prefs.codeSize + by,
+  });
+  return { textSize: next.textSize, codeSize: next.codeSize };
+}
+
+/** On the desktop one key press can reach both the window's keydown handler and the
+ * View menu's accelerator, depending on the platform; a step from the other source
+ * within this window of the last one is that same press, not a second. */
+const SAME_PRESS_MS = 250;
+export function textSizeStepGate(now: () => number = Date.now) {
+  let last: { at: number; step: TextSizeStep; source: string } | undefined;
+  return (step: TextSizeStep, source: "keyboard" | "menu") => {
+    const at = now();
+    const duplicate =
+      last !== undefined &&
+      last.source !== source &&
+      last.step === step &&
+      at - last.at < SAME_PRESS_MS;
+    // A duplicate leaves the press it repeats as the one to compare with, so a held key
+    // that both sources see keeps stepping once per repeat.
+    if (!duplicate) last = { at, step, source };
+    return !duplicate;
+  };
+}
+const stepGate = textSizeStepGate();
+
+export function stepTextSize(step: TextSizeStep, source: "keyboard" | "menu") {
+  if (stepGate(step, source)) updateLayout(steppedLayout(current, step));
+}

@@ -371,19 +371,23 @@ export function attentionAnnouncement(item: {
   /** A loop's setup card (its reason is `review`) or a stuck loop's item (`error`). */
   loop_setup?: boolean;
   loop_stuck?: boolean;
+  /** Raised because the hub's machine has no internet connection. */
+  offline?: boolean;
 }) {
   const who = item.threadName || "twr";
   const kind = item.loop_setup
     ? "asks you to choose a loop's settings"
     : item.loop_stuck
       ? "has a loop that is stuck"
-      : item.reason === "permission"
-        ? "asks for permission"
-        : item.reason === "question"
-          ? "has a question"
-          : item.reason === "review"
-            ? "finished work to review"
-            : "needs you";
+      : item.offline
+        ? "has no internet connection"
+        : item.reason === "permission"
+          ? "asks for permission"
+          : item.reason === "question"
+            ? "has a question"
+            : item.reason === "review"
+              ? "finished work to review"
+              : "needs you";
   // A setup card's first line says which loop it is for; its rows (models, a held task)
   // are for the card, not for a sentence read aloud.
   const text = item.loop_setup

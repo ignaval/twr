@@ -135,7 +135,13 @@ export const attentionSummarySchema = z
             revision: z.number().int().min(0),
             reason: z.string().max(40),
             card: z
-              .enum(["confirm", "delete", "loop_setup", "loop_stuck"])
+              .enum([
+                "confirm",
+                "delete",
+                "loop_setup",
+                "loop_stuck",
+                "offline",
+              ])
               .optional(),
             incomplete: z.boolean().optional(),
           })
