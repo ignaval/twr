@@ -709,29 +709,18 @@ impl Service {
     async fn workspace(&self, name: &str) -> Result<Arc<Workspace>> {
         let paths = self.paths.workspace(name)?;
         ensure!(paths.exists(), "workspace does not exist");
-        let mut workspaces = self.workspaces.lock().await;
         let file = paths.data_dir.join("link-identity");
-        let bytes = match crate::state::read_private(&file, 64) {
-            Ok(b) => b,
-            Err(e)
-                if e.downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                let b = crate::random::<64>()?;
-                // Under the registry lock, which a removal holds from its checks through its
-                // move: checked again there, so it is never written into a workspace removed
-                // since it was looked at (`default`'s directory stays when it is removed).
-                let (paths, file) = (paths.clone(), file.clone());
-                tokio::task::spawn_blocking(move || {
-                    let _registry = twr_core::workspaces::RegistryLock::take(&paths)?;
-                    ensure!(paths.exists(), "workspace does not exist");
-                    crate::state::atomic_write_existing(&file, &b)
-                })
-                .await??;
-                b.to_vec()
-            }
-            Err(e) => return Err(e),
-        };
+        // A workspace without an identity yet gets one first, before the cache is locked: the
+        // registry lock it takes for that may be held a while (`twr ws rm` asking its
+        // question), and no other workspace's call, nor the service's loop, waits for it.
+        if read_identity(&file)?.is_none() {
+            let (paths, file) = (paths.clone(), file.clone());
+            tokio::task::spawn_blocking(move || make_identity(&paths, &file)).await??;
+        }
+        let mut workspaces = self.workspaces.lock().await;
+        // Read again under the cache's lock: the identity as it is now (another call may have
+        // made it meanwhile).
+        let bytes = read_identity(&file)?.context("workspace does not exist")?;
         ensure!(bytes.len() == 64, "invalid workspace link identity");
         let key = HubKey::load_or_create(&paths.data_dir.join("box-key"))?;
         for w in workspaces.values() {
@@ -2424,6 +2413,39 @@ impl Service {
     }
 }
 
+/// A workspace's `link-identity`, as it is: `None` while it has none.
+fn read_identity(file: &std::path::Path) -> Result<Option<Vec<u8>>> {
+    match crate::state::read_private(file, 64) {
+        Ok(b) => Ok(Some(b)),
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// How long making a workspace's identity waits for the registry lock before it fails, for its
+/// caller to try again later.
+const IDENTITY_LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// Makes workspace `paths`'s `link-identity` (`file`) when it has none, under the registry lock,
+/// which a removal holds from its checks through its move: checked again there, so it is never
+/// written into a workspace removed since it was looked at (`default`'s directory stays when it
+/// is removed), and never twice by two callers. Waits for the lock at most
+/// [`IDENTITY_LOCK_WAIT`].
+fn make_identity(paths: &Paths, file: &std::path::Path) -> Result<()> {
+    let _registry = twr_core::workspaces::RegistryLock::take_within(paths, IDENTITY_LOCK_WAIT)?;
+    ensure!(paths.exists(), "workspace does not exist");
+    if read_identity(file)?.is_some() {
+        return Ok(());
+    }
+    let b = crate::random::<64>()?;
+    crate::state::atomic_write_existing(file, &b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2571,6 +2593,43 @@ mod tests {
             )?;
         }
         Ok((c, reply))
+    }
+    /// A workspace's first runner use, while a `twr ws rm` holds the registry lock at its
+    /// question, holds up nothing else: the service's other calls and its loop's cache sweep
+    /// go on. The call itself waits a bounded time: it gets its identity once the lock goes,
+    /// and fails, for its caller to try again, while it stays held.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_registry_lock_holds_up_only_the_call_that_needs_it() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let service = fixture(dir.path()).await?;
+        twr_core::workspaces::create(&service.paths, "b")?;
+        twr_core::workspaces::create(&service.paths, "c")?;
+        let held = twr_core::workspaces::RegistryLock::take(&service.paths)?;
+        let waiting = {
+            let s = service.clone();
+            tokio::spawn(async move { s.workspace("b").await.map(|_| ()) })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::timeout(Duration::from_secs(2), service.retire_workspaces())
+            .await
+            .context("the cache sweep waited for the registry lock")?;
+        drop(held);
+        waiting.await??;
+        let b = service.paths.workspace("b")?;
+        assert!(b.data_dir.join("link-identity").exists());
+        // Held past the bounded wait: the call fails, saying why, and writes nothing.
+        let held = twr_core::workspaces::RegistryLock::take(&service.paths)?;
+        let e = service
+            .workspace("c")
+            .await
+            .err()
+            .context("it did not wait")?;
+        assert!(format!("{e:#}").contains("in progress"), "{e:#}");
+        let c = service.paths.workspace("c")?;
+        assert!(!c.data_dir.join("link-identity").exists());
+        drop(held);
+        service.workspace("c").await?;
+        Ok(())
     }
     #[tokio::test]
     async fn publication_failure_retires_the_private_window_and_endpoint() -> Result<()> {

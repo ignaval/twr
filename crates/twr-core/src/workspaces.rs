@@ -304,6 +304,41 @@ impl RegistryLock {
     }
 }
 
+impl RegistryLock {
+    /// [`RegistryLock::take`] for long-lived code (the runner service): waits at most `wait`
+    /// for another holder (`twr ws rm` may hold it while its question waits, for hours), then
+    /// fails saying a workspace change is in progress, for its caller to try again later. Never
+    /// calls the wait hook.
+    pub fn take_within(root: &Paths, wait: std::time::Duration) -> anyhow::Result<RegistryLock> {
+        let root = root.root();
+        crate::paths::ensure_private_dir(&root.data_dir)?;
+        let path = root.data_dir.join(REGISTRY_LOCK);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(RegistryLock { file }),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(e).with_context(|| format!("locking {}", path.display()))
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "another change to the workspaces is in progress (a `twr ws` command, maybe \
+                     asking a question): try again once it is done"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
 type WaitHook = Box<dyn Fn() + Send + Sync>;
 
 /// What this process does when a change to the workspaces waits for another's
