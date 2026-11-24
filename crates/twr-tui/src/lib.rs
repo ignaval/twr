@@ -2019,6 +2019,30 @@ fn accounts_failure(e: &anyhow::Error) -> Value {
     }
 }
 
+/// A removal the workspace menu confirmed of the workspace shown ([`Shared::pending_removal`]):
+/// it runs once the open `open` (the switch away from it) is done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingRemoval {
+    open: u64,
+    id: String,
+    stop_hub: bool,
+    generation: Option<String>,
+}
+
+/// What a session's end does with the removal that waits in `pending` ([`PendingRemoval`]):
+/// it is let go whatever the end, and runs (returned) only when that end is the switch its
+/// open made (`opened`, to `to`) away from the workspace it removes. A reconnect, a quit or
+/// another open's switch drops it, so a confirmation never runs later, on a workspace used
+/// since.
+fn due_removal(
+    pending: &mut Option<PendingRemoval>,
+    opened: Option<u64>,
+    to: &str,
+) -> Option<PendingRemoval> {
+    let p = pending.take()?;
+    (opened == Some(p.open) && p.id != to).then_some(p)
+}
+
 /// Deletes workspace `id` off the loop ([`Workspaces::remove`]); what it did, and the
 /// workspaces as listed after, go to `done`.
 fn spawn_removal(
@@ -2639,9 +2663,11 @@ enum End {
     /// The user quit.
     Quit,
     /// The user switched to workspace `to`, whose hub `next` is connected: the view of the
-    /// workspace left, the tabs and whether the TUI has the mouse go with it.
+    /// workspace left, the tabs and whether the TUI has the mouse go with it. `opened`: the
+    /// open that connected it ([`Shared::opens`]).
     Switch {
         to: String,
+        opened: u64,
         next: Box<Session>,
         view: Box<workspace::SavedView>,
         tabs: Vec<workspace::Tab>,
@@ -2745,9 +2771,11 @@ struct Shared {
     late_tx: mpsc::UnboundedSender<StatusMsg>,
     late_rx: mpsc::UnboundedReceiver<StatusMsg>,
     /// A workspace being deleted from the workspace menu ([`Action::WsRemove`]): the one the
-    /// TUI showed, deleted once the switch away from it is done; whether to stop its hub, and
-    /// the plan's generation.
-    pending_removal: Option<(String, bool, Option<String>)>,
+    /// TUI showed, deleted once the switch away from it is done ([`due_removal`]).
+    pending_removal: Option<PendingRemoval>,
+    /// The opens of a workspace's hub started so far ([`Action::Workspace`],
+    /// [`Action::WsRemove`]): each one's number, so a removal waits for its own.
+    opens: u64,
     /// What to say on the first view ([`Switching::note`]).
     note: Option<String>,
     /// What a workspace change from the menu did, and the workspaces as listed after it.
@@ -2970,6 +2998,7 @@ pub async fn run_with(
         late_tx,
         late_rx,
         pending_removal: None,
+        opens: 0,
         note: None,
         ws_done_tx,
         ws_done_rx,
@@ -3078,6 +3107,7 @@ where
         match end {
             Ok(End::Switch {
                 to,
+                opened,
                 next,
                 view,
                 tabs,
@@ -3092,13 +3122,12 @@ where
                 // A workspace no longer listed (deleted, here or elsewhere) leaves no view: one
                 // made later with its id starts afresh.
                 saved.retain(|id, _| tabs.iter().any(|t| &t.name == id));
-                // The workspace left, to delete now that it is not shown.
-                if let Some((id, stop_hub, generation)) = ctx.pending_removal.take() {
-                    if id != to {
-                        saved.remove(&id);
-                        if let Some(ws) = ctx.workspaces.clone() {
-                            spawn_removal(ws, id, stop_hub, generation, ctx.ws_done_tx.clone());
-                        }
+                // The workspace left, to delete now that it is not shown (only after the switch
+                // its removal waited for).
+                if let Some(p) = due_removal(&mut ctx.pending_removal, Some(opened), &to) {
+                    saved.remove(&p.id);
+                    if let Some(ws) = ctx.workspaces.clone() {
+                        spawn_removal(ws, p.id, p.stop_hub, p.generation, ctx.ws_done_tx.clone());
                     }
                 }
                 carried = Carried {
@@ -3117,6 +3146,21 @@ where
                 mouse,
             }) => {
                 flush_history(writer);
+                // The open a removal waited for ended with the session: the removal is let go,
+                // and said so, rather than run on a later switch.
+                if let Some(p) = ctx.pending_removal.take() {
+                    let label = tabs
+                        .iter()
+                        .find(|t| t.name == p.id)
+                        .map_or(p.id.clone(), |t| t.label.clone());
+                    let _ = ctx.ws_done_tx.send((
+                        format!(
+                            "workspace {label} not deleted: its hub was reconnected to before \
+                             the switch away from it was done; delete it again"
+                        ),
+                        None,
+                    ));
+                }
                 carried = Carried {
                     mouse,
                     view: Some(*view),
@@ -3368,7 +3412,7 @@ where
     // What deleting a workspace would do, for the workspace menu ([`Action::WsPlan`]).
     let (plan_tx, mut plan_rx) = mpsc::unbounded_channel::<(String, anyhow::Result<RemovalPlan>)>();
     // A workspace switched to, once its hub is connected ([`open_workspace`]).
-    type Opened = (String, anyhow::Result<Session>);
+    type Opened = (String, u64, anyhow::Result<Session>);
     let (open_tx, mut open_rx) = mpsc::unbounded_channel::<Opened>();
     // What the last frame showed: another thread or screen repaints the whole terminal.
     let mut shown: Option<(Option<String>, app::Screen)> = None;
@@ -3794,11 +3838,18 @@ where
                                         if !state.begin_switch(&to) {
                                             continue;
                                         }
-                                        ctx.pending_removal = Some((id, stop_hub, generation));
+                                        ctx.opens += 1;
+                                        let open = ctx.opens;
+                                        ctx.pending_removal = Some(PendingRemoval {
+                                            open,
+                                            id,
+                                            stop_hub,
+                                            generation,
+                                        });
                                         let tx = open_tx.clone();
                                         tokio::spawn(async move {
                                             let r = open_workspace(ws.as_ref(), &to, false).await;
-                                            let _ = tx.send((to, r));
+                                            let _ = tx.send((to, open, r));
                                         });
                                     }
                                     None => {
@@ -3821,9 +3872,11 @@ where
                                         continue;
                                     }
                                     let (ws, tx) = (ws.clone(), open_tx.clone());
+                                    ctx.opens += 1;
+                                    let open = ctx.opens;
                                     tokio::spawn(async move {
                                         let r = open_workspace(ws.as_ref(), &name, create).await;
-                                        let _ = tx.send((name, r));
+                                        let _ = tx.send((name, open, r));
                                     });
                                 }
                                 continue;
@@ -4138,7 +4191,7 @@ where
                 Some((id, plan)) = plan_rx.recv() => {
                     state.ws_planned(&id, plan, std::time::Instant::now());
                 }
-                Some((name, r)) = open_rx.recv() => match r {
+                Some((name, opened, r)) = open_rx.recv() => match r {
                     Ok(next) => {
                         // What the user saw of this workspace's waiting items: no alert for
                         // them once it is in the background.
@@ -4155,6 +4208,7 @@ where
                         state.keep_live_glance();
                         return Ok(End::Switch {
                             to: name,
+                            opened,
                             next: Box::new(next),
                             view: Box::new(state.take_view()),
                             tabs: state.tabs.clone(),
@@ -4164,10 +4218,16 @@ where
                     Err(e) => {
                         state.switching = None;
                         let label = state.ws_label(&name);
-                        state.view.status = Some(match ctx.pending_removal.take() {
-                            Some((id, ..)) => format!(
+                        // A removal waiting for this open goes with it.
+                        let waited = ctx
+                            .pending_removal
+                            .as_ref()
+                            .is_some_and(|p| p.open == opened);
+                        let removal = if waited { ctx.pending_removal.take() } else { None };
+                        state.view.status = Some(match removal {
+                            Some(p) => format!(
                                 "workspace {} not deleted: the switch to {label} failed: {e:#}",
-                                state.ws_label(&id)
+                                state.ws_label(&p.id)
                             ),
                             None => format!("workspace {label}: {e:#}"),
                         });
@@ -4316,6 +4376,35 @@ mod asks_tests {
 
 #[cfg(test)]
 mod tests {
+    /// A confirmed removal of the workspace shown runs only after the switch its own open
+    /// made away from it: a reconnect, a quit or another open's switch lets it go, so it never
+    /// runs later on a workspace used since.
+    #[test]
+    fn a_pending_removal_runs_only_after_its_own_open() {
+        let pending = |open| {
+            Some(PendingRemoval {
+                open,
+                id: "x".into(),
+                stop_hub: true,
+                generation: Some("g".into()),
+            })
+        };
+        let mut p = pending(3);
+        assert_eq!(due_removal(&mut p, Some(3), "d"), pending(3));
+        assert!(p.is_none());
+        // Ended otherwise (a reconnect to its own hub): let go, never run after.
+        let mut p = pending(3);
+        assert_eq!(due_removal(&mut p, None, "x"), None);
+        assert!(p.is_none());
+        assert_eq!(due_removal(&mut p, Some(3), "d"), None);
+        // Another open's switch, or one back to the workspace itself.
+        let mut p = pending(3);
+        assert_eq!(due_removal(&mut p, Some(4), "d"), None);
+        assert!(p.is_none());
+        let mut p = pending(3);
+        assert_eq!(due_removal(&mut p, Some(3), "x"), None);
+    }
+
     /// A hub that records the calls it gets, fails `fail` (and a `message.withdraw` or an
     /// `account.list` whose params say `fail`; an `account.list` whose params say `old` as a
     /// hub older than accounts does), answers `slow` once its oneshot fires, and a
