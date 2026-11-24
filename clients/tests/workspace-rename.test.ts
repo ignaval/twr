@@ -112,9 +112,10 @@ describe("a renamed workspace", () => {
   it("opens the desktop on the default workspace, whatever it is called", () => {
     // `TWR_WORKSPACE` wins, as with `twr`.
     expect(startWorkspace("acme", "default", listing)).toBe("acme");
-    // The one shown last, by its id, while it is there.
-    expect(startWorkspace(undefined, "client", listing)).toBe("acme");
+    // The one shown last, by its id, while it is there; the app saves ids, so a name is
+    // no workspace's (the default opens).
     expect(startWorkspace(undefined, "acme", listing)).toBe("acme");
+    expect(startWorkspace(undefined, "client", listing)).toBe("default");
     // Else the default one: after `twr ws rm default` and `twr ws default acme`, not `default`.
     const later = [{ id: "acme", name: "client", default: true }];
     expect(startWorkspace(undefined, "default", later)).toBe("acme");
@@ -127,6 +128,14 @@ describe("a renamed workspace", () => {
       ]),
     ).toBe("a");
     expect(startWorkspace(undefined, undefined, [])).toBe("default");
+    // The saved id is matched by id alone: `a` was removed and `b` renamed to `a` since, so
+    // `a` is not the one shown last, and the default opens.
+    expect(
+      startWorkspace(undefined, "a", [
+        { id: "b", name: "a", default: false },
+        { id: "z", name: "z", default: true },
+      ]),
+    ).toBe("z");
     // A listing that could not be read: the saved one, else `default`.
     expect(startWorkspace(undefined, "acme", undefined)).toBe("acme");
     expect(startWorkspace(undefined, undefined, undefined)).toBe("default");

@@ -62,7 +62,7 @@ that on this device. **New workspace** at the end of the list creates or removes
 workspaces. Needs you and the thread grid stay at the top.
 
 The app opens the workspace `TWR_WORKSPACE` names when it is set, else the one it showed
-last while it still exists, else the default workspace (`twr ws default`), and with no
+last while it still exists (by its id: not another workspace renamed into it since), else the default workspace (`twr ws default`), and with no
 default workspace the first one listed, as a bare `twr` does. When the workspace it opens
 can't be (it was removed, say), the sidebar still lists the others, to pick one or make a
 new one. A renamed

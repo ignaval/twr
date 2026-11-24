@@ -185,6 +185,11 @@ export function startWorkspace(
 ): string {
   if (env) return env;
   if (!listing) return saved || "default";
-  const last = saved ? resolveWorkspace(listing, saved) : undefined;
-  return last ?? defaultWorkspace(listing);
+  // The app saves the id it showed (an older one saved the name, which was the id then, as no
+  // workspace could be renamed): by id alone, so a workspace renamed into that id since (the
+  // one it showed removed) is never taken for it.
+  const last = saved
+    ? listing.find((w) => workspaceId(w) === saved)
+    : undefined;
+  return last !== undefined ? workspaceId(last) : defaultWorkspace(listing);
 }
