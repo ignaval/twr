@@ -3,6 +3,7 @@
 import { createRoot } from "react-dom/client";
 import App from "../../shared/App";
 import type {
+  Attention,
   DesktopAPI,
   DesktopEvent,
   HubEvent,
@@ -80,7 +81,7 @@ declare global {
       releaseNext: () => void;
       append: () => void;
       threads: () => Thread[];
-      setThreads: (threads: Thread[]) => void;
+      setThreads: (threads: Thread[], attention?: Attention[]) => void;
       reply: (text: string, ts: string) => void;
       stream: (kind: string, data: Json, ts: string) => void;
       historyReads: () => HubEvent[][];
@@ -97,12 +98,12 @@ window.conversationScrollQA = {
       event: { ...event("orch", 5, sequence++, kind, data), ts },
     }),
   threads: () => currentThreads,
-  setThreads: (threads) =>
+  setThreads: (threads, attention = []) =>
     emit({
       type: "state",
       state: {
         threads,
-        attention: [],
+        attention,
         decisions: [],
         decisions_seen: 0,
         head: 1,

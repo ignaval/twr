@@ -1867,6 +1867,10 @@ pub struct AttentionItem {
     /// says anything about it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<RequestContext>,
+    /// A delete card's short form ([`delete_brief`]), when the hub gave it one: clients show it
+    /// with the whole summary behind it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete: Option<DeleteBrief>,
 }
 
 /// The context a worker's permission or question was raised in, for the user to judge it
@@ -2025,6 +2029,7 @@ impl AttentionStack {
                     item.loop_stuck = ev.source == Source::Hub && is_loop_stuck_item(&p.ext);
                     item.offline_since = offline_since(&ev.source, &p.ext);
                     item.context = RequestContext::of(p.reason, &p.ext);
+                    item.delete = delete_brief(&ev.thread, &p.ext);
                     return;
                 }
                 self.items.insert(
@@ -2046,6 +2051,7 @@ impl AttentionStack {
                         loop_stuck: ev.source == Source::Hub && is_loop_stuck_item(&p.ext),
                         offline_since: offline_since(&ev.source, &p.ext),
                         context: RequestContext::of(p.reason, &p.ext),
+                        delete: delete_brief(&ev.thread, &p.ext),
                     },
                 );
             }
