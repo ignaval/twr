@@ -750,7 +750,12 @@ mod tests {
             if c.end == c.total {
                 break;
             }
-            assert!(c.text.ends_with('\n'), "pages end at line ends");
+            // A line end in the second half ends the page; a line longer than that (a table
+            // row of SKILL.md's) is cut where the page is full.
+            assert!(
+                c.text.ends_with('\n') || !c.text.as_bytes()[c.text.len() / 2..].contains(&b'\n'),
+                "pages end at line ends when one is in their second half"
+            );
             offset = c.end;
         }
         assert_eq!(whole, BUNDLED[1].1);
