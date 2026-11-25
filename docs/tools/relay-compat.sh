@@ -25,6 +25,8 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/twr-relay-compat.XXXXXXXX")
 cleanup() {
     if [ -f "$work/pids" ]; then
         while read -r p; do kill "$p" 2>/dev/null || true; done < "$work/pids"
+        # Wait for them: a relay still exiting writes to its state while it goes.
+        while read -r p; do wait "$p" 2>/dev/null || true; done < "$work/pids"
     fi
     for wt in "$work"/src-*; do
         [ -d "$wt" ] && git worktree remove --force "$wt" >/dev/null 2>&1
