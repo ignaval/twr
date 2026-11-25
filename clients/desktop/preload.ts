@@ -8,6 +8,7 @@ import type {
 import type { DesktopConnections } from "../shared/connections";
 const api: DesktopAPI = {
   inboxSources: () => ipcRenderer.invoke("twr:inbox-sources"),
+  engineHubs: () => ipcRenderer.invoke("twr:engine-hubs"),
   sendMessage: (message) => ipcRenderer.invoke("twr:send-message", message),
   secureRead: (key) => ipcRenderer.invoke("twr:secure-read", key),
   secureWrite: (key, value) =>
@@ -44,7 +45,8 @@ const api: DesktopAPI = {
   quit: () => ipcRenderer.invoke("twr:quit"),
   copyText: (text) => ipcRenderer.invoke("twr:copy-text", text),
   bootstrap: () => ipcRenderer.invoke("twr:bootstrap"),
-  connect: (workspace) => ipcRenderer.invoke("twr:connect", workspace),
+  connect: (workspace, options) =>
+    ipcRenderer.invoke("twr:connect", workspace, options),
   rpc: (method, params = {}) => ipcRenderer.invoke("twr:rpc", method, params),
   cli: (args) => ipcRenderer.invoke("twr:cli", args),
   catalog: () => ipcRenderer.invoke("twr:catalog"),
@@ -91,12 +93,16 @@ const connections: DesktopConnections = {
   restart: (request) => ipcRenderer.invoke("twr:gateway-restart", request),
   invite: (request) => ipcRenderer.invoke("twr:gateway-invite", request),
   deactivateLocal: () => ipcRenderer.invoke("twr:deactivate-local"),
-  addListener: async (_event, callback) => {
+  updateRoutes: (request) =>
+    ipcRenderer.invoke("twr:remote-update-routes", request),
+  addListener: async (event, callback) => {
+    const channel =
+      event === "network" ? "twr:remote-network" : "twr:remote-message";
     const listener = (_: unknown, value: any) => callback(value);
-    ipcRenderer.on("twr:remote-message", listener);
+    ipcRenderer.on(channel, listener);
     return {
       remove: async () => {
-        ipcRenderer.removeListener("twr:remote-message", listener);
+        ipcRenderer.removeListener(channel, listener);
       },
     };
   },

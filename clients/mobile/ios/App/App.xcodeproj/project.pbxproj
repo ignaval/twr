@@ -21,6 +21,11 @@
 		A00000000000000000000002 /* TwrTransportPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000001 /* TwrTransportPlugin.swift */; };
 		A00000000000000000000004 /* TwrViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000003 /* TwrViewController.swift */; };
 		A00000000000000000000006 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000005 /* PrivacyInfo.xcprivacy */; };
+		A00000000000000000000008 /* TwrPairing.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000007 /* TwrPairing.swift */; };
+		A0000000000000000000000A /* TwrPinnedTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000009 /* TwrPinnedTransport.swift */; };
+		A0000000000000000000000C /* PairingLogicTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000000B /* PairingLogicTests.swift */; };
+		A0000000000000000000000E /* TwrArgon2 in Frameworks */ = {isa = PBXBuildFile; productRef = A0000000000000000000000D /* TwrArgon2 */; };
+		A00000000000000000000011 /* TwrArgon2 in Frameworks */ = {isa = PBXBuildFile; productRef = A00000000000000000000010 /* TwrArgon2 */; };
 		B00000000000000000000002 /* TwrOfflinePlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000001 /* TwrOfflinePlugin.swift */; };
 		B00000000000000000000004 /* TwrVoicePlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000003 /* TwrVoicePlugin.swift */; };
 /* End PBXBuildFile section */
@@ -52,6 +57,9 @@
 		A00000000000000000000001 /* TwrTransportPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TwrTransportPlugin.swift; sourceTree = "<group>"; };
 		A00000000000000000000003 /* TwrViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TwrViewController.swift; sourceTree = "<group>"; };
 		A00000000000000000000005 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		A00000000000000000000007 /* TwrPairing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TwrPairing.swift; sourceTree = "<group>"; };
+		A00000000000000000000009 /* TwrPinnedTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TwrPinnedTransport.swift; sourceTree = "<group>"; };
+		A0000000000000000000000B /* PairingLogicTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingLogicTests.swift; sourceTree = "<group>"; };
 		C5EBBAA87D679AA598C77C2E /* RemoteHubTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RemoteHubTests.swift; sourceTree = "<group>"; };
 		F4820369321EAA82AE6FB0F8 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
 		B00000000000000000000001 /* TwrOfflinePlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TwrOfflinePlugin.swift; sourceTree = "<group>"; };
@@ -64,6 +72,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				4D22ABE92AF431CB00220026 /* CapApp-SPM in Frameworks */,
+				A0000000000000000000000E /* TwrArgon2 in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -72,6 +81,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				848A140DFD204A379EE4B24B /* Foundation.framework in Frameworks */,
+				A00000000000000000000011 /* TwrArgon2 in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -82,6 +92,7 @@
 			isa = PBXGroup;
 			children = (
 				C5EBBAA87D679AA598C77C2E /* RemoteHubTests.swift */,
+				A0000000000000000000000B /* PairingLogicTests.swift */,
 			);
 			name = AppTests;
 			path = AppTests;
@@ -115,6 +126,8 @@
 				504EC3071FED79650016851F /* AppDelegate.swift */,
 				A00000000000000000000003 /* TwrViewController.swift */,
 				A00000000000000000000001 /* TwrTransportPlugin.swift */,
+				A00000000000000000000009 /* TwrPinnedTransport.swift */,
+				A00000000000000000000007 /* TwrPairing.swift */,
 				B00000000000000000000001 /* TwrOfflinePlugin.swift */,
 				B00000000000000000000003 /* TwrVoicePlugin.swift */,
 				504EC30B1FED79650016851F /* Main.storyboard */,
@@ -163,6 +176,7 @@
 			name = App;
 			packageProductDependencies = (
 				4D22ABE82AF431CB00220026 /* CapApp-SPM */,
+				A0000000000000000000000D /* TwrArgon2 */,
 			);
 			productName = App;
 			productReference = 504EC3041FED79650016851F /* App.app */;
@@ -182,6 +196,9 @@
 				5D36232E30BEC97A9D103E76 /* PBXTargetDependency */,
 			);
 			name = AppTests;
+			packageProductDependencies = (
+				A00000000000000000000010 /* TwrArgon2 */,
+			);
 			productName = AppTests;
 			productReference = 98173195A97DA5C058CCA517 /* AppTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
@@ -213,6 +230,7 @@
 			mainGroup = 504EC2FB1FED79650016851F;
 			packageReferences = (
 				D4C12C0A2AAA248700AAC8A2 /* XCLocalSwiftPackageReference "CapApp-SPM" */,
+				A0000000000000000000000F /* XCLocalSwiftPackageReference "TwrArgon2" */,
 			);
 			productRefGroup = 504EC3051FED79650016851F /* Products */;
 			projectDirPath = "";
@@ -254,6 +272,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				6545EACED6CEB8A5A9E9D073 /* RemoteHubTests.swift in Sources */,
+				A0000000000000000000000C /* PairingLogicTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -264,6 +283,8 @@
 				504EC3081FED79650016851F /* AppDelegate.swift in Sources */,
 				A00000000000000000000004 /* TwrViewController.swift in Sources */,
 				A00000000000000000000002 /* TwrTransportPlugin.swift in Sources */,
+				A0000000000000000000000A /* TwrPinnedTransport.swift in Sources */,
+				A00000000000000000000008 /* TwrPairing.swift in Sources */,
 				B00000000000000000000002 /* TwrOfflinePlugin.swift in Sources */,
 				B00000000000000000000004 /* TwrVoicePlugin.swift in Sources */,
 				9582B6832FE993A70072D4E8 /* SceneDelegate.swift in Sources */,
@@ -424,7 +445,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.6.0;
+				MARKETING_VERSION = 0.7.0;
 				OTHER_SWIFT_FLAGS = "$(inherited) \"-D\" \"COCOAPODS\" \"-DDEBUG\"";
 				PRODUCT_BUNDLE_IDENTIFIER = tools.twr.mobile.dev;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -447,7 +468,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.6.0;
+				MARKETING_VERSION = 0.7.0;
 				PRODUCT_BUNDLE_IDENTIFIER = tools.twr.mobile;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "";
@@ -526,6 +547,10 @@
 			isa = XCLocalSwiftPackageReference;
 			relativePath = "CapApp-SPM";
 		};
+		A0000000000000000000000F /* XCLocalSwiftPackageReference "TwrArgon2" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = TwrArgon2;
+		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -533,6 +558,16 @@
 			isa = XCSwiftPackageProductDependency;
 			package = D4C12C0A2AAA248700AAC8A2 /* XCLocalSwiftPackageReference "CapApp-SPM" */;
 			productName = "CapApp-SPM";
+		};
+		A0000000000000000000000D /* TwrArgon2 */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A0000000000000000000000F /* XCLocalSwiftPackageReference "TwrArgon2" */;
+			productName = TwrArgon2;
+		};
+		A00000000000000000000010 /* TwrArgon2 */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A0000000000000000000000F /* XCLocalSwiftPackageReference "TwrArgon2" */;
+			productName = TwrArgon2;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

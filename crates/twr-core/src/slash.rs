@@ -28,6 +28,9 @@ pub enum CompactPane {
 pub enum Slash {
     /// Show a private one-time code to use this terminal host as a runner.
     Runner,
+    /// Pair a phone: a private invitation (QR code, link, code) with this access level
+    /// (`read-only`, `operate`, `terminal`, `admin`), or a choice of one when `None`.
+    Phone { level: Option<String> },
     /// `/clear`: reset the orchestrator without carrying the conversation over.
     Clear,
     /// `/open [thread]`: talk to a worker thread directly (dive in); default: the selected card.
@@ -244,6 +247,13 @@ pub enum Slash {
     /// `/ws new [name]`: create a workspace and switch to it; without a name, ask for it
     /// (the new-workspace dialog, `the client`).
     WsNew(Option<String>),
+    /// `/ws menu [name]`: the workspace menu of one (the current one without a name): open,
+    /// rename, make default, delete (`the client`).
+    WsMenu(Option<String>),
+    /// `/ws rename [name] <new>`: rename one (the current one without a name), asking first.
+    WsRename(Option<String>, String),
+    /// `/ws rm <name>` (or `delete`): what deleting it would remove, and Delete to do it.
+    WsRm(String),
     /// `/spaces [on|off]`: the same as `/sidebar` (Ctrl-T); `None` toggles.
     Spaces(Option<bool>),
     /// `/settings`: the settings overlay (`the client`).
@@ -922,6 +932,13 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
         &[],
     ),
     (
+        "/phone",
+        "/phone [access]",
+        "pair a phone: shows a private QR code and one-use code; access: read-only, operate (the \
+         default), terminal or admin",
+        &[],
+    ),
+    (
         "/accounts",
         "/accounts",
         "every runtime's accounts and their logins",
@@ -1128,9 +1145,10 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
     ),
     (
         "/ws",
-        "/ws [name] | /ws new [name]",
+        "/ws [name] | /ws new [name] | /ws menu [name] | /ws rename [name] <new> | /ws rm <name>",
         "list the workspaces, or switch to one (Alt-1..9, Ctrl-PgUp/PgDn); a new name asks to \
-         create it; /ws new creates one; alias /workspace",
+         create it; /ws new creates one; /ws menu (the ⋯ on a workspace's card) renames, \
+         deletes or makes one the default; alias /workspace",
         &[ArgKind::Workspace],
     ),
     (
@@ -1166,6 +1184,9 @@ pub const ACCESS_LEVELS: &[(&str, &str)] = &[
     ("limited", "twr's tools and a web search only"),
     ("full", "every tool, its shell included, without asking"),
 ];
+
+/// The access levels `/phone` offers, narrowest first.
+pub const PHONE_LEVELS: &[&str] = &["read-only", "operate", "terminal", "admin"];
 
 /// Whether command `name` (canonical) takes arguments at all.
 pub fn takes_args(name: &str) -> bool {
@@ -1364,6 +1385,13 @@ pub fn parse(line: &str) -> Result<Slash, String> {
             })
         }
         "/runner" if args.is_empty() => Ok(Slash::Runner),
+        "/phone" => match args {
+            [] => Ok(Slash::Phone { level: None }),
+            [level] if PHONE_LEVELS.contains(&level.as_str()) => Ok(Slash::Phone {
+                level: Some(level.to_string()),
+            }),
+            _ => bad(),
+        },
         "/accounts" if args.is_empty() => Ok(Slash::Accounts),
         "/new" => {
             let mut project = None;
@@ -1507,6 +1535,15 @@ pub fn parse(line: &str) -> Result<Slash, String> {
         "/ws" => match args {
             [new] if new == "new" => Ok(Slash::WsNew(None)),
             [new, name] if new == "new" => Ok(Slash::WsNew(Some(name.clone()))),
+            [menu] if menu == "menu" => Ok(Slash::WsMenu(None)),
+            [menu, name] if menu == "menu" => Ok(Slash::WsMenu(Some(name.clone()))),
+            [rename, to] if rename == "rename" => Ok(Slash::WsRename(None, to.clone())),
+            [rename, name, to] if rename == "rename" => {
+                Ok(Slash::WsRename(Some(name.clone()), to.clone()))
+            }
+            [rm, name] if rm == "rm" || rm == "delete" => Ok(Slash::WsRm(name.clone())),
+            [rm] if rm == "rm" || rm == "delete" => Err("usage: /ws rm <name>".into()),
+            [rename] if rename == "rename" => Err("usage: /ws rename [name] <new name>".into()),
             _ => one(args).map(Slash::Ws),
         },
         "/parked" | "/sidebar" | "/spaces" | "/focus" | "/mouse" | "/compact" | "/suggest"
@@ -3020,6 +3057,19 @@ mod tests {
         assert_eq!(parse("/ws new"), Ok(Slash::WsNew(None)));
         assert_eq!(parse("/ws new api"), Ok(Slash::WsNew(Some("api".into()))));
         assert_eq!(parse("/ws api"), Ok(Slash::Ws(Some("api".into()))));
+        assert_eq!(parse("/ws menu"), Ok(Slash::WsMenu(None)));
+        assert_eq!(parse("/ws menu api"), Ok(Slash::WsMenu(Some("api".into()))));
+        assert_eq!(
+            parse("/ws rename main"),
+            Ok(Slash::WsRename(None, "main".into()))
+        );
+        assert_eq!(
+            parse("/ws rename default main"),
+            Ok(Slash::WsRename(Some("default".into()), "main".into()))
+        );
+        assert_eq!(parse("/ws rm api"), Ok(Slash::WsRm("api".into())));
+        assert_eq!(parse("/ws delete api"), Ok(Slash::WsRm("api".into())));
+        assert!(parse("/ws rm").is_err());
         assert_eq!(parse("/w"), Ok(Slash::Pane(CompactPane::Threads)));
         assert_eq!(parse("/sidebar on"), Ok(Slash::Sidebar(Some(true))));
         assert_eq!(parse("/sidebar off"), Ok(Slash::Sidebar(Some(false))));
@@ -3212,6 +3262,7 @@ mod tests {
                 "/mode",
                 "/model",
                 "/account",
+                "/phone",
                 "/accounts",
                 "/loop",
                 "/compact-context",
@@ -3228,6 +3279,7 @@ mod tests {
         assert_eq!(
             names("/P", &pools),
             [
+                "/phone",
                 "/park",
                 "/pin",
                 "/parked",

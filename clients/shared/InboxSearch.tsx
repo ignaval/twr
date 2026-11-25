@@ -199,7 +199,8 @@ export function NeedsYouInbox({
           >
             <header>
               <h2 id={`inbox-${group.hubId}-${group.workspace}`}>
-                {group.hubName} <span> / {group.workspace}</span>
+                {group.hubName}{" "}
+                <span> / {group.workspaceName || group.workspace}</span>
               </h2>
               <span>
                 {group.running === false
@@ -233,7 +234,7 @@ export function NeedsYouInbox({
               <div
                 className="inbox-items"
                 role="list"
-                aria-label={`Requests in ${group.workspace}`}
+                aria-label={`Requests in ${group.workspaceName || group.workspace}`}
               >
                 {group.attention.map((item) =>
                   live ? (
@@ -263,7 +264,9 @@ export function NeedsYouInbox({
                           {inboxCategory(item)} · {requestLine(item)}
                         </span>
                         <span className="visually-hidden">. </span>
-                        <small>Open {group.workspace}</small>
+                        <small>
+                          Open {group.workspaceName || group.workspace}
+                        </small>
                       </button>
                     </div>
                   ),

@@ -411,6 +411,21 @@ describe("CLI parity catalog", () => {
       "name is required",
     );
   });
+  it("reads an option whose value name has brackets as its own field", () => {
+    const { command } = parseHelp(
+      ["phone"],
+      `Pair a phone\n\nUsage: twr phone [OPTIONS]\n\nOptions:\n      --admin\n          Grant admin\n\n      --address <HOST[:PORT]>\n          The address invitations offer first\n`,
+    );
+    expect(command.fields.map((f) => [f.key, f.type, f.description])).toEqual([
+      ["admin", "boolean", "Grant admin"],
+      ["address", "text", "The address invitations offer first"],
+    ]);
+    expect(commandArguments(command, { address: "box.example:443" })).toEqual([
+      "phone",
+      "--address",
+      "box.example:443",
+    ]);
+  });
   it("preserves message quotes and newlines, and cannot shift a message into a missing thread", () => {
     const { command } = parseHelp(
       ["send"],

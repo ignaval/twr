@@ -1104,6 +1104,145 @@ try {
     );
     await page.close();
   }
+  {
+    // The conversation's furniture lines up with its text column and never covers it: the
+    // working cursor on its own line, the shortcut to your preceding message, and a delete
+    // card in short in the requests area above them.
+    const page = await browser.newPage({
+      viewport: { width: 1200, height: 775 },
+    });
+    await page.goto(`${url}?with-user&fast-history`);
+    await page.locator(".transcript-block").first().waitFor();
+    await page.evaluate(() => {
+      const qa = window.conversationScrollQA;
+      const name = (i) => `merged-${i}`;
+      qa.setThreads(
+        qa.threads().map((t) => ({ ...t, status: "running" })),
+        [
+          {
+            attn_id: "del",
+            revision: 3,
+            thread: "hub",
+            reason: "question",
+            proposal: true,
+            options: ["Delete", "Cancel"],
+            summary:
+              "Delete 5 threads?\n" +
+              [0, 1, 2, 3, 4]
+                .map(
+                  (i) =>
+                    `- ${name(i)} (project twr): stops its runtime, moves its worktree /home/u/.local/share/twr/worktrees/twr/${name(i)} (32 MB) to the trash (no uncommitted changes), deletes its build output (clients/node_modules/, 397 MB) instead of moving it to the trash, moves its branch twr/${name(i)} to the trash`,
+                )
+                .join("\n"),
+            delete: {
+              title: "Delete 5 threads?",
+              threads: [0, 1, 2, 3, 4].map((i) => ({
+                name: name(i),
+                project: "twr",
+                risk: i
+                  ? "no uncommitted or unpushed work"
+                  : "2 unpushed commits",
+                clean: i > 0,
+              })),
+              total:
+                "Deletes 1.9 GB of build output outright; the rest (160 MB) goes to the trash for 7 days.",
+            },
+          },
+        ],
+      );
+      qa.appendUser("yes. Also delete all merged threads");
+    });
+    await page.locator(".working-line .working-cursor").waitFor();
+    await page.locator(".delete-brief").waitFor();
+    const box = (selector) =>
+      page
+        .locator(selector)
+        .first()
+        .evaluate((node) => {
+          const r = node.getBoundingClientRect();
+          return { left: r.left, right: r.right, top: r.top, bottom: r.bottom };
+        });
+    const column = await box(".transcript-virtual");
+    const cursor = await box(".working-line .working-cursor");
+    const bar = await box(".latest-user-message");
+    const shortcut = await box(".latest-user-message svg");
+    const requests = await box(".conversation-attention");
+    const history = await box(".conversation-scroll");
+    expect(Math.abs(cursor.left - column.left)).toBeLessThanOrEqual(1);
+    expect(Math.abs(bar.left - column.left)).toBeLessThanOrEqual(1);
+    expect(Math.abs(bar.right - column.right)).toBeLessThanOrEqual(1);
+    // Its icon in line with the messages' avatars (the button's 8px padding).
+    expect(Math.abs(shortcut.left - column.left - 8)).toBeLessThanOrEqual(1);
+    // Requests, the shortcut row and the history are stacked, never over one another.
+    expect(requests.bottom).toBeLessThanOrEqual(bar.top + 1);
+    expect(bar.bottom).toBeLessThanOrEqual(history.top + 1);
+    const card = await box(".conversation-attention .attention-card");
+    expect(card.bottom - card.top).toBeLessThan(360);
+    await expect(page.locator(".delete-details")).not.toHaveAttribute("open");
+    await expect(page.locator(".attention-kind")).toHaveText(
+      "Confirm deletion",
+    );
+    console.log(
+      "PASS conversation layout: cursor and shortcut in the text column, a short delete card above them",
+    );
+    await page.close();
+  }
+  {
+    // A notice that wraps in a short, narrow window (the engine notice, three lines and its
+    // buttons at 420px) left a waiting request 3px: its answers sat under the conversation.
+    // While a request waits, the notices keep to two lines and the request keeps room.
+    const page = await browser.newPage({
+      viewport: { width: 420, height: 480 },
+    });
+    await page.goto(`${url}?fast-history&engine-notice`);
+    await page.locator('[data-notice="version"]').waitFor();
+    await page.evaluate(() => {
+      const qa = window.conversationScrollQA;
+      qa.setThreads(qa.threads(), [
+        {
+          attn_id: "perm",
+          revision: 1,
+          thread: "hub",
+          reason: "permission",
+          options: ["allow", "deny"],
+          summary:
+            "Bash LAYOUT_BOUNDARY " +
+            "Review this command carefully. ".repeat(300),
+        },
+      ]);
+    });
+    const request = page
+      .locator(".conversation-attention .attention-card")
+      .filter({ hasText: "LAYOUT_BOUNDARY" });
+    await request.waitFor();
+    const deny = request
+      .locator(".attention-options button")
+      .filter({ hasText: "deny" });
+    await deny.scrollIntoViewIfNeeded();
+    await frames(page);
+    const reach = await deny.evaluate((button) => {
+      const r = button.getBoundingClientRect();
+      const hit = document.elementFromPoint(
+        r.left + r.width / 2,
+        r.top + r.height / 2,
+      );
+      return {
+        hit: !!hit && (hit === button || button.contains(hit)),
+        requests: document
+          .querySelector(".conversation-attention")
+          .getBoundingClientRect().height,
+        strip: document.querySelector(".status-strip").getBoundingClientRect()
+          .height,
+      };
+    });
+    expect(reach.hit, JSON.stringify(reach)).toBe(true);
+    expect(reach.requests).toBeGreaterThanOrEqual(48);
+    expect(reach.strip).toBeLessThanOrEqual(57);
+    console.log(
+      "PASS short window: a wrapped notice keeps to two lines while a request waits, and Deny stays reachable",
+    );
+    await page.close();
+  }
 } finally {
   await browser?.close();
   await server.close();

@@ -397,7 +397,7 @@ pub(super) async fn run(
             code_stdin,
             replace,
         } => super::runner_link::pair(paths, name, code_stdin, replace).await?,
-        BoxCmd::List { json } => list(socket, json).await?,
+        BoxCmd::List { json } => list(paths, socket, json).await?,
         BoxCmd::Status { name, json } => status(config, socket, &name, json).await?,
         BoxCmd::Token {
             name,
@@ -562,15 +562,32 @@ pub(super) fn terminal_refusal(name: &str, link: &BoxLink, instead: &str) -> Opt
     })
 }
 
-/// Refuses a named workspace: boxes belong to the default workspace's hub.
+/// Refuses a workspace you created: boxes belong to the hub of the workspace in twr's data
+/// directory (`default` by id, whatever it is named, and whichever workspace is the default).
 fn default_workspace_only(paths: &Paths, cmd: &str) -> anyhow::Result<()> {
     match &paths.workspace {
-        Some(w) => bail!(
-            "boxes belong to the default workspace's hub, not workspace {w}'s: run `twr box \
-             {cmd}` without -w"
-        ),
+        Some(_) => bail!("{}", boxes_elsewhere(paths, &format!("twr box {cmd}"))),
         None => Ok(()),
     }
+}
+
+/// Why workspace `paths` (one you created) has no boxes, and how to reach them with `run`: they
+/// belong to the hub of the workspace in twr's data directory, which `-w default` selects.
+fn boxes_elsewhere(paths: &Paths, run: &str) -> String {
+    use twr_core::paths::DEFAULT_WORKSPACE;
+    let root = paths.root();
+    let named = root.display_name();
+    let root_name = if named == DEFAULT_WORKSPACE {
+        String::new()
+    } else {
+        format!(", named {named}")
+    };
+    format!(
+        "boxes belong to the hub of the workspace in twr's data directory ({DEFAULT_WORKSPACE}\
+         {root_name}), not workspace {}'s: run `twr -w {DEFAULT_WORKSPACE} {}`",
+        paths.display_name(),
+        run.trim_start_matches("twr ")
+    )
 }
 
 /// The hub's version and build: the running hub's (`hub.info`), else this twr's (the one a
@@ -1490,7 +1507,7 @@ fn online_note(name: &str, b: &Value) {
 }
 
 /// `twr box list`.
-async fn list(socket: &Path, json: bool) -> anyhow::Result<()> {
+async fn list(paths: &Paths, socket: &Path, json: bool) -> anyhow::Result<()> {
     let mut c = connect(socket).await?;
     let info = c.call("hub.info", Value::Null).await?;
     let boxes = info["boxes"].as_array().cloned().unwrap_or_default();
@@ -1499,7 +1516,12 @@ async fn list(socket: &Path, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     if boxes.is_empty() {
-        outln!("no remote boxes (`twr box add <name> <ssh destination>` adds one)");
+        // A workspace you created has none: say which was read, and where they are.
+        if paths.workspace.is_some() {
+            outln!("{}", boxes_elsewhere(paths, "twr box list"));
+        } else {
+            outln!("no remote boxes (`twr box add <name> <ssh destination>` adds one)");
+        }
         return Ok(());
     }
     out!("{}", list_text(&boxes));
@@ -2746,6 +2768,27 @@ fn stop_command(link: &BoxLink, build: &str, name: &str, key: &str) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A box command in a workspace you created says where boxes are: `-w default`, the
+    /// workspace in twr's data directory, named as shown; never "without -w", which may
+    /// select another workspace once one is made the default.
+    #[test]
+    fn box_commands_elsewhere_say_dash_w_default() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        let a = twr_core::workspaces::create(&root, "a").unwrap().paths;
+        twr_core::workspaces::rename(&root, "a", "acme").unwrap();
+        let e = default_workspace_only(&a, "add").unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "boxes belong to the hub of the workspace in twr's data directory (default), not \
+             workspace acme's: run `twr -w default box add`"
+        );
+        twr_core::workspaces::rename(&root, "default", "main").unwrap();
+        let e = default_workspace_only(&a, "add").unwrap_err().to_string();
+        assert!(e.contains("(default, named main)"), "{e}");
+        assert!(default_workspace_only(&root, "add").is_ok());
+    }
 
     /// An upload's error says what the hub's own would: the C library hint when the box
     /// refused the build for its glibc, the HOME hint when a command box's user may not write

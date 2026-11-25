@@ -85,6 +85,11 @@ pub const BUNDLED: &[(&str, &str)] = &[
     ),
     ("docs/recipes.md", include_str!("../../../docs/recipes.md")),
     (
+        "docs/relay-protocol.md",
+        include_str!("../../../docs/relay-protocol.md"),
+    ),
+    ("docs/relay.md", include_str!("../../../docs/relay.md")),
+    (
         "docs/security-model.md",
         include_str!("../../../docs/security-model.md"),
     ),
@@ -750,7 +755,12 @@ mod tests {
             if c.end == c.total {
                 break;
             }
-            assert!(c.text.ends_with('\n'), "pages end at line ends");
+            // A line end in the second half ends the page; a line longer than that (a table
+            // row of SKILL.md's) is cut where the page is full.
+            assert!(
+                c.text.ends_with('\n') || !c.text.as_bytes()[c.text.len() / 2..].contains(&b'\n'),
+                "pages end at line ends when one is in their second half"
+            );
             offset = c.end;
         }
         assert_eq!(whole, BUNDLED[1].1);

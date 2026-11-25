@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
-    path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -11,11 +10,27 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, Command},
+    process::{Child, ChildStdin},
     sync::{mpsc, oneshot, Mutex},
 };
 
 type Replies = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
+/// How a device's companion (the desktop bridge) is run: `program`, then `args`, then the
+/// workspace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Command {
+    pub program: std::path::PathBuf,
+    pub args: Vec<std::ffi::OsString>,
+}
+impl Command {
+    /// A program run with the workspace alone: `twr-desktop-bridge <workspace>`.
+    pub fn program(program: std::path::PathBuf) -> Self {
+        Self {
+            program,
+            args: Vec::new(),
+        }
+    }
+}
 pub struct Companion {
     child: Child,
     input: Mutex<ChildStdin>,
@@ -25,15 +40,19 @@ pub struct Companion {
 }
 impl Companion {
     pub async fn start(
-        binary: &Path,
+        binary: &self::Command,
         workspace: &str,
         device: &str,
         token: &str,
         events: mpsc::Sender<Value>,
     ) -> Result<Self> {
-        let mut command = Command::new(binary);
+        let mut command = tokio::process::Command::new(&binary.program);
+        // `workspace` is the id the gateway resolved: served by id alone
+        // ([`twr_core::paths::WORKSPACE_ID_ENV`]).
         command
+            .args(&binary.args)
             .arg(workspace)
+            .env(twr_core::paths::WORKSPACE_ID_ENV, workspace)
             .env("TWR_CLIENT_NAME", format!("mobile-{device}"));
         command
             .env_remove("TWR_DEVICE_TOKEN")
@@ -171,9 +190,10 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         let (events, _) = mpsc::channel(8);
-        let companion = Companion::start(&binary, "default", "device", "", events)
-            .await
-            .unwrap();
+        let companion =
+            Companion::start(&Command::program(binary), "default", "device", "", events)
+                .await
+                .unwrap();
         (directory, companion)
     }
     #[tokio::test]

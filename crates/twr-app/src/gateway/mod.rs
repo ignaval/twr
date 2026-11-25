@@ -1,5 +1,10 @@
 //! Authenticated remote user transport. Runner tokens are never accepted here.
-mod remote;
+//!
+//! The `twr-mobile-gateway` binary of the desktop bundle and `twr gateway` both run [`run`].
+use crate::remote;
+pub mod identity;
+pub mod routes;
+pub mod settings;
 use anyhow::{Context, Result};
 use axum::{
     extract::{
@@ -22,7 +27,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -33,17 +38,26 @@ use std::{
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock, Semaphore};
 use twr_core::proto::codes;
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(
     about = "Remote mobile clients for twr. Start from your own terminal or desktop launcher."
 )]
-struct Args {
-    #[arg(long, default_value = "127.0.0.1:47321")]
-    listen: SocketAddr,
+pub struct Args {
+    /// Where to listen. Default: 127.0.0.1:47321 with --tls-cert or --development; else the
+    /// saved settings' addresses, or 0.0.0.0:47321 and [::]:47321.
     #[arg(long)]
+    listen: Option<SocketAddr>,
+    /// Serve this certificate (certificate mode), with --tls-key. Without them the gateway
+    /// serves its own key, which phones pin (pinned mode).
+    #[arg(long, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
-    #[arg(long)]
+    /// The private key of --tls-cert's certificate, in PEM.
+    #[arg(long, requires = "tls_cert")]
     tls_key: Option<PathBuf>,
+    /// Pinned mode: the address invitations offer first, a DNS name or a forwarded
+    /// host:port; saved for later runs. An empty one offers none.
+    #[arg(long, value_name = "HOST[:PORT]", conflicts_with_all = ["tls_cert", "development"])]
+    address: Option<String>,
     /// Debug builds only: plaintext loopback for adb reverse and iOS Simulator.
     #[arg(long)]
     development: bool,
@@ -113,7 +127,7 @@ struct Server {
     connections: Arc<remote::limits::Connections>,
     terminal_slots: Arc<Semaphore>,
     binary: PathBuf,
-    companion: PathBuf,
+    companion: remote::companion::Command,
     owner: Mutex<Option<twr_core::client::Client>>,
     auth: Arc<Auth>,
     slots: Arc<Semaphore>,
@@ -125,6 +139,25 @@ struct Server {
     receipt_waiters: Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<Value>>>>,
     /// twr's natural voices, made here for phones that read aloud with one.
     renderer: Arc<remote::voice::Renderer>,
+    /// Pinned mode: the pin it serves and where its routes come from.
+    pinned: Option<Pinned>,
+}
+/// What a pinned gateway serves beside its key: the pin, and what its routes come from.
+pub(crate) struct Pinned {
+    pin: String,
+    /// The gateway's directory, for its saved settings.
+    dir: PathBuf,
+    /// Its listeners, as bound.
+    listeners: Vec<SocketAddr>,
+}
+impl Pinned {
+    /// The routes it offers now ([`routes::current`]).
+    fn routes(&self) -> Vec<String> {
+        routes::current(&self.dir, &self.listeners)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
 }
 type OrderedInput = (Call, mpsc::Sender<Value>, u64);
 fn stamp(mut event: Value, generation: u64) -> Value {
@@ -160,8 +193,8 @@ fn authorize_mutation(device: &Device, call: &Call) -> Result<()> {
     Ok(())
 }
 
-const MAX_SOCKET_REPLY: usize = 16 * 1024 * 1024;
-const OVERSIZED_REPLY_ERROR: &str =
+pub(crate) const MAX_SOCKET_REPLY: usize = 16 * 1024 * 1024;
+pub(crate) const OVERSIZED_REPLY_ERROR: &str =
     "Hub response exceeds 16 MiB. Load a smaller transcript page or open it on desktop.";
 
 /// Keep a large transcript or state event from tearing down a healthy native socket.
@@ -173,7 +206,7 @@ fn send_budget(message: &Message) -> Duration {
     };
     Duration::from_secs(20 + (bytes as u64).div_ceil(32 * 1024))
 }
-fn socket_message(event: &Value) -> Message {
+pub(crate) fn socket_message(event: &Value) -> Message {
     let text = event.to_string();
     let text = if text.len() > MAX_SOCKET_REPLY {
         match event.get("id") {
@@ -188,6 +221,129 @@ fn socket_message(event: &Value) -> Message {
 #[cfg(test)]
 mod socket_tests {
     use super::*;
+    /// A call stamped with the name an older phone app connected by (a renamed workspace's
+    /// name, or its original name, an alias) is for the workspace connected by id; another
+    /// workspace's name or id is not.
+    #[test]
+    fn a_call_by_a_workspace_s_name_is_for_its_id() {
+        let home = tempfile::tempdir().unwrap();
+        let root = twr_core::paths::Paths::with_home(home.path());
+        twr_core::workspaces::create(&root, "a").unwrap();
+        twr_core::workspaces::create(&root, "b").unwrap();
+        twr_core::workspaces::rename(&root, "a", "acme").unwrap();
+        // An older app connects by the name and stamps its calls with it.
+        assert_eq!(connect_id(&root, "acme", false).unwrap(), "a");
+        assert!(same_workspace("acme", "a", "acme"));
+        assert!(same_workspace("a", "a", "acme"));
+        // Not a name the connection wasn't made with, even one that selects it.
+        assert!(!same_workspace("acme", "a", "a"));
+        assert!(!same_workspace("b", "a", "acme"));
+        assert!(!same_workspace("nope", "a", "a"));
+        assert!(same_workspace("a", "a", "a"));
+    }
+
+    /// A phone reconnecting with the id it was given never lands on another workspace renamed
+    /// into that id's name once its own is gone, and a call stamped for the one that went is
+    /// not for it.
+    #[test]
+    fn a_stored_id_never_follows_its_name_to_another_workspace() {
+        let home = tempfile::tempdir().unwrap();
+        let root = twr_core::paths::Paths::with_home(home.path());
+        twr_core::workspaces::create(&root, "a").unwrap();
+        twr_core::workspaces::create(&root, "b").unwrap();
+        assert_eq!(connect_id(&root, "a", true).unwrap(), "a");
+        // `a` removed, and `b` renamed `a`.
+        std::fs::remove_dir_all(root.workspace("a").unwrap().data_dir).unwrap();
+        twr_core::workspaces::rename(&root, "b", "a").unwrap();
+        let e = connect_id(&root, "a", true).unwrap_err().to_string();
+        assert!(e.contains("there is no workspace a"), "{e}");
+        // By name (a first connect, an older app) it is `b` now, as named...
+        assert_eq!(connect_id(&root, "a", false).unwrap(), "b");
+        // ...and a connection to `b` made by its id refuses a call stamped `a`.
+        assert!(!same_workspace("a", "b", "b"));
+        assert!(same_workspace("a", "b", "a"));
+        // A session still on `a` runs its commands and terminals there: the `twr` it runs
+        // resolves `a` by id alone, never as `b`'s name, and refuses it gone where a command
+        // needs it (twr-cli's `a_held_id_never_reaches_a_workspace_renamed_into_it`).
+        let cli = held_twr(Path::new("twr"), "a");
+        let cli = cli.as_std();
+        assert_eq!(
+            cli.get_args().collect::<Vec<_>>(),
+            [std::ffi::OsStr::new("-w"), std::ffi::OsStr::new("a")]
+        );
+        assert!(cli.get_envs().any(|(k, v)| {
+            k == twr_core::paths::WORKSPACE_ID_ENV && v == Some(std::ffi::OsStr::new("a"))
+        }));
+        let env = |k: &str| match k {
+            "TWR_HOME" => Some(home.path().to_string_lossy().into_owned()),
+            twr_core::paths::WORKSPACE_ID_ENV => Some("a".into()),
+            _ => None,
+        };
+        let child = twr_core::paths::Paths::resolve_selected(env, Some("a")).unwrap();
+        assert!(child.workspace_id() == "a" && !child.exists());
+        let terminal = twr_core::app_commands::plan(&["attach".into(), "t".into()], "a").unwrap();
+        assert_eq!(terminal[..2], ["-w", "a"]);
+    }
+
+    /// What this crate looks workspaces up by is an id twr held (a session's, a source's, a
+    /// push observer's, the companion's): never a lookup that falls back to names, but for a
+    /// phone's first `connect` by name ([`connect_id`]). A guard for new code: a name lookup
+    /// here needs a reason, and a place in this list.
+    #[test]
+    fn held_ids_are_never_looked_up_by_name() {
+        // Matched in the code with its comments and every space and line break taken out,
+        // however rustfmt wraps a call.
+        let by_name = concat!("find_", "workspace(");
+        let env_lookup = concat!("from_env_", "in(");
+        let connect_by_name = concat!("root.find_", "workspace(workspace)?");
+        let root_lookups = [
+            concat!("Some(twr_core::paths::DEFAULT_", "WORKSPACE)"),
+            concat!("Some(DEFAULT_", "WORKSPACE)"),
+            concat!("Some(\"def", "ault\")"),
+        ];
+        for (file, text) in [
+            ("gateway/mod.rs", include_str!("mod.rs")),
+            ("gateway/identity.rs", include_str!("identity.rs")),
+            ("gateway/routes.rs", include_str!("routes.rs")),
+            ("gateway/settings.rs", include_str!("settings.rs")),
+            ("bridge.rs", include_str!("../bridge.rs")),
+            ("phone.rs", include_str!("../phone.rs")),
+            ("runtime.rs", include_str!("../runtime.rs")),
+            (
+                "remote/companion.rs",
+                include_str!("../remote/companion.rs"),
+            ),
+            ("remote/push.rs", include_str!("../remote/push.rs")),
+            ("remote/terminal.rs", include_str!("../remote/terminal.rs")),
+            ("remote/voice.rs", include_str!("../remote/voice.rs")),
+        ] {
+            let code: String = text
+                .lines()
+                .map(|l| l.split("//").next().unwrap_or_default())
+                .flat_map(str::chars)
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            let near = |i: usize| code[i..].chars().take(80).collect::<String>();
+            let lookups = code.matches(by_name).count();
+            let allowed = code.matches(connect_by_name).count();
+            assert!(
+                lookups == allowed && allowed <= usize::from(file == "gateway/mod.rs"),
+                "{file}: a lookup by name: {}",
+                code.match_indices(by_name)
+                    .map(|(i, _)| near(i))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+            for (i, _) in code.match_indices(env_lookup) {
+                let after = &code[i + env_lookup.len()..];
+                assert!(
+                    root_lookups.iter().any(|r| after.starts_with(r)),
+                    "{file}: `from_env_in` of a workspace (by id, else name): {}",
+                    near(i)
+                );
+            }
+        }
+    }
     #[test]
     fn launcher_pairing_flags_cannot_expand_read_only_invitations() {
         let args =
@@ -290,9 +446,13 @@ mod socket_tests {
             remote::push::Push::new(dir, None, None).unwrap(),
             remote::receipts::Receipts::new(dir).unwrap(),
             None,
-            (dir.join("twr"), dir.join("twr-desktop-bridge")),
+            (
+                dir.join("twr"),
+                remote::companion::Command::program(dir.join("twr-desktop-bridge")),
+            ),
             true,
             TEST_LIMITS,
+            None,
         ))
     }
     async fn spawn_gateway(
@@ -487,6 +647,322 @@ mod socket_tests {
         );
         assert_eq!(attempt("192.0.2.7:1").await, StatusCode::BAD_REQUEST);
         assert_eq!(attempt("[2001:db8:1::1]:1").await, StatusCode::BAD_REQUEST);
+    }
+    /// A hub that answers a gateway's owner calls from the device store in `dir`, as the hub
+    /// does: `hello` as the user, `device.pair_proof` from the open invitation. An `older` one
+    /// answers as a twr before 12-symbol codes: `device.pair_begin` with a 10-symbol code,
+    /// `device.pair_cancel` (noting the code in `dir`'s `cancelled`), and no
+    /// `device.pair_proof`.
+    async fn proof_hub(dir: &Path, older: bool) -> twr_core::client::Client {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use twr_core::phone_pairing::{b64url_decode, b64url_encode, decode_pin};
+        let path = dir.join("hub.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let store = dir.to_owned();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = socket.into_split();
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        let (id, p) = (&request["id"], &request["params"]);
+                        let reply = match request["method"].as_str().unwrap() {
+                            "hello" => json!({"id":id,"result":{"identity":"user:local"}}),
+                            "device.pair_begin" if older => {
+                                json!({"id":id,"result":{"code":"ABCDEFGHJK","expires_in":300}})
+                            }
+                            "device.pair_cancel" if older => {
+                                let code = p["code"].as_str().unwrap();
+                                std::fs::write(store.join("cancelled"), code).unwrap();
+                                json!({"id":id,"result":{"cancelled":true}})
+                            }
+                            "device.pair_proof" if older => json!({"id":id,"error":{
+                                "code":"method_not_found",
+                                "message":"unknown method device.pair_proof"}}),
+                            "device.pair_proof" => {
+                                let pin = decode_pin(p["pin"].as_str().unwrap()).unwrap();
+                                let nonce = b64url_decode(p["nonce"].as_str().unwrap()).unwrap();
+                                let gateway = p["gateway_id"].as_str().unwrap();
+                                match Auth::open(&store).unwrap().proof(&pin, &nonce, gateway) {
+                                    Ok(Some(proof)) => {
+                                        json!({"id":id,"result":{"proof":b64url_encode(&proof)}})
+                                    }
+                                    _ => {
+                                        json!({"id":id,"error":{"code":"not_found","message":"none open"}})
+                                    }
+                                }
+                            }
+                            method => panic!("the gateway asked the hub for {method}"),
+                        };
+                        writer
+                            .write_all(format!("{reply}\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        let mut client = twr_core::client::Client::connect(&path).await.unwrap();
+        client
+            .hello(json!({"client":"mobile-gateway"}))
+            .await
+            .unwrap();
+        client
+    }
+    /// A pinned gateway over the device store in `dir`, with [`proof_hub`] as its hub.
+    async fn pinned_server(dir: &Path) -> (Shared, identity::Identity) {
+        pinned_server_of(dir, false).await
+    }
+    /// [`pinned_server`], its hub an `older` one or not ([`proof_hub`]).
+    async fn pinned_server_of(dir: &Path, older: bool) -> (Shared, identity::Identity) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let identity = identity::Identity::ensure(dir).unwrap();
+        let server = Arc::new(Server::new(
+            Auth::open(dir).unwrap(),
+            remote::push::Push::new(dir, None, None).unwrap(),
+            remote::receipts::Receipts::new(dir).unwrap(),
+            Some(proof_hub(dir, older).await),
+            (
+                dir.join("twr"),
+                remote::companion::Command::program(dir.join("twr-desktop-bridge")),
+            ),
+            false,
+            TEST_LIMITS,
+            Some(Pinned {
+                pin: identity.pin.clone(),
+                dir: dir.to_owned(),
+                listeners: vec!["127.0.0.1:47321".parse().unwrap()],
+            }),
+        ));
+        (server, identity)
+    }
+    async fn ask_proof(server: &Shared, peer: &str, nonce: &str) -> (StatusCode, Value) {
+        let query = Ok(axum::extract::Query(ProofQuery {
+            nonce: nonce.into(),
+        }));
+        let peer: SocketAddr = peer.parse().unwrap();
+        let response = pair_proof(State(server.clone()), ConnectInfo(peer), query)
+            .await
+            .into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+    /// `/v1/pair/proof`: 404 with no invitation (or no pin), 400 for a nonce that is not 32
+    /// bytes of base64url, else a proof that checks against the code's key, this gateway's pin
+    /// and id; within `/v1/pair`'s rate limit, which the two share.
+    #[tokio::test]
+    async fn the_proof_endpoint_proves_the_open_invitation_for_this_pin() {
+        use twr_core::phone_pairing::{b64url_decode, b64url_encode, proof_key, verify_pin_proof};
+        let dir = tempfile::tempdir().unwrap();
+        let (server, identity) = pinned_server(dir.path()).await;
+        let nonce = [3u8; 32];
+        let encoded = b64url_encode(&nonce);
+        let (status, _) = ask_proof(&server, "192.0.2.1:1", &encoded).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        for bad in [
+            b64url_encode(&[3u8; 16]),
+            "not base64!".into(),
+            String::new(),
+            "A".repeat(80),
+        ] {
+            let (status, _) = ask_proof(&server, "192.0.2.2:1", &bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let code = server.auth.begin(vec!["read".into()]).unwrap();
+        let (status, body) = ask_proof(&server, "192.0.2.3:1", &encoded).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let proof = b64url_decode(body["proof"].as_str().unwrap()).unwrap();
+        let key = proof_key(&code).unwrap();
+        let gateway = server.push.gateway_id.as_str();
+        assert!(verify_pin_proof(
+            &key,
+            &identity.pin_raw,
+            &nonce,
+            gateway,
+            &proof
+        ));
+        let other = twr_core::phone_pairing::pin_bytes(b"another key");
+        assert!(!verify_pin_proof(&key, &other, &nonce, gateway, &proof));
+        // Asking was no attempt at the code: it still pairs.
+        assert!(server.auth.pair(&code, "phone").is_ok());
+        let (status, _) = ask_proof(&server, "192.0.2.3:1", &encoded).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // One peer's attempts, proofs and pairings together, run out.
+        let peer = "192.0.2.9:1";
+        for _ in 0..PAIRING_PER_PEER - 1 {
+            assert_eq!(
+                ask_proof(&server, peer, "x").await.0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let junk = Pair {
+            code: "x".into(),
+            name: "phone".into(),
+        };
+        let paired = pair(
+            State(server.clone()),
+            ConnectInfo(peer.parse().unwrap()),
+            Json(junk),
+        );
+        assert_eq!(
+            paired.await.into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            ask_proof(&server, peer, &encoded).await.0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // A gateway without a pin proves nothing.
+        let plain = tempfile::tempdir().unwrap();
+        let server = test_server(plain.path());
+        server.auth.begin(vec!["read".into()]).unwrap();
+        assert_eq!(
+            ask_proof(&server, "192.0.2.1:1", &encoded).await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    /// A hub from a twr before 12-symbol codes and typed pairing: its code is cancelled and
+    /// the gateway says to restart it, both when it begins an invitation and when a phone asks
+    /// for a proof (404, as for no invitation, never 503 or "not a pairing code").
+    #[tokio::test]
+    async fn an_older_hub_is_named_as_such() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _) = pinned_server_of(dir.path(), true).await;
+        let nonce = twr_core::phone_pairing::b64url_encode(&[5u8; 32]);
+        let (status, body) = ask_proof(&server, "192.0.2.1:1", &nonce).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let error = body["error"].as_str().unwrap();
+        assert!(
+            error.contains("older twr") && error.contains("twr hub stop"),
+            "{error}"
+        );
+        let mut owner = server.owner.lock().await.take().unwrap();
+        let pinned = PinnedInvitation {
+            pin: "p".repeat(43),
+            iroh: String::new(),
+            routes: vec![routes::configured("192.0.2.4", 47321).unwrap()],
+        };
+        for pinned in [Some(&pinned), None] {
+            let _ = std::fs::remove_file(dir.path().join("cancelled"));
+            let error = begin_invitation(&mut owner, &["read"], dir.path(), pinned)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, OLDER_HUB);
+            let cancelled = std::fs::read_to_string(dir.path().join("cancelled")).unwrap();
+            assert_eq!(cancelled, "ABCDEFGHJK");
+        }
+    }
+    /// `/health` says protocol 2 and the pin in pinned mode only; certificate mode stays 1.
+    #[tokio::test]
+    async fn health_carries_the_pin_in_pinned_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, identity) = pinned_server(dir.path()).await;
+        let Json(pinned) = health(State(server.clone())).await;
+        assert_eq!(pinned["protocol"], 2);
+        assert_eq!(pinned["service"], "twr-mobile");
+        assert_eq!(pinned["pin"], identity.pin.as_str());
+        assert_eq!(pinned["gateway_id"], server.push.gateway_id.as_str());
+        let plain = tempfile::tempdir().unwrap();
+        let Json(plain) = health(State(test_server(plain.path()))).await;
+        assert_eq!(plain["protocol"], 1, "released desktop clients require 1");
+        assert!(plain.get("pin").is_none());
+    }
+    /// A running gateway's record names its listeners in `listens`, `listen` being the first
+    /// alone; a gateway before `listens` joined them all in `listen` with commas.
+    #[test]
+    fn the_record_names_every_listener() {
+        let both: Vec<SocketAddr> = vec![
+            "0.0.0.0:47321".parse().unwrap(),
+            "[::]:47321".parse().unwrap(),
+        ];
+        let record = remote::gateway_lifecycle::Info {
+            listens: both.iter().map(ToString::to_string).collect(),
+            ..remote::gateway_lifecycle::Info::new("g".into(), both[0].to_string(), None, None)
+                .unwrap()
+        };
+        let record = serde_json::to_value(&record).unwrap();
+        assert_eq!(record["listen"], "0.0.0.0:47321");
+        assert_eq!(record["listens"], json!(["0.0.0.0:47321", "[::]:47321"]));
+        assert_eq!(listeners_of(&record), both);
+        let older = json!({"listen": "0.0.0.0:47321,[::]:47321"});
+        assert_eq!(listeners_of(&older), both);
+        assert!(listeners_of(&json!({})).is_empty());
+    }
+    /// `--pair --json` in pinned mode: today's fields, the version 2 invitation and its link;
+    /// in certificate mode today's fields alone.
+    #[test]
+    fn pinned_pair_json_carries_the_invitation_and_its_link() {
+        let gateway = "8b0f5c7e-2a44-4b8e-9d21-6a4e1c3f7b90";
+        let plain = pair_json("ABCDEFGHJK23", 1_763_900_000, &["read"], gateway, None).unwrap();
+        assert_eq!(
+            plain,
+            json!({"code":"ABCDEFGHJK23","expires_at":1_763_900_000u64,"scopes":["read"],"gateway_id":gateway})
+        );
+        let pinned = PinnedInvitation {
+            pin: twr_core::phone_pairing::pin(b"spki"),
+            iroh: "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6".into(),
+            routes: vec![
+                twr_core::phone_pairing::Route::parse("tls:192.168.1.20:47321").unwrap(),
+                twr_core::phone_pairing::Route::parse("tls:[2001:db8::5]:47321").unwrap(),
+            ],
+        };
+        let scopes = ["read", "operate"];
+        let line = pair_json(
+            "ABCDEFGHJK23",
+            1_763_900_000,
+            &scopes,
+            gateway,
+            Some(&pinned),
+        )
+        .unwrap();
+        let keys: Vec<&str> = line
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "code",
+                "expires_at",
+                "gateway_id",
+                "invitation",
+                "link",
+                "scopes"
+            ]
+        );
+        let invitation = &line["invitation"];
+        assert_eq!(invitation["type"], "twr-pair");
+        assert_eq!(invitation["version"], 2);
+        assert_eq!(invitation["id"], gateway);
+        assert_eq!(invitation["code"], "ABCDEFGHJK23");
+        assert_eq!(invitation["expiresAt"], 1_763_900_000_000u64);
+        assert_eq!(invitation["pin"], pinned.pin.as_str());
+        assert_eq!(invitation["iroh"], pinned.iroh.as_str());
+        assert_eq!(
+            invitation["routes"],
+            json!(["tls:192.168.1.20:47321", "tls:[2001:db8::5]:47321"])
+        );
+        assert_eq!(invitation["scopes"], json!(scopes));
+        let link = line["link"].as_str().unwrap();
+        let parsed = twr_core::phone_pairing::Invitation::parse(link).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), *invitation);
+        // No route to offer: no invitation.
+        let nowhere = PinnedInvitation {
+            routes: Vec::new(),
+            ..pinned
+        };
+        let error = pair_json("ABCDEFGHJK23", 1, &scopes, gateway, Some(&nowhere)).unwrap_err();
+        assert!(error.to_string().contains("--address"), "{error}");
     }
     #[test]
     fn stopped_inbox_sources_require_a_typed_socket_error() {
@@ -747,7 +1223,56 @@ mod socket_tests {
         assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), small);
     }
 }
-async fn owner_client() -> Result<twr_core::client::Client> {
+/// The workspace kept by id `id` (a phone's connection, a push observer, the inbox's ids),
+/// while it exists: never another workspace only named so (`Paths::existing_by_id`).
+fn by_id(id: &str) -> Result<twr_core::paths::Paths> {
+    root_paths()?.existing_by_id(id)
+}
+
+/// The root's paths (`default`'s), from the environment: what holds every workspace.
+fn root_paths() -> Result<twr_core::paths::Paths> {
+    twr_core::paths::Paths::from_env_in(Some(twr_core::paths::DEFAULT_WORKSPACE))
+}
+
+/// Whether a call stamped with workspace `requested` is for the workspace `connected` (an id)
+/// the connection serves: its id, or exactly the selector the connection was made with
+/// (`selector`: an older app stamps the name it connected with, a renamed workspace's
+/// original name say). Never another name that selects it now: a stamp made for a workspace
+/// since removed would follow its name onto the one renamed into it.
+fn same_workspace(requested: &str, connected: &str, selector: &str) -> bool {
+    requested == connected || requested == selector
+}
+
+/// `twr -w <id>` for the session's workspace `id`, which the child resolves by id alone
+/// ([`twr_core::paths::WORKSPACE_ID_ENV`]): once it is gone, never another workspace renamed
+/// into it.
+fn held_twr(binary: &Path, id: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .args(["-w", id])
+        .env(twr_core::paths::WORKSPACE_ID_ENV, id);
+    command
+}
+
+/// The id of the workspace a phone's `connect` of `workspace` in `root` is to: with `by_id`
+/// (an app reconnecting with the id the gateway gave it), the workspace kept by that id while
+/// it exists, never another only named so now; without (a first connect by name, an older
+/// app), the one it selects, by id first, else by name.
+fn connect_id(root: &twr_core::paths::Paths, workspace: &str, by_id: bool) -> Result<String> {
+    let ws = if by_id {
+        root.existing_by_id(workspace)?
+    } else {
+        root.find_workspace(workspace)?
+    };
+    Ok(ws.workspace_id().to_string())
+}
+
+/// A connection to the default workspace's hub as this user (the gateway's own).
+pub async fn owner_client() -> Result<twr_core::client::Client> {
+    // A unit test's gateway has a hub of its own or none: never this machine's.
+    if cfg!(test) {
+        anyhow::bail!("a gateway in a unit test never connects to this machine's hub");
+    }
     tokio::time::timeout(Duration::from_secs(30), async {
         let paths = twr_core::paths::Paths::from_env_in(Some("default"))?;
         let config = twr_core::config::Config::load_from(&paths)?;
@@ -772,14 +1297,16 @@ const REFUSED_UPGRADES_PER_PEER: u32 = 30;
 /// How long `/v1/pair` may take, reading its body included.
 const PAIR_DEADLINE: Duration = Duration::from_secs(35);
 impl Server {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         auth: Auth,
         push: Arc<remote::push::Push>,
         receipts: remote::receipts::Receipts,
         owner: Option<twr_core::client::Client>,
-        (binary, companion): (PathBuf, PathBuf),
+        (binary, companion): (PathBuf, remote::companion::Command),
         development: bool,
         limits: remote::limits::Limits,
+        pinned: Option<Pinned>,
     ) -> Self {
         let minute = Duration::from_secs(60);
         Self {
@@ -804,6 +1331,7 @@ impl Server {
             observers: Mutex::new(std::collections::HashSet::new()),
             receipts,
             receipt_waiters: Mutex::new(HashMap::new()),
+            pinned,
         }
     }
     async fn owner_call(&self, method: &str, params: Value) -> Result<Value> {
@@ -937,14 +1465,16 @@ async fn pair(
             Json(json!({"error":"Too many pairing attempts; wait a minute"})),
         );
     }
-    if ![10, 64].contains(&p.code.len()) || p.name.is_empty() || p.name.len() > 80 {
+    // A code as typed (`abcd-efgh-jk23`) is the code; anything else never reaches the hub.
+    let code = twr_core::phone_pairing::normalize_code(&p.code);
+    let (Some(code), false) = (code, p.name.is_empty() || p.name.len() > 80) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error":"Invalid pairing request"})),
         );
-    }
+    };
     let result = server
-        .owner_call("device.pair_complete", json!({"code":p.code,"name":p.name}))
+        .owner_call("device.pair_complete", json!({"code":code,"name":p.name}))
         .await;
     match result {
         Ok(mut value) => {
@@ -962,6 +1492,73 @@ async fn pair(
             )
         }
         Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"The hub is unavailable or busy. Try again when it reconnects."})),
+        ),
+    }
+}
+#[derive(Deserialize)]
+struct ProofQuery {
+    nonce: String,
+}
+/// `GET /v1/pair/proof?nonce=`: the open invitation's proof for this gateway's pin, the
+/// phone's nonce and the gateway's id, which a phone that typed the code checks before it
+/// trusts the key it was shown (docs/design/phone-pairing.md). Within `/v1/pair`'s rate limits
+/// and deadline; no attempt at the code.
+async fn pair_proof(
+    State(server): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    query: Result<axum::extract::Query<ProofQuery>, axum::extract::rejection::QueryRejection>,
+) -> impl IntoResponse {
+    use twr_core::phone_pairing::{b64url_decode, NONCE_LEN};
+    if !server.pairing.take(peer.ip()) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error":"Too many pairing attempts; wait a minute"})),
+        );
+    }
+    let nonce = query
+        .ok()
+        .map(|q| q.0.nonce)
+        .filter(|n| n.len() < 64 && b64url_decode(n).is_ok_and(|n| n.len() == NONCE_LEN));
+    let Some(nonce) = nonce else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"A nonce is 32 bytes, base64url without padding"})),
+        );
+    };
+    let none_open = || {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"No pairing invitation is open"})),
+        )
+    };
+    let Some(pinned) = &server.pinned else {
+        return none_open();
+    };
+    let params = json!({"nonce":nonce,"pin":pinned.pin,"gateway_id":server.push.gateway_id});
+    match server.owner_call("device.pair_proof", params).await {
+        Ok(value) if value["proof"].is_string() => {
+            (StatusCode::OK, Json(json!({"proof":value["proof"]})))
+        }
+        Err(error)
+            if error
+                .downcast_ref::<twr_core::proto::RpcError>()
+                .is_some_and(|e| e.code == twr_core::proto::codes::NOT_FOUND) =>
+        {
+            none_open()
+        }
+        // A hub older than typed pairing has no invitation this twr made, and no proofs.
+        Err(error)
+            if error
+                .downcast_ref::<twr_core::proto::RpcError>()
+                .is_some_and(|e| e.code == twr_core::proto::codes::METHOD_NOT_FOUND) =>
+        {
+            crate::gateway_log!("Typed pairing refused: {OLDER_HUB}");
+            let message = format!("No pairing invitation is open: {OLDER_HUB}");
+            (StatusCode::NOT_FOUND, Json(json!({ "error": message })))
+        }
+        _ => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error":"The hub is unavailable or busy. Try again when it reconnects."})),
         ),
@@ -1047,7 +1644,10 @@ struct Call {
     workspace: Option<String>,
 }
 struct WorkspaceConnection {
+    /// The workspace's id.
     workspace: String,
+    /// What the app connected with: the id, or a name of the workspace ([`same_workspace`]).
+    selector: String,
     bridge: Option<Arc<Companion>>,
 }
 struct Session {
@@ -1135,8 +1735,8 @@ impl Session {
             "This device does not have read access"
         );
         let paths = twr_core::paths::Paths::from_env_in(Some("default"))?;
-        let mut workspaces = vec!["default".to_owned()];
-        workspaces.extend(paths.named_workspaces()?);
+        // By id, the root slot's unless it was removed.
+        let workspaces = paths.workspace_ids()?;
         anyhow::ensure!(
             workspaces.len() <= 256,
             "Too many workspaces to summarize at once"
@@ -1144,7 +1744,7 @@ impl Session {
         let names = workspaces.clone();
         let stream = futures::stream::iter(workspaces).map(|workspace| async move {
             let result = tokio::time::timeout(Duration::from_secs(3), async {
-                let paths = twr_core::paths::Paths::from_env_in(Some(&workspace))?;
+                let paths = by_id(&workspace)?;
                 let config = twr_core::config::Config::load_from(&paths)?;
                 read_inbox_workspace(&config.socket_path(&paths), &workspace, &self.device, &self.token).await
             }).await;
@@ -1172,6 +1772,7 @@ impl Session {
         let p = &call.params;
         let connection = self.connection.read().await;
         let workspace = connection.workspace.clone();
+        let selector = connection.selector.clone();
         let selected_bridge = connection.bridge.clone();
         drop(connection);
         let bridge = || {
@@ -1184,7 +1785,7 @@ impl Session {
                 || call
                     .workspace
                     .as_ref()
-                    .is_none_or(|requested| requested == &workspace),
+                    .is_none_or(|requested| same_workspace(requested, &workspace, &selector)),
             "Workspace changed; review the destination before retrying"
         );
         match call.method.as_str() {
@@ -1198,6 +1799,13 @@ impl Session {
                 if let Some(error) = twr_core::paths::workspace_name_error(workspace) {
                     anyhow::bail!(error);
                 }
+                // By its id, whichever of its names the phone used: what its hub, the inbox
+                // sources and the push observers name it by (a rename leaves it). An app
+                // reconnecting with the id it was given (`by_id`) gets that workspace or none.
+                let root = root_paths()?;
+                let selector = workspace.to_string();
+                let id = connect_id(&root, workspace, p["by_id"].as_bool() == Some(true))?;
+                let workspace = id.as_str();
                 let existing = {
                     let connection = self.connection.read().await;
                     (connection.workspace == workspace)
@@ -1206,6 +1814,12 @@ impl Session {
                 };
                 if let Some(bridge) = existing.filter(|bridge| bridge.is_alive()) {
                     if bridge.call("hub.info", json!({})).await.is_ok() {
+                        {
+                            let mut connection = self.connection.write().await;
+                            if connection.workspace == workspace {
+                                connection.selector = selector.clone();
+                            }
+                        }
                         let paths = bridge.call("desktop.paths", json!({})).await?;
                         let cached = self.latest_state.lock().unwrap().clone();
                         if let Some(state) = cached {
@@ -1224,14 +1838,10 @@ impl Session {
                 }
                 let generation = self.bridge_generation.load(Ordering::SeqCst) + 1;
                 if self.device.scopes.iter().any(|s| s == "operate") {
-                    let paths = twr_core::paths::Paths::from_env_in(Some(workspace))?;
+                    let paths = by_id(workspace)?;
                     let config = twr_core::config::Config::load_from(&paths)?;
-                    twr_app::runtime::ensure_hub(
-                        &paths,
-                        &config.socket_path(&paths),
-                        &server.binary,
-                    )
-                    .await?;
+                    crate::runtime::ensure_hub(&paths, &config.socket_path(&paths), &server.binary)
+                        .await?;
                 }
                 let (events, mut received) = mpsc::channel::<Value>(256);
                 let output = self.events.clone();
@@ -1285,12 +1895,19 @@ impl Session {
                 )
                 .await?;
                 let paths = bridge.call("desktop.paths", json!({})).await?;
+                // The companion serves that id, or the connection is not made: never another
+                // workspace a lookup found meanwhile.
+                anyhow::ensure!(
+                    paths["workspace"].as_str() == Some(workspace),
+                    "there is no workspace {workspace} (it was removed or replaced meanwhile)"
+                );
                 // Prove device identity before presenting the connection as usable.
                 bridge.call("hub.info", json!({})).await?;
                 self.bridge_generation.store(generation, Ordering::SeqCst);
                 self.latest_state.lock().unwrap().take();
                 *self.connection.write().await = WorkspaceConnection {
                     workspace: workspace.into(),
+                    selector,
                     bridge: Some(Arc::new(bridge)),
                 };
                 let _ = ready.send(());
@@ -1320,7 +1937,7 @@ impl Session {
                 bridge()?.call(method, p["params"].clone()).await
             }
             "catalog" => Ok(serde_json::from_str(include_str!(
-                "../../../clients/mobile/catalog.json"
+                "../../../../clients/mobile/catalog.json"
             ))?),
             "directories" => {
                 anyhow::ensure!(
@@ -1516,8 +2133,11 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
             "cli" => {
                 let args: Vec<String> = serde_json::from_value(p["args"].clone())?;
                 device_cli_args(&self.device, &args)?;
-                let out = tokio::process::Command::new(&server.binary)
-                    .args(["-w", &workspace])
+                // In the session's workspace, by its id alone: never one renamed into it since
+                // it went. A command that needs it refuses it gone; `ws list` and `ws new` work
+                // from any workspace, existing or not (a phone whose workspace went lists and
+                // makes others).
+                let out = held_twr(&server.binary, &workspace)
                     .args(args)
                     .env_remove("TWR_DEVICE_TOKEN")
                     .output()
@@ -1573,8 +2193,11 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
                 let args = if shell {
                     vec!["-l".to_owned()]
                 } else {
+                    // As `cli`: the session's workspace by its id alone (commands for none, as
+                    // `remote`, take no `-w`).
                     twr_core::app_commands::plan(&args, &workspace)?
                 };
+                let held = (!shell).then_some(workspace.as_str());
                 let binary = if shell {
                     PathBuf::from(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()))
                 } else {
@@ -1589,6 +2212,7 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
                 if !shell {
                     let out = tokio::process::Command::new(&binary)
                         .arg("--desktop-validate")
+                        .env(twr_core::paths::WORKSPACE_ID_ENV, &workspace)
                         .args(&args)
                         .output()
                         .await?;
@@ -1604,6 +2228,7 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
                     cwd,
                     p["title"].as_str().unwrap_or("Remote terminal").to_owned(),
                     workspace.clone(),
+                    held,
                     self.terminal_events.clone(),
                     vec![device_permit, server_permit],
                 )?;
@@ -1673,7 +2298,7 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
             // this machine can make for it.
             "voice-voices" => {
                 remote::voice::allowed(&self.device)?;
-                let chosen = self.voice_store(&workspace)?.load()?.voices;
+                let chosen = self.voice_store()?.load()?.voices;
                 let natural = match remote::voice::natural_listing(&server.binary).await {
                     Ok(listing) => listing,
                     Err(e) => json!({"voices": [], "models": [], "error": format!("{e:#}")}),
@@ -1688,7 +2313,7 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
                 remote::voice::allowed(&self.device)?;
                 let lang = p["lang"].as_str().context("Language required")?;
                 let voice = p["voice"].as_str().filter(|v| !v.is_empty());
-                let chosen = remote::voice::select(&self.voice_store(&workspace)?, lang, voice)?;
+                let chosen = remote::voice::select(&self.voice_store()?, lang, voice)?;
                 Ok(json!({"by_language": chosen}))
             }
             // Downloads a model onto this machine: as much as `operate` may change here.
@@ -1718,9 +2343,10 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
     }
 }
 impl Session {
-    /// The state file of this device's speaker (its voices too).
-    fn voice_store(&self, workspace: &str) -> Result<twr_speech::StateStore> {
-        let paths = twr_core::paths::Paths::from_env_in(Some(workspace))?;
+    /// The state file of this device's speaker (its voices too), in the root's data
+    /// directory, whichever workspace the session is in.
+    fn voice_store(&self) -> Result<twr_speech::StateStore> {
+        let paths = root_paths()?;
         remote::voice::state_store(&paths.root().data_dir.join("mobile"), &self.device.id)
     }
 
@@ -1728,7 +2354,7 @@ impl Session {
     /// file, `[speech]`'s choices of what is read and attention announcements (its engine
     /// settings are this machine's and play no part: the phone speaks). It ends once the device is revoked or loses `read`.
     fn voice_start(&self, server: &Server, workspace: &str) -> Result<remote::voice::Start> {
-        let paths = twr_core::paths::Paths::from_env_in(Some(workspace))?;
+        let paths = by_id(workspace)?;
         let root = paths.root();
         let mut config = twr_core::config::Config::load_from(&root)
             .map(|c| c.speech)
@@ -1791,13 +2417,12 @@ async fn serve_socket(
     token: String,
     fragmented: bool,
 ) -> Result<()> {
-    socket
-        .send(Message::Text(
-            json!({"type":"authenticated","device":device.id,"scopes":device.scopes,"framing":fragmented})
-                .to_string()
-                .into(),
-        ))
-        .await?;
+    let mut hello = json!({"type":"authenticated","device":device.id,"scopes":device.scopes,"framing":fragmented});
+    // A pinned gateway's routes now, which the phone merges into those it knows.
+    if let Some(pinned) = &server.pinned {
+        hello["routes"] = json!(pinned.routes());
+    }
+    socket.send(Message::Text(hello.to_string().into())).await?;
     let slot = {
         let mut sessions = server.sessions.lock().await;
         if let Some(slot) = sessions.get(&device.id) {
@@ -1847,6 +2472,7 @@ async fn serve_socket(
                     token: token.clone(),
                     connection: RwLock::new(WorkspaceConnection {
                         workspace: "default".into(),
+                        selector: "default".into(),
                         bridge: None,
                     }),
                     connecting: Mutex::new(()),
@@ -2111,46 +2737,93 @@ async fn serve_socket(
     writer.abort();
     Ok(())
 }
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Where the gateway finds the programs it runs: `twr` (a hub, a device's shell, the CLI
+/// calls of a device) and the per-device companion (the desktop bridge).
+pub enum Programs {
+    /// The desktop bundle: `twr` and `twr-desktop-bridge` beside this executable, or in
+    /// `--binary-dir`.
+    Bundle,
+    /// `twr gateway`: this executable is `twr`, and its hidden `desktop-bridge` subcommand is
+    /// the companion (or `twr` in `--binary-dir`, run the same way).
+    Twr,
+}
+
+impl Programs {
+    /// `twr` and the companion's command, from `binary_dir` when given.
+    fn resolve(&self, binary_dir: Option<&Path>) -> Result<(PathBuf, remote::companion::Command)> {
+        let this = std::env::current_exe()?;
+        let dir = match binary_dir {
+            Some(dir) => dir.to_owned(),
+            None => this.parent().context("Binary directory")?.to_owned(),
+        };
+        Ok(match self {
+            Programs::Bundle => (
+                dir.join("twr"),
+                remote::companion::Command::program(dir.join("twr-desktop-bridge")),
+            ),
+            Programs::Twr => {
+                let twr = if binary_dir.is_some() {
+                    dir.join("twr")
+                } else {
+                    this
+                };
+                let companion = remote::companion::Command {
+                    program: twr.clone(),
+                    args: vec![BRIDGE_SUBCOMMAND.into()],
+                };
+                (twr, companion)
+            }
+        })
+    }
+}
+
+/// `twr`'s hidden subcommand that runs the desktop bridge ([`crate::bridge::run`]).
+pub const BRIDGE_SUBCOMMAND: &str = "desktop-bridge";
+
+/// The gateway, given its arguments: what `twr-mobile-gateway` and `twr gateway` run.
+pub async fn run(args: Args, programs: Programs) -> Result<()> {
     // The app starts the gateway, which outlives it and may start a hub: neither may keep
     // the app's crash handler.
-    twr_app::runtime::forget_inherited_crash_handler();
+    crate::runtime::forget_inherited_crash_handler();
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let args = Args::parse();
     if let Some(path) = args.log_file.clone() {
         remote::gateway_lifecycle::set_log_file(path);
     }
     let invitation_scopes = pairing_scopes(&args);
-    let administration = args.pair_only
-        || args.list_devices
-        || args.gateway_info
-        || args.stop_gateway
-        || args.cancel_invitation
-        || args.revoke.is_some();
+    let mode = if args.development {
+        Mode::Development
+    } else if args.tls_cert.is_some() {
+        Mode::Certificate
+    } else {
+        Mode::Pinned
+    };
     anyhow::ensure!(
-        !args.development || (cfg!(debug_assertions) && args.listen.ip().is_loopback()),
+        !args.development
+            || (cfg!(debug_assertions) && args.listen.is_none_or(|l| l.ip().is_loopback())),
         "Cleartext development transport requires a debug build on loopback"
     );
-    anyhow::ensure!(
-        administration || args.development || (args.tls_cert.is_some() && args.tls_key.is_some()),
-        "TLS certificate and key are required. Debug loopback tests may use --development"
-    );
-    let dir = args.binary_dir.unwrap_or(
-        std::env::current_exe()?
-            .parent()
-            .context("Binary directory")?
-            .to_owned(),
-    );
-    let binary = dir.join("twr");
-    let companion = dir.join("twr-desktop-bridge");
+    let (binary, companion) = programs.resolve(args.binary_dir.as_deref())?;
     let paths = twr_core::paths::Paths::from_env_in(Some("default"))?;
     let mobile_dir = paths.config_file.with_file_name("mobile");
+    // A pinned gateway's saved settings, with `--address` saved for later runs. Only `twr
+    // phone` turns autostart on: a gateway started any other way (the desktop app, a bare
+    // `twr gateway`) never does.
+    let settings = match mode {
+        Mode::Pinned => Some(settings_with(&mobile_dir, args.address.as_deref())?),
+        _ => None,
+    };
     if args.gateway_info {
-        println!("{}", remote::gateway_lifecycle::info(&mobile_dir).await?);
+        println!("{}", gateway_info(&mobile_dir).await?);
         return Ok(());
     }
     if args.stop_gateway {
+        // Stopped is stopped: a hub that starts doesn't bring it back (`twr phone` does).
+        if let Some(mut saved) = settings::Settings::load(&mobile_dir)? {
+            if saved.autostart {
+                saved.autostart = false;
+                saved.save(&mobile_dir)?;
+            }
+        }
         remote::gateway_lifecycle::stop(
             &mobile_dir,
             args.expected_instance
@@ -2192,9 +2865,9 @@ async fn main() -> Result<()> {
         println!("{}", json!({"cancelled":cancelled}));
         return Ok(());
     }
-    let auth = Auth::open(&paths.config_file.with_file_name("mobile"))?;
+    let auth = Auth::open(&mobile_dir)?;
     let config = twr_core::config::Config::load_from(&paths)?;
-    twr_app::runtime::ensure_hub(&paths, &config.socket_path(&paths), &binary).await?;
+    crate::runtime::ensure_hub(&paths, &config.socket_path(&paths), &binary).await?;
     let mut local = owner_client().await?;
     if let Some(id) = args.revoke {
         local.call("device.revoke", json!({"id":id})).await?;
@@ -2204,34 +2877,83 @@ async fn main() -> Result<()> {
         println!("{}", local.call("device.list", json!({})).await?);
         return Ok(());
     }
-    // Only an invitation: now. A gateway that serves too begins one only once nothing of its
-    // start can fail any more (below), so one that is about to exit never shows a code.
+    // Only an invitation: now, for the gateway that runs (a pinned one's carries its pin and
+    // routes). A gateway that serves too begins one only once nothing of its start can fail
+    // any more (below), so one that is about to exit never shows a code.
     if args.pair && args.pair_only {
-        announce_pairing(&mut local, &invitation_scopes, args.pair_json, &mobile_dir).await?;
+        let pinned = running_pinned(&mobile_dir).await?;
+        let announced = announce_pairing(
+            &mut local,
+            &invitation_scopes,
+            args.pair_json,
+            &mobile_dir,
+            pinned.as_ref(),
+        );
+        announced.await?;
         return Ok(());
     }
-    let pairing = args.pair.then(|| {
-        (
-            invitation_scopes.clone(),
-            args.pair_json,
-            mobile_dir.clone(),
-        )
-    });
-    let push = remote::push::Push::new(
-        &paths.config_file.with_file_name("mobile"),
-        args.push_config.as_deref(),
-        args.push_test_log,
+    let push =
+        remote::push::Push::new(&mobile_dir, args.push_config.as_deref(), args.push_test_log)?;
+    // Pinned mode: the identity, made the first time.
+    let identity = match mode {
+        Mode::Pinned => Some(identity::Identity::ensure(&mobile_dir)?),
+        _ => None,
+    };
+    let wanted: Vec<(SocketAddr, bool)> = match (args.listen, &settings) {
+        (Some(listen), _) => vec![(listen, true)],
+        (None, Some(settings)) if !settings.listen.is_empty() => {
+            settings.listen.iter().map(|l| (*l, true)).collect()
+        }
+        // Every IPv4 address, and IPv6's too where it binds.
+        (None, Some(_)) => {
+            let [v4, v6] = ALL_ADDRESSES;
+            vec![(v4, true), (v6, false)]
+        }
+        (None, None) => vec![(
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), DEFAULT_PORT),
+            true,
+        )],
+    };
+    let mut listeners = Vec::new();
+    for (address, required) in wanted {
+        match bind(address) {
+            Ok(listener) => listeners.push(listener),
+            Err(error) if !required => {
+                crate::gateway_log!("Not listening on {address}: {error}")
+            }
+            Err(error) => return Err(error).with_context(|| format!("listening on {address}")),
+        }
+    }
+    let bound: Vec<SocketAddr> = listeners
+        .iter()
+        .map(std::net::TcpListener::local_addr)
+        .collect::<std::io::Result<_>>()?;
+    let listens: Vec<String> = bound.iter().map(ToString::to_string).collect();
+    let (cert_path, key_path) = match (&identity, &args.tls_cert, &args.tls_key) {
+        (Some(_), _, _) => (
+            Some(mobile_dir.join(identity::CERT_FILE)),
+            Some(mobile_dir.join(identity::KEY_FILE)),
+        ),
+        (None, cert, key) => (cert.clone(), key.clone()),
+    };
+    // `listen` is the first address alone, as older readers of the record parse it; `listens`
+    // has them all.
+    let mut info = remote::gateway_lifecycle::Info::new(
+        push.gateway_id.clone(),
+        listens.first().cloned().unwrap_or_default(),
+        cert_path.as_deref(),
+        key_path.as_deref(),
     )?;
-    let mut lifecycle = remote::gateway_lifecycle::Lifecycle::acquire(
-        &mobile_dir,
-        remote::gateway_lifecycle::Info::new(
-            push.gateway_id.clone(),
-            args.listen.to_string(),
-            args.tls_cert.as_deref(),
-            args.tls_key.as_deref(),
-        )?,
-    )?;
+    info.listens = listens.clone();
+    info.mode = mode.name().into();
+    info.pin = identity.as_ref().map(|i| i.pin.clone());
+    let mut lifecycle = remote::gateway_lifecycle::Lifecycle::acquire(&mobile_dir, info)?;
     let receipts = remote::receipts::Receipts::new(&paths.root().data_dir.join("mobile"))?;
+    let pinned = identity.as_ref().map(|identity| Pinned {
+        pin: identity.pin.clone(),
+        dir: mobile_dir.clone(),
+        listeners: bound.clone(),
+    });
     let server = Arc::new(Server::new(
         auth,
         push,
@@ -2240,6 +2962,7 @@ async fn main() -> Result<()> {
         (binary, companion),
         args.development,
         remote::limits::PRE_AUTH,
+        pinned,
     ));
     start_observer(server.clone(), "default".into()).await;
     for workspace in server.push.workspaces().await {
@@ -2275,117 +2998,423 @@ async fn main() -> Result<()> {
     });
     let connections = server.connections.clone();
     let app = router(server).into_make_service_with_connect_info::<SocketAddr>();
-    let listener = std::net::TcpListener::bind(args.listen)?;
-    crate::gateway_log!("twr mobile gateway listening on {}", args.listen);
-    if args.development {
-        let http = http_server(listener, axum_server::accept::DefaultAcceptor, connections)?;
-        if let Some((scopes, json, dir)) = &pairing {
-            announce_pairing(&mut owner_client().await?, scopes, *json, dir).await?;
-        }
-        tokio::select! {
-            result = http.serve(app) => { result?; },
-            _ = lifecycle.stopping() => {},
-        }
-    } else {
-        let cert = args.tls_cert.unwrap();
-        let key = args.tls_key.unwrap();
-        use sha2::Digest;
-        let cert_bytes = std::fs::read(&cert)?;
-        let key_bytes = std::fs::read(&key)?;
-        let config =
-            axum_server::tls_rustls::RustlsConfig::from_pem(cert_bytes.clone(), key_bytes.clone())
-                .await?;
-        let reload = config.clone();
-        let metadata = lifecycle.metadata();
-        metadata.certificate(hex::encode(sha2::Sha256::digest(&cert_bytes)), &cert, &key)?;
-        let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-            .context("Register gateway TLS reload signal")?;
-        tokio::spawn(async move {
-            let signature = |certificate: &[u8], private_key: &[u8]| {
-                let mut digest = sha2::Sha256::new();
-                digest.update(certificate);
-                digest.update(private_key);
-                digest.finalize().to_vec()
-            };
-            let mut previous = signature(&cert_bytes, &key_bytes);
-            let mut tick = tokio::time::interval(Duration::from_secs(5));
-            loop {
-                tokio::select! { _ = tick.tick() => {}, _ = hangup.recv() => {} }
-                let (Ok(certificate), Ok(private_key)) =
-                    (std::fs::read(&cert), std::fs::read(&key))
-                else {
-                    let _ = metadata.renewal("failed", Some("Certificate or private key could not be read; the previous TLS context remains active"));
-                    crate::gateway_log!("Gateway TLS renewal files could not be read; the previous certificate remains active");
-                    continue;
-                };
-                let current = signature(&certificate, &private_key);
-                if current == previous {
-                    continue;
-                }
-                // Parse exactly the bytes whose digest is published. Certbot's symlink
-                // rotation cannot make metadata claim a certificate we have not loaded.
-                let _ = metadata.renewal("pending", None);
-                match reload
-                    .reload_from_pem(certificate.clone(), private_key)
-                    .await
-                {
-                    Ok(()) => {
-                        previous = current;
-                        let _ = metadata.certificate(
-                            hex::encode(sha2::Sha256::digest(&certificate)),
-                            &cert,
-                            &key,
-                        );
-                    }
-                    Err(_) => {
-                        let _ = metadata.renewal("failed", Some("Certificate or private key could not be loaded; the previous TLS context remains active"));
-                        crate::gateway_log!("Gateway TLS renewal could not be loaded; the previous certificate remains active");
-                    }
-                }
+    crate::gateway_log!(
+        "twr mobile gateway listening on {} ({} mode)",
+        listens.join(", "),
+        mode.name()
+    );
+    // Every listener serves, until one fails or the gateway is asked to stop.
+    type Serving = std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
+    let mut serving: Vec<Serving> = Vec::new();
+    match mode {
+        Mode::Development => {
+            for listener in listeners {
+                let http = http_server(
+                    listener,
+                    axum_server::accept::DefaultAcceptor,
+                    connections.clone(),
+                )?;
+                serving.push(Box::pin(http.serve(app.clone())));
             }
-        });
-        let tls = axum_server::tls_rustls::RustlsAcceptor::new(config);
-        let https = http_server(listener, tls, connections)?;
-        if let Some((scopes, json, dir)) = &pairing {
-            announce_pairing(&mut owner_client().await?, scopes, *json, dir).await?;
         }
-        tokio::select! {
-            result = https.serve(app) => { result?; },
-            _ = lifecycle.stopping() => {},
+        Mode::Pinned => {
+            let identity = identity.context("pinned mode has an identity")?;
+            let config = axum_server::tls_rustls::RustlsConfig::from_pem(
+                identity.cert_pem.clone().into_bytes(),
+                identity.key_pem.clone().into_bytes(),
+            )
+            .await?;
+            // The certificate is made again, for the same key, before it ends: the pin stays.
+            let (reload, metadata, dir) =
+                (config.clone(), lifecycle.metadata(), mobile_dir.clone());
+            tokio::spawn(async move {
+                let mut served = identity.cert_pem;
+                let mut tick = tokio::time::interval(Duration::from_secs(6 * 3600));
+                loop {
+                    tick.tick().await;
+                    let renewed = match identity::Identity::ensure(&dir) {
+                        Ok(renewed) if renewed.cert_pem != served => renewed,
+                        Ok(_) => continue,
+                        Err(error) => {
+                            crate::gateway_log!(
+                                "The gateway's identity could not be checked: {error:#}"
+                            );
+                            continue;
+                        }
+                    };
+                    let loaded = reload.reload_from_pem(
+                        renewed.cert_pem.clone().into_bytes(),
+                        renewed.key_pem.into_bytes(),
+                    );
+                    match loaded.await {
+                        Ok(()) => {
+                            use sha2::Digest;
+                            let digest = hex::encode(sha2::Sha256::digest(&renewed.cert_pem));
+                            let _ = metadata.certificate(
+                                digest,
+                                &dir.join(identity::CERT_FILE),
+                                &dir.join(identity::KEY_FILE),
+                            );
+                            served = renewed.cert_pem;
+                        }
+                        Err(error) => crate::gateway_log!(
+                            "The renewed identity certificate could not be loaded: {error}"
+                        ),
+                    }
+                }
+            });
+            for listener in listeners {
+                let tls = axum_server::tls_rustls::RustlsAcceptor::new(config.clone());
+                let https = http_server(listener, tls, connections.clone())?;
+                serving.push(Box::pin(https.serve(app.clone())));
+            }
         }
+        Mode::Certificate => {
+            let cert = args
+                .tls_cert
+                .context("certificate mode has a certificate")?;
+            let key = args.tls_key.context("certificate mode has a key")?;
+            use sha2::Digest;
+            let cert_bytes = std::fs::read(&cert)?;
+            let key_bytes = std::fs::read(&key)?;
+            let config = axum_server::tls_rustls::RustlsConfig::from_pem(
+                cert_bytes.clone(),
+                key_bytes.clone(),
+            )
+            .await?;
+            let reload = config.clone();
+            let metadata = lifecycle.metadata();
+            metadata.certificate(hex::encode(sha2::Sha256::digest(&cert_bytes)), &cert, &key)?;
+            let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .context("Register gateway TLS reload signal")?;
+            tokio::spawn(async move {
+                let signature = |certificate: &[u8], private_key: &[u8]| {
+                    let mut digest = sha2::Sha256::new();
+                    digest.update(certificate);
+                    digest.update(private_key);
+                    digest.finalize().to_vec()
+                };
+                let mut previous = signature(&cert_bytes, &key_bytes);
+                let mut tick = tokio::time::interval(Duration::from_secs(5));
+                loop {
+                    tokio::select! { _ = tick.tick() => {}, _ = hangup.recv() => {} }
+                    let (Ok(certificate), Ok(private_key)) =
+                        (std::fs::read(&cert), std::fs::read(&key))
+                    else {
+                        let _ = metadata.renewal("failed", Some("Certificate or private key could not be read; the previous TLS context remains active"));
+                        crate::gateway_log!("Gateway TLS renewal files could not be read; the previous certificate remains active");
+                        continue;
+                    };
+                    let current = signature(&certificate, &private_key);
+                    if current == previous {
+                        continue;
+                    }
+                    // Parse exactly the bytes whose digest is published. Certbot's symlink
+                    // rotation cannot make metadata claim a certificate we have not loaded.
+                    let _ = metadata.renewal("pending", None);
+                    match reload
+                        .reload_from_pem(certificate.clone(), private_key)
+                        .await
+                    {
+                        Ok(()) => {
+                            previous = current;
+                            let _ = metadata.certificate(
+                                hex::encode(sha2::Sha256::digest(&certificate)),
+                                &cert,
+                                &key,
+                            );
+                        }
+                        Err(_) => {
+                            let _ = metadata.renewal("failed", Some("Certificate or private key could not be loaded; the previous TLS context remains active"));
+                            crate::gateway_log!("Gateway TLS renewal could not be loaded; the previous certificate remains active");
+                        }
+                    }
+                }
+            });
+            for listener in listeners {
+                let tls = axum_server::tls_rustls::RustlsAcceptor::new(config.clone());
+                let https = http_server(listener, tls, connections.clone())?;
+                serving.push(Box::pin(https.serve(app.clone())));
+            }
+        }
+    }
+    if args.pair {
+        let pinned = running_pinned(&mobile_dir).await?;
+        let mut owner = owner_client().await?;
+        let announced = announce_pairing(
+            &mut owner,
+            &invitation_scopes,
+            args.pair_json,
+            &mobile_dir,
+            pinned.as_ref(),
+        );
+        announced.await?;
+    }
+    tokio::select! {
+        (result, _, _) = futures::future::select_all(serving) => { result?; },
+        _ = lifecycle.stopping() => {},
     }
     Ok(())
 }
+
+/// The gateway's port when none is given.
+pub const DEFAULT_PORT: u16 = 47321;
+/// Where a pinned gateway listens when its settings name nowhere: every IPv4 address, and
+/// every IPv6 one where IPv6 binds.
+pub const ALL_ADDRESSES: [SocketAddr; 2] = [
+    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), DEFAULT_PORT),
+    SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), DEFAULT_PORT),
+];
+
+/// How a gateway serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// Its own key, which phones pin (no `--tls-cert`).
+    Pinned,
+    /// `--tls-cert` and `--tls-key`, which phones trust as the system does.
+    Certificate,
+    /// Cleartext loopback, debug builds only.
+    Development,
+}
+impl Mode {
+    fn name(self) -> &'static str {
+        match self {
+            Mode::Pinned => "pinned",
+            Mode::Certificate => "certificate",
+            Mode::Development => "development",
+        }
+    }
+}
+
+/// A listener on `address`: an IPv6 one for IPv6 only, so that it and an IPv4 one on the same
+/// port go together, and an IPv4 peer is never seen as a mapped IPv6 address.
+fn bind(address: SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    if address.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.set_reuse_address(true)?;
+    socket.bind(&address.into())?;
+    socket.listen(1024)?;
+    Ok(socket.into())
+}
+
+/// The pinned gateway's saved settings in `dir` (the defaults, autostart off, when there are
+/// none), with `address` saved when given. Nothing is written without one.
+fn settings_with(dir: &Path, address: Option<&str>) -> Result<settings::Settings> {
+    let saved = settings::Settings::load(dir)?;
+    let mut settings = saved.clone().unwrap_or_default();
+    let Some(address) = address else {
+        return Ok(settings);
+    };
+    settings.set_address(address)?;
+    if saved.as_ref() != Some(&settings) {
+        settings.save(dir)?;
+    }
+    Ok(settings)
+}
+
+/// What an invitation of a pinned gateway carries beside its code.
+pub struct PinnedInvitation {
+    pub pin: String,
+    pub iroh: String,
+    pub routes: Vec<twr_core::phone_pairing::Route>,
+}
+
+/// The listeners a running gateway's record `info` names: its `listens`, or from a gateway
+/// before them, its `listen` (which joined them with commas).
+pub fn listeners_of(info: &Value) -> Vec<SocketAddr> {
+    let listens: Vec<&str> = match info["listens"].as_array() {
+        Some(listens) => listens.iter().filter_map(Value::as_str).collect(),
+        None => info["listen"].as_str().unwrap_or("").split(',').collect(),
+    };
+    listens
+        .iter()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect()
+}
+
+/// The running gateway of `dir`'s invitation parts when it runs in pinned mode; `None` when
+/// none runs, or one runs in another mode.
+pub async fn running_pinned(dir: &Path) -> Result<Option<PinnedInvitation>> {
+    let info = remote::gateway_lifecycle::info(dir).await?;
+    if info["running"] != true || info["mode"] != "pinned" {
+        return Ok(None);
+    }
+    let identity = identity::Identity::load(dir)?.context("the gateway's identity is missing")?;
+    anyhow::ensure!(
+        info["pin"] == identity.pin.as_str(),
+        "the running gateway serves another key than its directory holds: restart it"
+    );
+    let listeners = listeners_of(&info);
+    Ok(Some(PinnedInvitation {
+        pin: identity.pin,
+        iroh: identity.iroh,
+        routes: routes::current(dir, &listeners),
+    }))
+}
+
+/// `--gateway-info`: the lifecycle's record, and the pin and routes of a pinned gateway (one
+/// that runs, or the one that would start when none does).
+pub async fn gateway_info(dir: &Path) -> Result<Value> {
+    let mut info = remote::gateway_lifecycle::info(dir).await?;
+    let running = info["running"] == true;
+    if running && info["mode"] != "pinned" {
+        return Ok(info);
+    }
+    let listeners = if running {
+        listeners_of(&info)
+    } else {
+        match settings::Settings::load(dir)? {
+            Some(settings) if !settings.listen.is_empty() => settings.listen,
+            _ => ALL_ADDRESSES.to_vec(),
+        }
+    };
+    if let Some(identity) = identity::Identity::load(dir)? {
+        info["pin"] = json!(identity.pin);
+        let routes: Vec<String> = routes::current(dir, &listeners)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        info["routes"] = json!(routes);
+    }
+    Ok(info)
+}
+
+/// This machine's name, as an invitation shows it: its host name up to the first dot.
+pub fn hub_name() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname writes at most `buf.len()` bytes into `buf`.
+    let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0;
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]);
+    let short = name.split('.').next().unwrap_or("").trim();
+    if ok && !short.is_empty() {
+        short.chars().take(80).collect()
+    } else {
+        "twr".into()
+    }
+}
+
+/// The JSON line `--pair --json` prints for code `code`, ending at `expires_at` (seconds),
+/// with `scopes`: in pinned mode (`pinned`) it carries the version 2 invitation and its link
+/// too (docs/design/phone-pairing.md#gateway-command-line-output).
+pub fn pair_json(
+    code: &str,
+    expires_at: u64,
+    scopes: &[&str],
+    gateway_id: &str,
+    pinned: Option<&PinnedInvitation>,
+) -> Result<Value> {
+    let mut line = json!({
+        "code": code,
+        "expires_at": expires_at,
+        "scopes": scopes,
+        "gateway_id": gateway_id,
+    });
+    if let Some(pinned) = pinned {
+        anyhow::ensure!(
+            !pinned.routes.is_empty(),
+            "This machine has no address a phone could reach the gateway at: give one with \
+             --address"
+        );
+        let scopes: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
+        let invitation = twr_core::phone_pairing::Invitation::new(
+            gateway_id,
+            &hub_name(),
+            &pinned.pin,
+            Some(pinned.iroh.clone()),
+            code,
+            expires_at * 1000,
+            &pinned.routes,
+            &scopes,
+        )?;
+        line["link"] = json!(invitation.to_link());
+        line["invitation"] = serde_json::to_value(&invitation)?;
+    }
+    Ok(line)
+}
+
 /// Begins a device invitation with `scopes` on the hub (`device.pair_begin`, as the owner
-/// through `owner`) and prints its code: as JSON with `json` (with the gateway id from the
-/// gateway directory `dir`), else as a line.
+/// through `owner`): the [`pair_json`] line for it, with the gateway id from the gateway
+/// directory `dir` and a pinned gateway's invitation. An invitation it cannot show is cancelled.
+pub async fn begin_invitation(
+    owner: &mut twr_core::client::Client,
+    scopes: &[&str],
+    dir: &Path,
+    pinned: Option<&PinnedInvitation>,
+) -> Result<Value> {
+    let pairing_started = remote::auth::now();
+    let begun = owner
+        .call("device.pair_begin", json!({"scopes":scopes}))
+        .await?;
+    let code = begun["code"].as_str().context("Invalid pairing reply")?;
+    let expires_at = pairing_started
+        + begun["expires_in"]
+            .as_u64()
+            .unwrap_or(300)
+            .min(twr_core::devices::PAIRING_SECONDS);
+    let gateway_id = std::fs::read_to_string(dir.join("gateway-id")).unwrap_or_default();
+    // A hub older than 12-symbol codes makes 10-symbol ones, which nothing of this twr takes.
+    let line = match twr_core::phone_pairing::normalize_code(code) {
+        Some(_) => pair_json(code, expires_at, scopes, gateway_id.trim(), pinned),
+        None => Err(anyhow::anyhow!(OLDER_HUB)),
+    };
+    if line.is_err() {
+        let _ = owner.call("device.pair_cancel", json!({"code":code})).await;
+    }
+    line
+}
+
+/// What the gateway, `twr phone` and the TUI say when the hub that runs is from a twr older
+/// than 12-symbol pairing codes and `device.pair_proof`.
+pub const OLDER_HUB: &str = "the twr hub that runs is from an older twr, which can't pair \
+                             phones with this one: restart it (`twr hub stop`, then run twr \
+                             again)";
+/// [`begin_invitation`], printed: as its JSON line with `json`, else as lines.
 async fn announce_pairing(
     owner: &mut twr_core::client::Client,
     scopes: &[&str],
     json: bool,
     dir: &Path,
+    pinned: Option<&PinnedInvitation>,
 ) -> Result<()> {
-    let pairing_started = remote::auth::now();
-    let code = owner
-        .call("device.pair_begin", json!({"scopes":scopes}))
-        .await?;
+    let line = begin_invitation(owner, scopes, dir, pinned).await?;
     if json {
-        println!(
-            "{}",
-            json!({
-                "code": code["code"],
-                "expires_at": pairing_started + code["expires_in"].as_u64().unwrap_or(300).min(300),
-                "scopes": scopes,
-                "gateway_id": std::fs::read_to_string(dir.join("gateway-id")).unwrap_or_default().trim(),
-            })
-        );
-    } else {
-        println!(
-            "Pairing code (one use, five minutes): {}",
-            code["code"].as_str().unwrap_or("")
-        );
+        println!("{line}");
+        return Ok(());
+    }
+    println!(
+        "Pairing code (one use, five minutes): {}",
+        twr_core::phone_pairing::display_code(line["code"].as_str().unwrap_or(""))
+    );
+    if let Some(link) = line["link"].as_str() {
+        println!("Link: {link}");
+        for route in line["invitation"]["routes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            println!("Route: {}", route.as_str().unwrap_or(""));
+        }
     }
     Ok(())
+}
+/// `GET /health`: the gateway's id; in pinned mode protocol 2 and the pin it serves. A
+/// certificate-mode gateway stays protocol 1, which released desktop clients require.
+async fn health(State(server): State<Shared>) -> Json<Value> {
+    let mut health =
+        json!({"service":"twr-mobile","protocol":1,"gateway_id":server.push.gateway_id});
+    if let Some(pinned) = &server.pinned {
+        health["protocol"] = json!(2);
+        health["pin"] = json!(pinned.pin);
+    }
+    Json(health)
 }
 fn router(server: Shared) -> Router {
     Router::new()
@@ -2396,11 +3425,15 @@ fn router(server: Shared) -> Router {
                 pair_deadline,
             )),
         )
-        .route("/v1/socket", get(upgrade))
         .route(
-            "/health",
-            get(|State(server):State<Shared>| async move { Json(json!({"service":"twr-mobile","protocol":1,"gateway_id":server.push.gateway_id})) }),
+            "/v1/pair/proof",
+            get(pair_proof).layer(axum::middleware::from_fn_with_state(
+                server.clone(),
+                pair_deadline,
+            )),
         )
+        .route("/v1/socket", get(upgrade))
+        .route("/health", get(health))
         .layer(axum::extract::DefaultBodyLimit::max(4096))
         .with_state(server)
 }
@@ -2443,13 +3476,15 @@ async fn start_observer(server: Shared, workspace: String) {
     });
 }
 async fn observe_push(server: &Server, workspace: &str) -> Result<()> {
+    // By id alone: a stored id whose workspace was removed reaches none, never one renamed
+    // into it since.
     use twr_core::{
         client::Client,
         client_state::{ClientFold, FOLD},
         config::Config,
         notify::{still_due, Held, Policy},
     };
-    let paths = twr_core::paths::Paths::from_env_in(Some(workspace))?;
+    let paths = by_id(workspace)?;
     let config = Config::load_from(&paths)?;
     let mut client = Client::connect(&config.socket_path(&paths)).await?;
     let hello = client.hello(json!({"client":"mobile-notify"})).await?;

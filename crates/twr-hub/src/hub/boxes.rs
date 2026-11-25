@@ -296,6 +296,18 @@ pub(super) fn add_box(inner: &Arc<Inner>, name: &str, cfg: BoxConfig) -> Result<
     Ok(())
 }
 
+/// Why a hub of a workspace you created (named `name`) has no boxes, and how to reach them
+/// with `twr <cmd>`: they belong to the hub of the workspace in twr's data directory, which
+/// `-w default` selects whatever it is named and whichever workspace is the default.
+fn boxes_elsewhere(name: &str, cmd: &str) -> String {
+    format!(
+        "boxes belong to the hub of the workspace in twr's data directory \
+         ({}), not workspace {name}'s: run `twr -w {} {cmd}`",
+        twr_core::paths::DEFAULT_WORKSPACE,
+        twr_core::paths::DEFAULT_WORKSPACE
+    )
+}
+
 impl Hub {
     /// `box.add {name}` (users only, see the module docs): box `name` from the hub's config
     /// file and the `boxes.toml` next to it, read again now, added to the running hub. Returns
@@ -346,7 +358,8 @@ impl Hub {
         if self.inner.workspace.is_some() && transport != BoxTransport::Link {
             return Err(rpc(
                 codes::UNSUPPORTED,
-                "SSH, command and token boxes belong to the default workspace",
+                "SSH, command and token boxes belong to the hub of the workspace in twr's data \
+                 directory (`twr -w default box add`)",
             ));
         }
         let already = match add_box(&self.inner, name, cfg.clone()) {
@@ -483,13 +496,10 @@ impl Hub {
                 "only the user restarts box daemons (`twr box restart`)",
             ));
         }
-        if let Some(w) = &self.inner.workspace {
+        if self.inner.workspace.is_some() {
             return Err(rpc(
                 codes::UNSUPPORTED,
-                format!(
-                    "boxes belong to the default workspace's hub, not workspace {w}'s: restart \
-                     it without -w"
-                ),
+                boxes_elsewhere(&self.inner.workspace_name(), "box restart"),
             ));
         }
         let Some(rbox) = self.inner.remote(name) else {
@@ -634,13 +644,10 @@ impl Hub {
                 "only the user changes box tokens (`twr box token`, `twr box remove`)",
             ));
         }
-        if let Some(w) = &self.inner.workspace {
+        if self.inner.workspace.is_some() {
             return Err(rpc(
                 codes::UNSUPPORTED,
-                format!(
-                    "boxes belong to the default workspace's hub, not workspace {w}'s: run it \
-                     without -w"
-                ),
+                boxes_elsewhere(&self.inner.workspace_name(), "box token"),
             ));
         }
         let Some(file) = self.inner.config_file.clone() else {

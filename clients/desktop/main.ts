@@ -40,14 +40,23 @@ import { localUploadRequest } from "./upload-request";
 import {
   cliArgs,
   nonInteractiveArgs,
+  runsWithoutWorkspace,
   externalUrl,
   terminalSchema,
   sizeSchema,
   workspaceSchema,
 } from "./validation";
 import type { DesktopAppearance, DesktopEvent } from "../shared/types";
+import { startWorkspace } from "../shared/workspaceTree";
 import { readOmarchyTheme, watchOmarchyTheme } from "./omarchy-theme";
-import { ENGINE_BINARIES, cleanupEngines, stageEngines } from "./engines";
+import {
+  ENGINE_BINARIES,
+  EngineDigests,
+  cleanupEngines,
+  stageEngines,
+} from "./engines";
+import { engineHubs } from "./engine-hubs";
+import { buildIdOf, engineDifference, type Engine } from "../shared/engineHubs";
 import { parseLoginEnvironment, runLoginShell } from "./login-env";
 import { discoverCatalog } from "./catalog";
 import { AppServices } from "./app-services";
@@ -99,6 +108,15 @@ if (app.isPackaged && process.env.TWR_DESKTOP_TEST_AUTOMATION !== "1") {
 let window: BrowserWindow;
 let bridge: Bridge | undefined;
 let workspace = process.env.TWR_WORKSPACE || "default";
+// The workspace saved from the last run, and whether the one to open at start was settled
+// (`bootstrap`, from `TWR_WORKSPACE`, that one or the default workspace).
+let savedWorkspaceName: string | undefined;
+let startSettled = !!process.env.TWR_WORKSPACE;
+// `workspace` is `TWR_WORKSPACE` as a person gave it (a name, maybe), until a connection says
+// the id it serves.
+let workspaceTyped = !!process.env.TWR_WORKSPACE;
+// A workspace was connected in this session ({@link runsWithoutWorkspace}).
+let workspaceEverConnected = false;
 let binaries: { twr: string; bridge: string; gateway: string };
 let quitting = false;
 let quitRequested = false;
@@ -118,6 +136,8 @@ let openingTerminals = 0;
 let remoteTransport: DesktopTransport;
 let services: AppServices | undefined;
 let hubVersion: string | undefined;
+// The bundled twr's build id (`hub.info`'s `build` of a hub it started), once staged.
+let engineBuild: string | undefined;
 let voice: DesktopVoice | undefined;
 let voices: DesktopVoices | undefined;
 // The microphone is granted only after the user turned voice mode on (`voice-arm`), and only
@@ -189,9 +209,13 @@ if (!app.isPackaged && process.env.TWR_DESKTOP_TEST_USER_DATA)
 // Crash reports stay on this machine (app.getPath("crashDumps")); nothing is uploaded.
 crashReporter.start({ uploadToServer: false });
 const appFile = resolve(__dirname, "../dist/index.html");
-const env = (): NodeJS.ProcessEnv => ({
-  ...loginEnv,
-  PATH: [
+const env = (): NodeJS.ProcessEnv => {
+  // Only for an id this app holds ({@link heldEnv}), never one it was started with.
+  const { TWR_WORKSPACE_ID: _started, ...rest } = loginEnv;
+  return { ...rest, PATH: pathEnv() };
+};
+const pathEnv = () =>
+  [
     ...new Set(
       [
         dirname(binaries.twr),
@@ -204,8 +228,14 @@ const env = (): NodeJS.ProcessEnv => ({
         "/bin",
       ].filter(Boolean),
     ),
-  ].join(":"),
-});
+  ].join(":");
+/**
+ * {@link env} for a `twr` (or bridge) run for workspace id `id`, which the app holds: it
+ * resolves that id alone (`TWR_WORKSPACE_ID`), so once that workspace is gone it never reaches
+ * another renamed into its id. Without an id, {@link env}.
+ */
+const heldEnv = (id: string | undefined): NodeJS.ProcessEnv =>
+  id ? { ...env(), TWR_WORKSPACE_ID: id } : env();
 function emit(event: DesktopEvent) {
   if (window && !window.isDestroyed())
     window.webContents.send("twr:event", event);
@@ -275,6 +305,18 @@ async function findBinaries() {
   // A packaged build ships its engines' digests; a development checkout's
   // binaries change under it, so they are always hashed.
   const stable = await stageEngines(dir, root, app.isPackaged);
+  // Staging just hashed it, so this reads the digest index rather than the file. A hub's
+  // `build` names its engine where the version cannot: a distribution package rebuilt from a
+  // later commit keeps the version.
+  try {
+    engineBuild = buildIdOf(
+      await new EngineDigests(join(root, "digests.json")).digest(
+        join(stable, "twr"),
+      ),
+    );
+  } catch {
+    engineBuild = undefined;
+  }
   setTimeout(
     () =>
       void cleanupEngines(
@@ -340,18 +382,19 @@ async function loadLoginEnvironment() {
   }
 }
 async function cli(args: unknown) {
-  if (!workspaceReady)
+  const words = nonInteractiveArgs(args);
+  if (!workspaceReady && !runsWithoutWorkspace(words, workspaceEverConnected))
     throw new Error(
       "Connect to the selected workspace before running CLI commands",
     );
-  const words = nonInteractiveArgs(args);
   const planned = await companion().call("desktop.cli_plan", {
     args: words,
     workspace,
   });
   try {
+    // The connected workspace by its id alone.
     const result = await exec(binaries.twr, planned, {
-      env: env(),
+      env: heldEnv(workspaceReady ? workspace : undefined),
       timeout: 120_000,
       maxBuffer: 16 * 1024 * 1024,
     });
@@ -365,8 +408,11 @@ async function cli(args: unknown) {
     };
   }
 }
-async function connect(name: unknown) {
+async function connect(name: unknown, options?: unknown) {
   const next = workspaceSchema.parse(name);
+  const byId =
+    z.object({ byId: z.boolean().optional() }).optional().parse(options)
+      ?.byId === true;
   const generation = localGeneration;
   // The generation is taken before waiting, so leaving the local hub while the
   // environment loads still cancels this connection.
@@ -374,23 +420,33 @@ async function connect(name: unknown) {
     await envReady;
     if (generation !== localGeneration)
       throw new Error("This hub connection was closed");
-    return connectWorkspace(next, generation);
+    return connectWorkspace(next, generation, byId);
   });
   connectTail = task.catch(() => {});
   return task;
 }
-async function connectWorkspace(next: string, generation: number) {
+async function connectWorkspace(
+  next: string,
+  generation: number,
+  byId = false,
+) {
   workspaceReady = false;
   emit({ type: "connection", connected: false });
   const previous = bridge;
   // Attachments are scoped to the old workspace and keep running in their own terminal tabs.
-  const current = new Bridge(binaries.bridge, next, env(), (event) => {
-    if (bridge === current) {
-      if (event.type === "connection" && event.connected && !workspaceReady)
-        return;
-      emit(event);
-    }
-  });
+  // An id the app holds is served by id alone; a name given by a person as `-w` takes it.
+  const current = new Bridge(
+    binaries.bridge,
+    next,
+    heldEnv(byId ? next : undefined),
+    (event) => {
+      if (bridge === current) {
+        if (event.type === "connection" && event.connected && !workspaceReady)
+          return;
+        emit(event);
+      }
+    },
+  );
   bridge = current;
   previous?.close();
   const paths = await current.call("desktop.paths");
@@ -402,18 +458,33 @@ async function connectWorkspace(next: string, generation: number) {
       current.close();
       throw new Error("This hub connection was closed");
     }
-    workspace = next;
+    // By the id its hub serves (`desktop.paths`), whichever of its names was asked for: what
+    // the app keys its drafts, outbox and terminals by.
+    workspace =
+      typeof paths?.workspace === "string" && paths.workspace
+        ? paths.workspace
+        : next;
+    workspaceTyped = false;
     workspaceReady = true;
+    workspaceEverConnected = true;
     emit({ type: "connection", connected: true });
     void current
       .call("notify.looking", { looking: window?.isFocused() || false })
       .catch(() => {});
-    saveDesktopSettings({ workspace: next });
+    saveDesktopSettings({ workspace });
     hubVersion = hubInfo.version;
+    const difference = engineDifference(
+      { version: paths.version, build: engineBuild },
+      hubInfo,
+    );
     return {
       ...paths,
+      build: engineBuild,
       hubVersion: hubInfo.version,
-      versionMismatch: hubInfo.version !== paths.version,
+      hubBuild: hubInfo.build,
+      // "version" or "build": see shared/engineHubs.
+      engineDifference: difference,
+      versionMismatch: !!difference,
     };
   } catch (error) {
     // Retain the companion for config repair, while blocking workspace-bound commands.
@@ -478,6 +549,11 @@ function register() {
     },
     !app.isPackaged,
   );
+  // A change of this computer's addresses reconnects a pinned hub at once.
+  remoteTransport.watchNetwork((value) => {
+    if (window && !window.isDestroyed())
+      window.webContents.send("twr:remote-network", value);
+  });
   // Created once the engines are staged; every gateway handler waits for them.
   let gatewaySetup: GatewaySetup | undefined;
   const gateway = () =>
@@ -565,10 +641,11 @@ function register() {
                 live.call(method, params, 5000),
               close: () => {},
             };
+          // By id alone: `name` is a listing's id.
           return new Bridge(
             binaries.bridge,
             name,
-            { ...env(), TWR_BRIDGE_READ_ONLY: "1" },
+            { ...heldEnv(name), TWR_BRIDGE_READ_ONLY: "1" },
             () => {},
           );
         },
@@ -576,12 +653,34 @@ function register() {
       ),
     ),
   );
+  // The hubs of every running workspace whose engine is not the app's: after an upgrade
+  // they keep running the old one until stopped. The listing reads each hub's `hub.info`
+  // itself, so no bridge is opened for it.
+  handleWithEnvironment("engine-hubs", async () => {
+    if (!workspaceReady || !bridge) return [];
+    const live = bridge;
+    const version = (await live.call("desktop.paths")).version;
+    const engine: Engine = { version, build: engineBuild };
+    const listing = JSON.parse(
+      (
+        await exec(binaries.twr, ["ws", "list", "--json"], {
+          env: env(),
+          timeout: 5000,
+          maxBuffer: 1024 * 1024,
+        })
+      ).stdout,
+    );
+    return engineHubs(listing?.workspaces ?? listing, engine);
+  });
   handle("remote-list", () => remoteTransport.listHubs());
   handle("remote-pair", (request) => remoteTransport.pair(request));
   handle("remote-connect", (request) => remoteTransport.connect(request));
   handle("remote-send", (request) => remoteTransport.send(request));
   handle("remote-disconnect", () => remoteTransport.disconnect());
   handle("remote-remove", (request) => remoteTransport.removeHub(request));
+  handle("remote-update-routes", (request) =>
+    remoteTransport.updateRoutes(request),
+  );
   handle("remote-reset", () => remoteTransport.resetSavedHubs());
   handleWithEnvironment("gateway-status", () => gateway().status());
   handleWithEnvironment("gateway-cancel-invitation", () =>
@@ -717,8 +816,34 @@ function register() {
           throw error;
         })),
   );
-  handle("bootstrap", () => ({
+  handle("bootstrap", async () => {
+    // Without `TWR_WORKSPACE`, the one shown last while it is still there, else the default
+    // workspace as `twr` resolves it (which need not be `default`, nor exist under that id).
+    if (!startSettled) {
+      startSettled = true;
+      let listing: unknown[] | undefined;
+      try {
+        await envReady;
+        const value = JSON.parse(
+          (
+            await exec(binaries.twr, ["ws", "list", "--json"], {
+              env: env(),
+              timeout: 5000,
+            })
+          ).stdout,
+        );
+        if (Array.isArray(value)) listing = value;
+      } catch {}
+      const chosen = workspaceSchema.safeParse(
+        startWorkspace(undefined, savedWorkspaceName, listing as any),
+      );
+      if (chosen.success) workspace = chosen.data;
+    }
+    return bootstrapInfo();
+  });
+  const bootstrapInfo = () => ({
     workspace,
+    typed: workspaceTyped,
     hostId: "local",
     platform: process.platform,
     home: homedir(),
@@ -730,7 +855,7 @@ function register() {
       workspace: t.workspace,
       exited: t.exited,
     })),
-  }));
+  });
   handle("connect", connect);
   handle(
     "upload-request",
@@ -878,7 +1003,7 @@ function register() {
       if (!value.shell) {
         try {
           await exec(binaries.twr, ["--desktop-validate", ...args], {
-            env: env(),
+            env: heldEnv(terminalWorkspace),
             cwd,
             timeout: 15000,
             maxBuffer: 1024 * 1024,
@@ -893,7 +1018,8 @@ function register() {
         rows: 24,
         cwd,
         env: {
-          ...env(),
+          // A twr terminal reaches its workspace by id alone; a shell carries no id.
+          ...heldEnv(value.shell ? undefined : terminalWorkspace),
           TERM: "xterm-256color",
           COLORTERM: "truecolor",
         } as Record<string, string>,
@@ -1364,7 +1490,10 @@ else {
         const savedWorkspace = workspaceSchema.safeParse(
           desktopSettings.workspace,
         );
-        if (savedWorkspace.success) workspace = savedWorkspace.data;
+        if (savedWorkspace.success) {
+          workspace = savedWorkspace.data;
+          savedWorkspaceName = savedWorkspace.data;
+        }
       }
       const savedAppearance = appearanceSchema.safeParse(
         desktopSettings.appearance,
@@ -1475,9 +1604,31 @@ else {
             submenu: [
               { role: "reload" },
               { role: "togglefullscreen" },
-              { role: "resetZoom" },
-              { role: "zoomIn" },
-              { role: "zoomOut" },
+              // Text size, not page zoom: these step Settings › Layout & text's sizes
+              // (shared/layoutPreferences.ts), which persist and scale the terminal too.
+              {
+                label: "Actual Text Size",
+                accelerator: "CmdOrCtrl+0",
+                click: () => emit({ type: "menu-text-reset" }),
+              },
+              {
+                label: "Larger Text",
+                accelerator: "CmdOrCtrl+Plus",
+                click: () => emit({ type: "menu-text-larger" }),
+              },
+              // + needs Shift on most layouts: = is the same key without it.
+              {
+                label: "Larger Text",
+                accelerator: "CmdOrCtrl+=",
+                visible: false,
+                acceleratorWorksWhenHidden: true,
+                click: () => emit({ type: "menu-text-larger" }),
+              },
+              {
+                label: "Smaller Text",
+                accelerator: "CmdOrCtrl+-",
+                click: () => emit({ type: "menu-text-smaller" }),
+              },
               ...(!app.isPackaged ? [{ role: "toggleDevTools" as const }] : []),
             ],
           },

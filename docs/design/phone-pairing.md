@@ -1,0 +1,308 @@
+# Certificate-free phone pairing: the wire contract
+
+This is the contract that the hub, the gateway, the Android and iOS apps and the desktop client implement. Each piece is checked against the test vectors in [`clients/shared/fixtures/phone-pairing-v2.json`](../../clients/shared/fixtures/phone-pairing-v2.json), which `cargo test -p twr-core phone_pairing` generates and checks.
+
+The design and its reasons are in the phone-pairing report (2026-11-23), kept outside the repository. User-facing behaviour belongs in [mobile.md](../mobile.md), [remote-clients.md](../remote-clients.md) and [security-model.md](../security-model.md).
+
+Phase 2 adds a relay route; its wire protocol is specified separately by the relay work. This document reserves the `relay:` route kind and nothing else.
+
+## Identity
+
+The gateway keeps an identity in its data directory, `mobile/`, beside `gateway-id`. That directory is mode 0700, and every file in it is 0600.
+
+| File | Contents |
+|---|---|
+| `identity-key.pem` | ECDSA P-256 private key, PKCS#8 PEM. Created once and never rotated, except by `twr phone rekey`. |
+| `identity-cert.pem` | A self-signed X.509 certificate for that key, described below |
+| `iroh-key` | 32 random bytes, an Ed25519 secret key for the phase 2 iroh route. Its public key, as iroh prints an `EndpointId`, goes in invitations as `iroh`. Unused in phase 1. |
+
+**The certificate:**
+
+- validity 800 days, starting one hour before creation;
+- subject CN `twr hub`;
+- SAN `DNS:twr-hub.invalid`;
+- EKU `serverAuth`;
+- signed with the identity key, ECDSA-SHA256.
+
+The gateway re-issues it with the **same key** when fewer than 30 days remain. iOS applies its 825-day, SAN and EKU rules to some trust paths, and staying within them costs nothing.
+
+**The pin** is `base64url-nopad(SHA-256(SubjectPublicKeyInfo DER))`: 43 characters. It depends only on the key, so re-issuing the certificate never changes it.
+
+The gateway serves TLS 1.3 (TLS 1.2 only if a client offers nothing else) with this certificate whenever it runs without `--tls-cert`. With `--tls-cert`/`--tls-key` it serves that certificate instead: that is **certificate mode**, today's behaviour, with version 1 invitations.
+
+## Pairing codes
+
+- 12 characters from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`: 32 symbols, so 60 bits.
+- Displayed as `XXXX-XXXX-XXXX`.
+- **Normalization:** strip ASCII spaces and `-`, then uppercase ASCII. The result must be exactly 12 characters, all in the alphabet. Anything else is not a code.
+- One use, 5 minutes, 5 failed attempts. That is the existing device store's rule, now with 12 characters instead of 10.
+
+## The proof key and the pin proof
+
+These are for typed pairing, where the phone has no pin yet.
+
+```text
+stretched = Argon2id(password = normalized code (ASCII), salt = "twr-mobile-pair-v2",
+                     m = 65536 KiB, t = 3, p = 1, version 0x13, output 32 bytes)
+K_proof   = HKDF-SHA256(salt = "twr-mobile-pair-v2", ikm = stretched, info = "pin-proof", L = 32)
+proof     = HMAC-SHA256(K_proof, "twr-mobile-pin-v2" || 0x00 || pin (32 raw bytes, the SHA-256)
+                                  || nonce (32 bytes) || gateway_id (UTF-8, as served by /health))
+```
+
+- The hub derives `K_proof` once, when it creates the code (`device.pair_begin`), and keeps it with the pairing state, never the code itself. The state lives in `devices.json`, 0600, and is removed with the pairing: when it is used, cancelled or replaced, and once it has expired or run out of attempts, the next time the store reads it (to begin, prove, pair, report or cancel an invitation). `twr phone` cancels an invitation it reports as expired.
+- The gateway asks the hub for proofs over the owner socket. Neither ever logs a code, `K_proof` or a proof.
+
+## Gateway endpoints
+
+**`GET /health`, unauthenticated.**
+
+```json
+{"service":"twr-mobile","protocol":2,"gateway_id":"<uuid>","pin":"<43 chars>"}
+```
+
+In certificate mode, `pin` is absent and `protocol` stays `1`: released desktop clients refuse any other number. Pinned-mode clients check that `pin` is there, not the number. Protocol 1 clients ignore the new field. A gateway without a pin (certificate or development mode) answers `/v1/pair/proof` with `404`.
+
+**`GET /v1/pair/proof?nonce=<base64url-nopad of 32 bytes>`, unauthenticated.**
+
+- `200 {"proof":"<base64url-nopad of 32 bytes>"}` while an invitation is open.
+- `404` when none is. That includes a hub from a twr older than this contract, which has no `device.pair_proof` (`method_not_found`): its `error` says the hub is from an older twr and to restart it, and the gateway logs that. Never `503` for it.
+- `400` for a malformed nonce.
+- It shares `/v1/pair`'s rate limits, per address and global, and its 35-second deadline.
+- A proof request doesn't count as a failed attempt. Every proof for the open code is derived from the same key, so a second one tells an attacker nothing new.
+
+**`POST /v1/pair`** is unchanged: `{code, name}` returns the device token and metadata. The code is normalized before the hub checks it.
+
+## Invitation, version 2
+
+The QR code and the copied link both carry this JSON:
+
+```json
+{
+  "type": "twr-pair",
+  "version": 2,
+  "id": "<gateway_id uuid>",
+  "name": "<hub display name, at most 80 characters>",
+  "pin": "<43 chars>",
+  "iroh": "<EndpointId string>",
+  "code": "<12 characters, normalized>",
+  "expiresAt": 1763900000000,
+  "routes": ["tls:192.168.1.20:47321", "tls:[2001:db8::5]:47321", "tls:box.tail1234.ts.net:47321"],
+  "scopes": ["read", "operate"]
+}
+```
+
+**Fields:**
+
+- `iroh` is optional.
+- `expiresAt` is milliseconds since the epoch. The hub enforces expiry; clients only display it.
+- `scopes` is for display only.
+- There are 1 to 8 routes. The whole JSON is at most 2048 bytes.
+
+**Parsers:**
+
+- Reject unknown top-level keys, a wrong `type`, and a version other than 1 or 2. Version 1 stays as today: `url`, `code`, `expiresAt`.
+- Keep route entries whose kind they don't know, and skip them when connecting.
+
+**Link form.** `twr://pair#` followed by base64url-nopad of the JSON's UTF-8 bytes. The secret is in the fragment. Scanners accept the raw JSON, the `twr://pair#` link, and version 1 JSON.
+
+**Routes.** Each entry is `<kind>:<rest>`:
+
+| Kind | Rest | Meaning |
+|---|---|---|
+| `tls` | `<host>:<port>`, where host is an IPv4 literal, `[IPv6]` or a DNS name, and port is 1 to 5 ASCII digits, 1-65535 (no sign) | Direct TLS to the gateway, authenticated by the pin |
+| `relay` | reserved for phase 2; defined by the relay specification | |
+
+Hubs print IPv6 hosts in RFC 5952 form (lowercase, compressed), so one address has one spelling. Clients store routes as they receive them.
+
+**How the hub builds the list:**
+
+1. The configured `address` first, if set: a DNS name or a forwarded `host:port`.
+2. Then addresses from the interfaces that are up, each class up to its quota, in this order:
+   - at most 2 global IPv4;
+   - at most 2 global IPv6;
+   - at most 2 tailnet addresses (100.64.0.0/10, fd7a:115c:a1e0::/48);
+   - at most 3 private LAN addresses (RFC 1918, fc00::/7 outside the tailnet range).
+3. Then the addresses the quotas left out, in the same order, while there is room.
+4. Cut the list off at 8.
+
+The quotas keep one class, such as a host's many global IPv6 addresses, from pushing the others out. Duplicates are dropped before they count.
+
+**Left out:**
+
+- loopback interfaces, and loopback, link-local, unspecified and multicast addresses;
+- virtual bridges of containers and virtual machines, by interface name: `docker*`, `br-*`, `veth*`, `virbr*`, `cni*`, `podman*`, `lxcbr*`, `flannel*`;
+- IPv6 addresses the system marks temporary (privacy addresses, which change daily), deprecated, tentative or failed duplicate address detection. Linux reads the flags column of `/proc/net/if_inet6` (`IFA_F_TEMPORARY` 0x01, `IFA_F_DADFAILED` 0x08, `IFA_F_DEPRECATED` 0x20, `IFA_F_TENTATIVE` 0x40). macOS asks `ioctl(SIOCGIFAFLAG_IN6)` (`IN6_IFF_TEMPORARY`, `IN6_IFF_DEPRECATED`, `IN6_IFF_TENTATIVE`, `IN6_IFF_DUPLICATED`, `IN6_IFF_DETACHED`). When neither answers, every address is offered.
+
+Interface addresses come only for a listener on all addresses (`0.0.0.0` gives IPv4 ones, `[::]` IPv6 ones). A listener on one address offers that address, a loopback one included. Within the tailnet and private classes, IPv4 comes before IPv6. When there is no route at all, the gateway opens no invitation and asks for `--address`.
+
+**Saved settings.** The pinned gateway keeps `address`, `listen` and `autostart` in `gateway-settings.json` in its directory (0600). The desktop app keeps its certificate-mode gateway's settings in its own settings file, which the gateway cannot read, so `--address` is saved only in pinned mode.
+
+## Client trust rule
+
+**For a hub paired by pin,** on every route and every connection: accept the TLS connection only if the leaf certificate's SPKI SHA-256 equals the saved pin. Ignore the chain, the name and the validity dates. Send nothing first: not the code, not the token, not the request line.
+
+- A mismatch is a hard error naming the route: "this is another device, not <hub>". Never fall back to system trust for a pinned hub.
+- Certificate-mode hubs keep system trust, and their credentials never move to a pinned route, or the reverse.
+
+**Typed pairing,** with an address and a code:
+
+1. Connect, and capture the leaf SPKI pin `P` without trusting it yet.
+2. Send `GET /v1/pair/proof` with a fresh random 32-byte nonce, and read `gateway_id` from `/health` on the same connection or another one that presented `P`.
+3. Compute `K_proof` from the typed code. Check the proof in constant time.
+4. Only then `POST /v1/pair` on a connection that presents `P`, and save `P` as the pin.
+
+A man in the middle presenting its own key can't produce a valid proof for that key without the code.
+
+## Saved hub (client side)
+
+| Field | Meaning |
+|---|---|
+| `pin` | The pinned key |
+| `iroh` | The iroh endpoint id, when the invitation had one |
+| `routes` | The invitation's routes, plus any the gateway reports later. At most 16, deduplicated. A route is dropped after 30 days unseen. |
+| `last` | Per network type (`wifi`, `cellular`, `other`), the route that last connected |
+| `token`, `gateway_id`, `name`, `scopes` | As today |
+
+## Racing routes
+
+1. Start the remembered route for the current network type at once.
+2. After 250 ms, start the remaining `tls` routes in parallel. On cellular, skip private LAN addresses (RFC 1918, fc00::/7 outside the tailnet range, `.local` names).
+3. The first route to complete TLS with the pin and answer `/health` with the expected `gateway_id` wins. Cancel the rest.
+4. Save the winner as `last` for the current network type.
+
+**Reconnect at once on a network change:** Android's `ConnectivityManager` callback, iOS's `NWPathMonitor`. Don't wait for a timeout.
+
+**While connected, the gateway reports its current routes** in the connection hello, as `routes`. The client merges them under the limits above. Only a pinned gateway does: the hello of a certificate-mode gateway has no `routes`.
+
+## Client API (TypeScript ↔ native transport)
+
+`clients/shared/remote.ts` `NativeTransport` is implemented by Android (`TwrTransportPlugin.java`), iOS (`TwrTransportPlugin.swift`) and the desktop (`clients/desktop/remote-transport.ts`). The extensions below are backwards compatible: certificate-mode hubs keep working unchanged.
+
+```ts
+interface Hub {
+  id: string; name: string; url: string; scopes: string[]; gateway_id?: string;
+  pin?: string;       // set for pinned hubs; absent for certificate-mode hubs
+  routes?: string[];  // pinned hubs: known routes, e.g. "tls:192.168.1.20:47321"
+  route?: string;     // pinned hubs: the route last connected
+}
+interface PairRequest {
+  code: string; name: string; hubName: string;
+  url?: string;                                            // certificate mode (v1), as today
+  pin?: string; gatewayId?: string; routes?: string[]; iroh?: string;  // a scanned v2 invitation
+  address?: string;                                        // typed pairing: "host" or "host:port" (default 47321)
+}
+interface NativeTransport {
+  // existing: listHubs, pair, connect, send, disconnect, removeHub, addListener("message", …)
+  updateRoutes(request: { id: string; routes: string[] }): Promise<void>;
+  addListener(event: "network", listener: (value: { type: "wifi" | "cellular" | "other" | "none" }) => void):
+    Promise<{ remove(): Promise<void> }>;
+}
+```
+
+**`pair`:**
+
+- `pin` set: a scanned invitation. Race `routes` with the pin check. Then `POST /v1/pair` on the winner.
+- `address` set: typed pairing, with the proof flow above.
+- Otherwise: `url`, certificate mode.
+
+Every case returns a `Hub`; pinned ones carry `pin`, `routes` and `route`. The `url` of a pinned hub is `https://<host>:<port>` of the winning route, for display only.
+
+**`connect`.** For a pinned hub, race the saved routes as in [Racing routes](#racing-routes), then open `/v1/socket` on the winner, with the pin check, and remember the winner. Certificate-mode hubs connect as today.
+
+**`updateRoutes`** merges the routes the gateway's hello reports into the saved hub, within the limits in [Saved hub](#saved-hub-client-side). The shared TypeScript calls it when the hello carries `routes`.
+
+**The `network` event** fires when the device's default network changes. When it fires, the TypeScript layer reconnects at once if it was connected, or was trying to be, without waiting for a timeout or backoff.
+
+**Errors.** `pair` and `connect` reject with messages that name the route and the reason: unreachable, timed out, another device's key, or bad code. A pin mismatch carries `PIN_MISMATCH` in the message.
+
+## Gateway command-line output (for `twr phone`, the TUI and the desktop wizard)
+
+In pinned mode, `twr gateway --pair --json` (and `--pair --pair-only --json`, which the desktop wizard uses) prints one JSON line. The flag is `--json`; `pair_json` is only the field's name in the code. The line is a superset of today's:
+
+```json
+{"code":"ABCDEFGHJK23","expires_at":1763900000,"scopes":["read","operate"],"gateway_id":"<uuid>",
+ "invitation":{ …the version 2 invitation object… },"link":"twr://pair#…"}
+```
+
+`expires_at` is seconds, as today; the invitation's `expiresAt` is milliseconds. In certificate mode the output is unchanged, with no `invitation` and no `link`.
+
+**A hub from an older twr.** A hub that still runs from a twr before 12-character codes answers `device.pair_begin` with a 10-character code. In either mode, the gateway, `twr phone` and the TUI's `/phone` then cancel that code and print no invitation. They fail with one line saying the running hub is from an older twr and to restart it (`twr hub stop`, then run twr again), never a generic "not a pairing code".
+
+**Terminal QR codes.** `twr phone` and the TUI's `/phone` draw a QR code of the invitation JSON without its optional `iroh` and `scopes`, which every scanner accepts. They print the `twr://pair#` link beside it as text, for copy, paste and tap. Base64 makes the link a third larger. At low error correction, with a 2-module quiet zone, a three-route invitation takes:
+
+| Payload | Bytes | QR version | Columns |
+|---|---|---|---|
+| JSON without `iroh` and `scopes` (drawn) | 282 | 11 | 65 |
+| Full JSON | 384 | 13 | 73 |
+| Link | 523 | 16 | 85 |
+
+When the drawn code doesn't fit the terminal, they say so and show the link, the code and the addresses to type.
+
+**Starting with the hub.** When the default workspace's hub starts and answers, it starts the pinned gateway, detached, if all of these hold:
+
+- the saved settings have `autostart` on;
+- no gateway runs;
+- a device is paired, or an invitation is open.
+
+It starts the gateway with no `--listen`, so it listens where the saved `listen` says, or on `0.0.0.0:47321` and `[::]:47321` when that is empty.
+
+**Autostart is opt-in, through `twr phone` alone:**
+
+- `twr phone` turns it on. It also saves the `listen` of the pinned gateway it pairs through, the one it started or the one it found running, so a later autostart listens there too: the default pair (`0.0.0.0:47321` and `[::]:47321`) is saved as an empty `listen`, any other set as itself.
+- `twr phone off` turns it off, and so does `--stop-gateway` (the desktop app's "Stop gateway") whenever settings exist: a gateway someone stopped stays stopped.
+- A gateway started any other way, by the desktop app or a bare `twr gateway`, never turns it on. With no settings it writes none, unless it is given `--address`, which it saves with autostart off.
+
+So a desktop user who never ran `twr phone` never gets a gateway started for them. A test's hub (a debug build under `TWR_HOME`) and `TWR_GATEWAY_AUTOSTART=off` never start one.
+
+`--gateway-info` adds `"pin"` (absent in certificate mode) and `"routes"`, the list the gateway would put in an invitation now. Both are absent while a certificate-mode gateway runs. When no gateway runs, they describe the pinned gateway that would start, if its identity exists. A running gateway's record also carries `"mode"`: `pinned`, `certificate` or `development`. Its `"listen"` is the first address it listens on, one `host:port`, and `"listens"` lists every one, `listen` first: a pinned gateway on all addresses has `"listen":"0.0.0.0:47321","listens":["0.0.0.0:47321","[::]:47321"]`. A gateway older than `listens` joined them all in `listen` with commas, so readers take `listens` when it is there and split `listen` on commas when it isn't. A pinned gateway's `tls_cert` and `tls_key` are its `identity-cert.pem` and `identity-key.pem`, so the desktop app's checks still read the record.
+
+## Client rules settled in implementation (2026-11-23)
+
+The contract left these open. The Android, iOS and desktop clients all implement them, and new clients should too.
+
+**Saved routes:**
+
+- "30 days unseen" counts back from the newest sighting of any of the hub's routes, not from today. So a phone left unused for a month keeps its routes.
+- Past 16 routes, the least recently seen go first. Unknown kinds count toward the 16.
+
+**Racing:**
+
+- With no remembered route, every route starts at once.
+- The 250 ms head start ends early if the remembered route fails.
+- On cellular, a remembered private route is skipped as well.
+- If every route is private, they are tried anyway, since a VPN may reach them.
+
+**Typed pairing:**
+
+- It makes one aborted handshake first: the client captures the key, then refuses. The gateway doesn't log it as an error or count it toward rate limits.
+- A `/health` without `pin` is a certificate-mode gateway. The client refuses typed pairing with `CERTIFICATE_MODE` and says to pair by its `https://` address.
+- A wrong code and a man in the middle look the same, so a failed proof is `BAD_CODE`, worded to cover both.
+
+**The `network` event** may fire once when it is registered, and for a change between two networks of the same type (Wi-Fi to Wi-Fi). Computers report `other` or `none`.
+
+**Error codes.** Rejections carry one of these tokens at the start of the message, or as the reject code:
+
+| Token | Meaning |
+|---|---|
+| `PIN_MISMATCH` | another device's key |
+| `BAD_CODE` | a malformed code, or a failed proof |
+| `NO_INVITATION` | the gateway has no open invitation |
+| `UNREACHABLE` | the route couldn't be reached |
+| `TIMEOUT` | the route timed out |
+| `RATE_LIMITED` | the gateway refused for rate |
+| `PAIR_REFUSED` | the hub refused the code |
+| `CERTIFICATE_MODE` | typed pairing reached a certificate-mode gateway |
+| `BAD_ADDRESS` | the typed address isn't usable |
+| `BAD_INVITATION` | the invitation doesn't parse or validate |
+| `BAD_ROUTES` | no usable route in the list |
+| `UNKNOWN_HUB` | no saved hub with that id |
+| `KDF_FAILED` | Argon2id couldn't run, for example out of memory |
+
+User interfaces show the text after the token.
+
+**The `twr://` scheme.** Any app on a phone can register `twr://`, so another app could receive a tapped invitation link and use its one-use code first. The pin prevents a man in the middle, not theft of the link. Two things limit it:
+
+- `twr phone` and the TUI print the name of the device that paired, so an unexpected one shows at once and can be revoked.
+- Scanning the QR code inside the twr app avoids the link entirely.
+
+Universal links would need an `apple-app-site-association` on a domain, and are not used.

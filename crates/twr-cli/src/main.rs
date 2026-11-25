@@ -6,7 +6,9 @@ mod accounts;
 mod boxes;
 mod dial_in;
 mod loops;
+mod phone;
 mod pretty;
+mod relay;
 mod runner_link;
 mod runner_update;
 mod speech;
@@ -34,6 +36,9 @@ use twr_hub::HubOptions;
 
 /// How long bare `twr` waits for a hub it spawned to start listening.
 const HUB_START_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long [`wait_for_hub`] keeps trying to start a hub while the data directory's lock is
+/// held by something else (as a starting hub waits for it itself).
+const LOCK_WAIT: Duration = Duration::from_secs(3);
 
 /// How long bare `twr` waits for a hub that accepts connections but does not answer yet (e.g.
 /// replaying a large log, or finishing a shutdown).
@@ -583,10 +588,11 @@ enum Cmd {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
-    /// List, create or remove workspaces: separate hubs on this machine, each with its own
-    /// orchestrator, threads, worktrees and trash, sharing the config file. `twr -w <name>
-    /// <command>` (or `TWR_WORKSPACE=<name>`) runs a command in one; `default` is the usual
-    /// one. Without a subcommand, lists them.
+    /// List, create, rename or remove workspaces, or choose the default one: separate hubs on
+    /// this machine, each with its own orchestrator, threads, worktrees and trash, sharing the
+    /// config file. `twr -w <name> <command>` (or `TWR_WORKSPACE=<name>`) runs a command in
+    /// one; without either, commands run in the default workspace. Without a subcommand,
+    /// lists them.
     #[command(alias = "workspace")]
     Ws {
         #[command(subcommand)]
@@ -610,6 +616,13 @@ enum Cmd {
     Account {
         #[command(subcommand)]
         cmd: accounts::AccountCmd,
+    },
+    /// Run, install or check a twr relay: the service that passes phone connections through
+    /// to hubs without decrypting them, relays linked runners with iroh, and keeps their
+    /// address records (docs/relay.md). `twr relay serve --install` sets one up on a server.
+    Relay {
+        #[command(subcommand)]
+        cmd: relay::RelayCmd,
     },
     /// Run this box as a runner: connect to a hub over WebSocket and run its threads here.
     /// Stops the runtimes gracefully on SIGINT / SIGTERM. `twr runner install-token <box>`
@@ -902,6 +915,47 @@ enum Cmd {
         #[arg(long, hide = true, value_name = "PATH", requires = "daemon")]
         log: Option<PathBuf>,
     },
+    /// Pair a phone with this machine's hubs: shows a QR code and a one-use code for the twr
+    /// app, and waits until the phone pairs (Ctrl-C cancels the code).
+    ///
+    /// It starts the phone gateway, which then runs on its own, and starts with a hub while a
+    /// phone is paired. `twr phone devices` lists the paired phones, `twr phone revoke <id>`
+    /// revokes one, `twr phone off` stops the gateway and keeps it off, and `twr phone rekey`
+    /// makes it a new key (every phone pairs again).
+    #[command(args_conflicts_with_subcommands = true)]
+    Phone {
+        #[command(subcommand)]
+        cmd: Option<phone::PhoneCmd>,
+        /// Grant read access only.
+        #[arg(long, conflicts_with_all = ["terminal", "admin"])]
+        read_only: bool,
+        /// Grant remote shells, attach and jobs too.
+        #[arg(long)]
+        terminal: bool,
+        /// Grant accounts, boxes, configuration and modes too, and terminal access, which they
+        /// include (configuration can name commands the hub runs).
+        #[arg(long)]
+        admin: bool,
+        /// The address invitations offer first: a DNS name, or a forwarded host:port. Saved
+        /// for later invitations; an empty one offers none.
+        #[arg(long, value_name = "HOST[:PORT]")]
+        address: Option<String>,
+        /// Print the invitation as a JSON line, then how it ended as another; no terminal
+        /// needed.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the phones' gateway in the foreground (advanced: `twr phone` starts it for you).
+    ///
+    /// Without --tls-cert it serves its own key, which paired phones pin.
+    Gateway(twr_app::gateway::Args),
+    /// A device's companion, which the gateway runs: the desktop bridge for a workspace, on
+    /// stdin and stdout.
+    #[command(name = "desktop-bridge", hide = true)]
+    DesktopBridge {
+        #[arg(default_value = "default")]
+        workspace: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1036,16 +1090,34 @@ enum WsCmd {
         detail: bool,
     },
     /// Create a workspace (1-32 of [a-z0-9-], starting and ending with a letter or digit).
-    /// Its hub starts on first use: `twr -w <name>`.
+    /// Its hub starts on first use: `twr -w <name>`. `default` makes the workspace in twr's
+    /// own data directory again once it was removed.
     New {
         /// The workspace's name.
         name: String,
     },
-    /// Remove a workspace's data for good: its log, orchestrator conversation and memory, and
-    /// history. Refused while its hub runs, while it has threads (delete them first) or while
-    /// its trash holds deleted threads (`twr -w <name> trash empty --all`). Lists what goes and
-    /// asks y/N on a terminal (without one, only with --yes). Branches stay in their
-    /// repositories.
+    /// Rename a workspace, `default` too. Nothing moves: its hub may keep running, and its
+    /// threads, worktrees, sessions and branches stay as they are. Its original name keeps
+    /// selecting it (`-w`), so no other workspace can take that name.
+    #[command(alias = "mv")]
+    Rename {
+        /// The workspace, by its name or its original name.
+        name: String,
+        /// Its new name.
+        new_name: String,
+    },
+    /// Show the default workspace, which commands without `-w` (or `TWR_WORKSPACE`) and a
+    /// bare `twr` open; with a name, make that workspace the default.
+    Default {
+        /// The workspace to make the default.
+        name: Option<String>,
+    },
+    /// Remove a workspace for good, `default` too: its log, orchestrator conversation and
+    /// memory, and its input history. Refused while its hub runs, while it has threads (delete
+    /// them first) or while its trash holds deleted threads (`twr -w <name> trash empty
+    /// --all`). Lists what goes and asks y/N on a terminal (without one, only with --yes).
+    /// Branches stay in their repositories; the config file, boxes, accounts and the other
+    /// workspaces stay too.
     Rm {
         /// The workspace's name.
         name: String,
@@ -1466,7 +1538,7 @@ fn main() -> ExitCode {
             }
         };
     }
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     twr_core::trace::mark_with(|| {
         let role = match &cli.cmd {
             None => "tui",
@@ -1475,6 +1547,11 @@ fn main() -> ExitCode {
         };
         format!("{role}: process started")
     });
+    // The TUI's own work is done once it returns: its history, settings and seen state written,
+    // and a Delete past its checks finished. What may still run is a blocking task that is safe
+    // to drop (a read, a workspace change still waiting for the registry lock, which gives up),
+    // which must neither hold up its exit nor finish after it.
+    let tui = cli.cmd.is_none();
     let stopping_hub = matches!(
         cli.cmd,
         Some(Cmd::Hub {
@@ -1515,27 +1592,30 @@ fn main() -> ExitCode {
     // starts its workers.
     if matches!(cli.cmd, Some(Cmd::Hub { cmd: None })) {
         std::env::remove_var(twr_hub::host::AGENT_ENV);
-        // What the hub runs inherits the workspace it serves, so an agent's own `twr` calls
-        // reach this hub (an invalid name fails below, before anything starts).
-        let from_env = std::env::var_os(WORKSPACE_ENV);
-        // One that is not UTF-8 stays, for `run` to refuse.
-        let unreadable =
-            cli.workspace.is_none() && from_env.as_ref().is_some_and(|v| v.to_str().is_none());
-        let workspace = cli
-            .workspace
-            .clone()
-            .or_else(|| from_env.and_then(|v| v.into_string().ok()))
-            .filter(|w| !w.is_empty() && w != DEFAULT_WORKSPACE);
-        match workspace {
-            Some(w) => std::env::set_var(WORKSPACE_ENV, w),
-            None if unreadable => {}
-            None => std::env::remove_var(WORKSPACE_ENV),
+        // What the hub runs inherits the id of the workspace it serves (`default` for the
+        // root slot too), held ([`twr_core::paths::WORKSPACE_ID_ENV`]): an agent's own `twr`
+        // calls reach this hub's workspace whatever its name becomes, whichever workspace
+        // becomes the default, and none once it is gone (a selection that fails, or is not
+        // UTF-8, stays as it is: `run` refuses it, before anything starts).
+        // Resolved once: the hub serves that id too (`run` resolves it again, by id alone,
+        // as its starter's id is: a hub started for an id serves that one or none).
+        if let Ok(paths) = Paths::from_env_selected(cli.workspace.as_deref()) {
+            // Nothing chosen and no default workspace: left as it is, for `run` to say why
+            // (there is no default), not that `default` does not exist.
+            let chosen = cli.workspace.is_some()
+                || std::env::var_os(WORKSPACE_ENV).is_some_and(|v| !v.is_empty());
+            if chosen || paths.exists() {
+                std::env::set_var(WORKSPACE_ENV, paths.workspace_id());
+                std::env::set_var(twr_core::paths::WORKSPACE_ID_ENV, paths.workspace_id());
+                cli.workspace = Some(paths.workspace_id().to_string());
+            }
         }
     }
     // A runner serves whichever hub it connects to: no workspace of this machine is its, and
     // nothing it runs inherits one.
     if matches!(cli.cmd, Some(Cmd::Runner { .. })) {
         std::env::remove_var(WORKSPACE_ENV);
+        std::env::remove_var(twr_core::paths::WORKSPACE_ID_ENV);
     }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1555,7 +1635,11 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     };
-    shutdown_cli_runtime(runtime, stopping_hub || relaying);
+    if tui {
+        runtime.shutdown_timeout(Duration::from_secs(1));
+    } else {
+        shutdown_cli_runtime(runtime, stopping_hub || relaying);
+    }
     code
 }
 
@@ -1724,12 +1808,42 @@ fn workspace_hint() -> &'static str {
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     refuse_runner_socket(&cli)?;
     refuse_bulk_stop_socket(&cli)?;
+    // The gateway and the companion it runs find their own paths (the default workspace's,
+    // the companion's named one).
+    let cli = match cli.cmd {
+        Some(Cmd::Gateway(args)) => {
+            twr_app::gateway::run(args, twr_app::gateway::Programs::Twr).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Cmd::DesktopBridge { workspace }) => {
+            twr_app::bridge::run(workspace).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Cmd::Phone { cmd: Some(cmd), .. }) => return phone::command(cmd).await,
+        Some(Cmd::Phone {
+            cmd: None,
+            read_only,
+            terminal,
+            admin,
+            address,
+            json,
+        }) => {
+            let level = phone::level(read_only, terminal, admin);
+            return phone::pair(level, address.as_deref(), json).await;
+        }
+        cmd => Cli { cmd, ..cli },
+    };
     // From the command definition alone: no twr home, config or hub.
     if let Some(Cmd::Completions { shell }) = &cli.cmd {
         let mut command = <Cli as clap::CommandFactory>::command();
         clap_complete::generate(*shell, &mut command, "twr", &mut std::io::stdout());
         return Ok(ExitCode::SUCCESS);
     }
+    // A relay is a server of its own: no twr home, config or hub.
+    let cli = match cli.cmd {
+        Some(Cmd::Relay { cmd }) => return relay::run(cmd).await,
+        cmd => Cli { cmd, ..cli },
+    };
     // An SSH box's relay and daemon need no twr home: every path comes from the box's
     // environment (the relay) or the relay (the daemon).
     let cli = match cli.cmd {
@@ -1915,17 +2029,45 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     // A runner's default storage is the root's (`main` removed `TWR_WORKSPACE` for it).
-    let paths = match cli.cmd {
+    let mut paths = match cli.cmd {
         Some(Cmd::Runner { .. }) => Paths::from_env_in(Some(DEFAULT_WORKSPACE))?,
-        _ => Paths::from_env_in(cli.workspace.as_deref())?,
+        // An id another process of twr held is that workspace or none (a hub started for
+        // it, a command the phone gateway runs): never one renamed into it since its own went
+        // ([`twr_core::paths::WORKSPACE_ID_ENV`]).
+        _ => Paths::from_env_selected(cli.workspace.as_deref())?,
     };
-    // With `-w`, a `default` that the shell's `TWR_WORKSPACE` would not select is named too;
-    // a socket given explicitly is how commands shown reach its hub.
-    let inherited = std::env::var_os(WORKSPACE_ENV).filter(|_| cli.workspace.is_some());
+    // Whether `-w` or `TWR_WORKSPACE` chose the workspace (else it is the default one).
+    let selected =
+        cli.workspace.is_some() || std::env::var_os(WORKSPACE_ENV).is_some_and(|v| !v.is_empty());
+    // A bare `twr` with no default workspace (it was removed) opens one there is, or asks for
+    // a new one to make ([`tui_without_default`]).
+    let mut opened_note = None;
+    if cli.cmd.is_none() && cli.socket.is_none() && !selected && !paths.exists() {
+        match tui_without_default(&paths.root())? {
+            Some((ws, note)) => {
+                paths = ws;
+                opened_note = Some(note);
+            }
+            None => return Ok(ExitCode::SUCCESS),
+        }
+    }
+    // A command shown names the workspace with `-w` (by id, which a rename leaves) unless
+    // `twr` alone selects it in this shell; a socket given explicitly is how commands shown
+    // reach its hub.
     let _ = WORKSPACE_HINT.set(match &cli.socket {
         Some(socket) => format!(" --socket {}", sh_word(&socket.to_string_lossy())),
         None => {
-            twr_core::paths::workspace_selection(paths.workspace.as_deref(), inherited.as_deref())
+            let bare = if cli.workspace.is_some() {
+                twr_core::paths::bare_selection(
+                    &paths.root(),
+                    std::env::var_os(WORKSPACE_ENV).as_deref(),
+                )
+            } else if opened_note.is_some() {
+                None
+            } else {
+                Some(paths.workspace_id().to_string())
+            };
+            twr_core::paths::workspace_selection(paths.workspace_id(), bare.as_deref())
         }
     });
     let cli = match cli.cmd {
@@ -2156,19 +2298,34 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         cmd => Cli { cmd, ..cli },
     };
-    if !paths.exists() {
-        let name = paths.workspace_name();
+    // (A socket given explicitly is that hub's, whichever workspace, and a command about
+    // every workspace is the root's: none need be the default.)
+    let every = matches!(
+        &cli.cmd,
+        Some(Cmd::Speech {
+            cmd: SpeechCmd::Feed {
+                all_workspaces: true,
+                ..
+            }
+        }) | Some(Cmd::Log {
+            cmd: LogCmd::Checkpoint { all: true, .. }
+        })
+    );
+    if !paths.exists() && !((cli.socket.is_some() || every) && !selected) {
+        if !selected {
+            bail!("{}", no_default_why(&paths.root()));
+        }
         let from = if cli.workspace.is_none() {
             format!(" (from {WORKSPACE_ENV})")
         } else {
             String::new()
         };
-        bail!("there is no workspace {name}{from}: create it with `twr ws new {name}` (`twr ws` lists them)");
+        bail!("{}", missing_workspace_why(&paths, &from));
     }
     let config = Config::load_from(&paths)?;
     twr_core::trace::mark("cli: config loaded");
     if cli.socket.is_none() {
-        let _ = EXPECTED_WORKSPACE.set(paths.workspace_name().to_string());
+        let _ = EXPECTED_WORKSPACE.set(paths.workspace_id().to_string());
         // `hub.socket` is the default workspace's alone.
         if paths.workspace.is_none() {
             check_socket_layout(&paths.root())?;
@@ -2183,7 +2340,8 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let Some(cmd) = cli.cmd else {
         // A socket given explicitly is that hub's alone: no workspaces to switch to.
         let switching = cli.socket.is_none().then(|| twr_tui::Switching {
-            current: paths.workspace_name().to_string(),
+            current: paths.workspace_id().to_string(),
+            note: opened_note.clone(),
             workspaces: std::sync::Arc::new(TuiWorkspaces {
                 root: paths.root(),
                 config: Config::load_from(&paths.root()).unwrap_or_else(|_| config.clone()),
@@ -2347,6 +2505,7 @@ async fn run_simple(cmd: Cmd, paths: Paths, socket: PathBuf) -> anyhow::Result<(
         | Cmd::Mcp
         | Cmd::ClaudeMemoryGuard { .. }
         | Cmd::Runner { .. }
+        | Cmd::Relay { .. }
         | Cmd::Update { .. }
         | Cmd::Boxes { .. }
         | Cmd::Loop { .. }
@@ -2357,6 +2516,9 @@ async fn run_simple(cmd: Cmd, paths: Paths, socket: PathBuf) -> anyhow::Result<(
         | Cmd::Remote { .. }
         | Cmd::TerminalSetup { .. }
         | Cmd::Completions { .. }
+        | Cmd::Gateway(_)
+        | Cmd::DesktopBridge { .. }
+        | Cmd::Phone { .. }
         | Cmd::Account { .. }
         | Cmd::Thread {
             cmd: ThreadCmd::New { .. },
@@ -3433,7 +3595,7 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    twr_core::paths::ensure_private_dir(&paths.data_dir)?;
+    hub_data_dir(&paths)?;
     let link_program = if test_token_trusted() {
         None
     } else {
@@ -3457,7 +3619,16 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
     }
     // A named workspace's orchestrator works in a directory of its own (`Config::in_workspace`).
     if let Some(dir) = paths.orchestrator_dir() {
-        twr_core::paths::ensure_private_dir(&dir)?;
+        // Not made with its parents: the workspace's directory exists, checked just above.
+        if std::fs::symlink_metadata(&dir).is_err() {
+            use std::os::unix::fs::DirBuilderExt;
+            match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
+            }
+        }
+        twr_core::paths::check_private_dir(&dir)?;
     }
     let (config, boxes_lock, removed_boxes) = {
         let paths = paths.clone();
@@ -3469,8 +3640,16 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
     opts.boxes_lock = boxes_lock;
     opts.removed_boxes = removed_boxes;
     opts.config_file = Some(paths.config_file.clone());
-    opts.instance_name = paths.instance_name();
+    opts.instance_name = paths.base_instance_name();
     opts.workspace = paths.workspace.clone();
+    // Its name, read as it is asked (a rename moves nothing, so the hub keeps running), and
+    // for the root slot what says it was removed, checked under the hub's lock.
+    opts.workspace_name_file = Some(paths.data_dir.join(twr_core::workspaces::NAME_FILE));
+    if paths.workspace.is_none() {
+        opts.removed_marker = Some(paths.removed_marker());
+    }
+    // A named workspace's directory is never made by its hub, `twr ws rm` may be removing it.
+    opts.data_dir_must_exist = paths.workspace.is_some();
     opts.workspaces_root = Some(paths.root().data_dir);
     // One pool of job slots for every workspace of this home.
     opts.job_slots_dir = Some(paths.root().data_dir.join("job-slots"));
@@ -3489,6 +3668,12 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
         // The accounts' logins too (`account.status`), on the same terms.
         opts.account_probe = Some(twr_hub::hub::own_account_probe());
     }
+    // Whether the hub's machine reaches the internet (`hub::net`): never under a test's
+    // throwaway hub, whose machine may have no connection at all.
+    if !trusted {
+        let targets = twr_hub::hub::probe_targets(&opts.config.hub, |v| std::env::var(v).ok());
+        opts.net_probe = Some(twr_hub::hub::own_net_probe(targets));
+    }
     // A test's throwaway hub may be told what it found instead ([`TEST_AGENTS_ENV`]).
     if let Some(agents) = test_agents(trusted) {
         opts.agent_probe = Some(std::sync::Arc::new(move || {
@@ -3506,6 +3691,25 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
                 test_gate(&gate, LOOP_GATE_ENV);
             }
         }));
+    }
+    // The phone gateway, while phones are paired with it (`twr phone`): started on its own,
+    // once this hub answers; never by a test's throwaway hub, nor a named workspace's (the
+    // gateway serves every workspace from the default one's hub).
+    if paths.workspace.is_none() {
+        let socket = socket.clone();
+        tokio::spawn(async move {
+            let started = async {
+                let program = twr_app::phone::this_program()?;
+                twr_app::phone::autostart(&program, &socket, trusted).await
+            };
+            match started.await {
+                Ok(twr_app::phone::Autostart::Start) => tracing::info!("started the phone gateway"),
+                Ok(twr_app::phone::Autostart::Dormant(why)) => {
+                    tracing::debug!("the phone gateway is not started: {why}")
+                }
+                Err(e) => tracing::warn!("the phone gateway could not be started: {e:#}"),
+            }
+        });
     }
     if trusted && std::env::var_os(HUB_STOP_GATE_ENV).is_some() {
         opts.socket_removed_hook = Some(std::sync::Arc::new(|| {
@@ -3975,7 +4179,7 @@ async fn prewarm_for_stop(info: &Value, paths: &Paths) -> Option<String> {
     if !prewarm_wanted(info, &twr_hub::checkpoint_build(), &db) {
         return None;
     }
-    let name = paths.workspace_name().to_string();
+    let name = paths.workspace_id().to_string();
     let notify = Config::load_from(paths)
         .map(|c| c.notify)
         .unwrap_or_default();
@@ -4055,12 +4259,18 @@ fn stop_connection_lost(e: &anyhow::Error) -> bool {
     })
 }
 
-/// Default plus the same named directories as `twr ws`. Each stop has its own deadline
-/// and task, so even a hub that never answers cannot delay shutdown of the others.
+/// The same workspaces as `twr ws`, by id: the root slot's unless it was removed (stopped
+/// even when the named ones can't be listed), then the named directories. Each stop has its
+/// own deadline and task, so even a hub that never answers cannot delay shutdown of the
+/// others.
 async fn hub_stop_all(root: &Paths, timeout: Duration) -> anyhow::Result<()> {
     let config = Config::load_from(root);
     let mut failed = 0;
-    let mut names = vec![DEFAULT_WORKSPACE.to_string()];
+    // By id: the root slot's first, unless it was removed (no hub starts there then).
+    let mut names = Vec::new();
+    if !root.root_removed() {
+        names.push(DEFAULT_WORKSPACE.to_string());
+    }
     match root
         .named_workspaces()
         .with_context(|| format!("listing {}", root.workspaces_dir().display()))
@@ -4086,6 +4296,8 @@ async fn hub_stop_all(root: &Paths, timeout: Duration) -> anyhow::Result<()> {
         } else {
             ws.socket.clone()
         };
+        // Said by its name, checked by its id.
+        let label = ws.display_name();
         stops.spawn(async move {
             let result = async {
                 check_socket_path(&socket)?;
@@ -4095,7 +4307,7 @@ async fn hub_stop_all(root: &Paths, timeout: Duration) -> anyhow::Result<()> {
                 hub_stop_result(&socket, &ws, timeout, Some(&name), true).await
             }
             .await;
-            (name, result)
+            (label, result)
         });
     }
     while let Some(result) = stops.join_next().await {
@@ -4899,6 +5111,7 @@ async fn prewarm_installed(new_exe: &Path) {
     let prewarm = tokio::process::Command::new(new_exe)
         .args(["log", "checkpoint", "--all"])
         .env_remove(twr_core::paths::WORKSPACE_ENV)
+        .env_remove(twr_core::paths::WORKSPACE_ID_ENV)
         .status()
         .await;
     if !prewarm.is_ok_and(|s| s.success()) {
@@ -5874,7 +6087,7 @@ enum Consent<'a> {
     /// `--yes`: the user consented up front to whatever item is printed.
     Yes,
     /// A terminal: show the prompt, read the user's reply line.
-    Ask(&'a mut dyn FnMut(&str) -> anyhow::Result<String>),
+    Ask(&'a mut (dyn FnMut(&str) -> anyhow::Result<String> + Send)),
     /// No terminal and no `--yes`: nobody can confirm, so refuse.
     NoTerminal,
 }
@@ -5890,7 +6103,7 @@ fn ask_on_stderr(q: &str) -> anyhow::Result<String> {
 
 /// The consent a command that confirms gets: `--yes`, else asking on a terminal (`ask`), else
 /// none.
-fn consent(yes: bool, ask: &mut dyn FnMut(&str) -> anyhow::Result<String>) -> Consent<'_> {
+fn consent(yes: bool, ask: &mut (dyn FnMut(&str) -> anyhow::Result<String> + Send)) -> Consent<'_> {
     if yes {
         Consent::Yes
     } else if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
@@ -6426,14 +6639,10 @@ async fn log_cmd(socket: &Path, cmd: LogCmd) -> anyhow::Result<()> {
 async fn log_checkpoint(paths: &Paths, all: bool, json: bool) -> anyhow::Result<()> {
     let root = paths.root();
     let names = if all {
-        let mut names = vec![DEFAULT_WORKSPACE.to_string()];
-        names.extend(
-            root.named_workspaces()
-                .with_context(|| format!("listing {}", root.workspaces_dir().display()))?,
-        );
-        names
+        root.workspace_ids()
+            .with_context(|| format!("listing {}", root.workspaces_dir().display()))?
     } else {
-        vec![paths.workspace_name().to_string()]
+        vec![paths.workspace_id().to_string()]
     };
     let mut failed = 0;
     for name in names {
@@ -8189,18 +8398,48 @@ async fn control(socket: &Path, follow: bool, since: u64, pretty: bool) -> anyho
 
 // --- workspaces ---------------------------------------------------------------------------------
 
-/// `twr ws`: lists, creates or removes the root's workspaces (whichever workspace `paths` is in).
+/// `twr ws`: lists, creates, renames or removes the root's workspaces, or shows or sets the
+/// default one (whichever workspace `paths` is in).
 async fn ws(cmd: Option<WsCmd>, paths: &Paths) -> anyhow::Result<()> {
+    // A change that has to wait for another (`twr ws rm` asking in another terminal) says so.
+    twr_core::workspaces::on_registry_wait(|| {
+        errln!(
+            "twr: waiting for another change to the workspaces to finish (a `twr ws` command \
+             elsewhere, maybe asking a question)..."
+        );
+    });
     let cmd = cmd.unwrap_or(WsCmd::List {
         json: false,
         detail: false,
     });
-    if matches!(cmd, WsCmd::Rm { .. }) {
+    // Only the user changes workspaces ([`refuse_agent`]); `twr ws new` refuses in
+    // [`create_workspace`], which the TUI shares.
+    if matches!(
+        cmd,
+        WsCmd::Rm { .. } | WsCmd::Rename { .. } | WsCmd::Default { name: Some(_) }
+    ) {
         refuse_agent()?;
     }
     match cmd {
         WsCmd::List { json, detail } => ws_list(paths, json, detail).await,
-        WsCmd::New { name } => ws_new(paths, &name),
+        WsCmd::New { name } => ws_new(paths, &name).await,
+        WsCmd::Rename { name, new_name } => {
+            let r = twr_core::workspaces::rename(&paths.root(), &name, &new_name)?;
+            outln!("{}", renamed_line(&r));
+            Ok(())
+        }
+        WsCmd::Default { name: None } => {
+            outln!("{}", default_line(&paths.root()));
+            Ok(())
+        }
+        WsCmd::Default { name: Some(name) } => {
+            let (_, name) = twr_core::workspaces::set_default(&paths.root(), &name)?;
+            outln!(
+                "{name} is the default workspace now: `twr` and commands without -w (or \
+                 {WORKSPACE_ENV}) use it"
+            );
+            Ok(())
+        }
         WsCmd::Rm { name, yes } => {
             // As for `twr trash empty`: only a terminal can confirm, else --yes.
             let mut ask = ask_on_stderr;
@@ -8209,30 +8448,78 @@ async fn ws(cmd: Option<WsCmd>, paths: &Paths) -> anyhow::Result<()> {
     }
 }
 
-/// `twr ws list`: every workspace (`default` first), with what its hub reports when it runs.
+/// What `twr ws rename` (and the TUI's Rename) says it did.
+fn renamed_line(r: &twr_core::workspaces::Renamed) -> String {
+    if r.id == r.to {
+        format!("renamed workspace {} back to {}", r.from, r.to)
+    } else {
+        format!(
+            "renamed workspace {} to {}; nothing in it moved, and `-w {}`, its original name, \
+             still selects it",
+            r.from, r.to, r.id
+        )
+    }
+}
+
+/// Which workspace is the default, as `twr ws default` says it.
+fn default_line(root: &Paths) -> String {
+    match root.default_workspace() {
+        Some(ws) => format!(
+            "the default workspace is {}: `twr` and commands without -w (or {WORKSPACE_ENV}) \
+             use it; `twr ws default <name>` makes another one the default",
+            ws.display_name()
+        ),
+        None => no_default_why(root),
+    }
+}
+
+/// Why commands without `-w` have no workspace to run in, and what to do.
+fn no_default_why(root: &Paths) -> String {
+    let names: Vec<String> = root
+        .workspaces()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    if names.is_empty() {
+        "there are no workspaces: create one with `twr ws new <name>` (`twr ws new default` \
+         makes the usual one)"
+            .to_string()
+    } else {
+        format!(
+            "there is no default workspace (it was removed): pass -w <name>, or make one the \
+             default with `twr ws default <name>` (workspaces: {})",
+            names.join(", ")
+        )
+    }
+}
+
+/// `twr ws list`: every workspace (the default first), with what its hub reports when it
+/// runs; a renamed one with the original name it still answers to.
 async fn ws_list(paths: &Paths, json: bool, detail: bool) -> anyhow::Result<()> {
     let root = paths.root();
-    // The root's config: its `hub.socket` is the `default` workspace's socket.
+    // The root's config: its `hub.socket` is the root slot's socket.
     let config = Config::load_from(&root)?;
-    let mut names = vec![DEFAULT_WORKSPACE.to_string()];
-    names.extend(
-        root.named_workspaces()
-            .with_context(|| format!("listing {}", root.workspaces_dir().display()))?,
-    );
+    let entries = root
+        .workspaces()
+        .with_context(|| format!("listing {}", root.workspaces_dir().display()))?;
+    let here = paths.exists().then(|| paths.workspace_id().to_string());
     // Every hub is asked at once: a slow one delays the listing by its own wait only.
     let mut probes = Vec::new();
-    for name in &names {
-        let socket = config.socket_path(&root.workspace(name)?);
-        let name = name.clone();
+    for e in &entries {
+        let socket = config.socket_path(&e.paths);
+        let id = e.id.clone();
         probes.push(tokio::spawn(async move {
-            ws_status(&socket, &name, detail).await
+            ws_status(&socket, &id, detail).await
         }));
     }
     let mut rows = Vec::new();
-    for (name, probe) in names.into_iter().zip(probes) {
+    for (e, probe) in entries.iter().zip(probes) {
         let mut row = probe.await?;
-        row["name"] = json!(name);
-        row["current"] = json!(name == paths.workspace_name());
+        row["name"] = json!(e.name);
+        row["id"] = json!(e.id);
+        row["default"] = json!(e.default);
+        row["current"] = json!(here.as_deref() == Some(e.id.as_str()));
         rows.push(row);
     }
     if json {
@@ -8244,8 +8531,19 @@ async fn ws_list(paths: &Paths, json: bool, detail: bool) -> anyhow::Result<()> 
         .iter()
         .map(|r| {
             let mark = if r["current"] == true { "* " } else { "  " };
+            let mut name = str_of(&r["name"]).to_string();
+            let mut notes = Vec::new();
+            if r["default"] == true {
+                notes.push("default".to_string());
+            }
+            if r["id"] != r["name"] {
+                notes.push(format!("was {}", str_of(&r["id"])));
+            }
+            if !notes.is_empty() {
+                name = format!("{name} ({})", notes.join(", "));
+            }
             [
-                format!("{mark}{}", str_of(&r["name"])),
+                format!("{mark}{name}"),
                 str_of(&r["hub"]).to_string(),
                 count(r, "threads"),
                 count(r, "running"),
@@ -8253,17 +8551,22 @@ async fn ws_list(paths: &Paths, json: bool, detail: bool) -> anyhow::Result<()> 
             ]
         })
         .collect();
-    out!(
-        "{}",
-        table(
-            &["  WORKSPACE", "HUB", "THREADS", "RUNNING", "WAITING"],
-            &table_rows
-        )
-    );
+    if !table_rows.is_empty() {
+        out!(
+            "{}",
+            table(
+                &["  WORKSPACE", "HUB", "THREADS", "RUNNING", "WAITING"],
+                &table_rows
+            )
+        );
+    }
     for r in &rows {
         if let Some(e) = r["error"].as_str() {
             errln!("twr: workspace {}: {e}", str_of(&r["name"]));
         }
+    }
+    if root.default_id().is_none() {
+        errln!("twr: {}", no_default_why(&root));
     }
     Ok(())
 }
@@ -8271,8 +8574,8 @@ async fn ws_list(paths: &Paths, json: bool, detail: bool) -> anyhow::Result<()> 
 /// What `twr ws` shows of workspace `name`'s hub on `socket`: `{"hub": "stopped"}` when
 /// nothing listens ([`nothing_listens`]), `"error"` with the `error` when the socket can't be
 /// used (another user's, say), `"busy"` when it does not answer in time, `"other"` when it
-/// serves another workspace, else `"running"` with its worker threads, how many run, and how
-/// many items block on you.
+/// serves another workspace, else `"running"` with its worker threads, how many run, how
+/// many items block on you, and the hub's `version` and `build` (`hub.info`'s).
 ///
 /// With `detail` (`twr ws list --json --detail`, the desktop app's one read of every workspace
 /// per refresh) it waits [`DETAIL_PROBE_TIMEOUT`], and a row whose hub isn't stopped also has
@@ -8316,10 +8619,13 @@ async fn ws_status(socket: &Path, name: &str, detail: bool) -> Value {
             .is_some_and(|i| i.starts_with("user:"));
         let threads = c.call("thread.list", Value::Null).await?;
         let items = c.call("attention.list", json!({ "all": true })).await?;
-        anyhow::Ok(Some((threads, items, user)))
+        // The engine it runs: the desktop app compares it with its own after an upgrade. A
+        // hub that refuses it is still listed, without them.
+        let info = c.call("hub.info", json!({})).await.unwrap_or(Value::Null);
+        anyhow::Ok(Some((threads, items, user, info)))
     })
     .await;
-    let (threads, items, user) = match answer {
+    let (threads, items, user, info) = match answer {
         Ok(Ok(Some(answer))) => answer,
         Ok(Ok(None)) => {
             return unread(json!({ "hub": "other" }), "Socket serves another workspace")
@@ -8348,16 +8654,21 @@ async fn ws_status(socket: &Path, name: &str, detail: bool) -> Value {
         .flatten()
         .filter(|i| is_blocking(i))
         .count();
-    let row = json!({
+    let mut row = json!({
         "hub": "running",
         "threads": workers.len(),
         "running": running,
         "waiting": waiting,
     });
+    // `build` is absent from a hub too old to report it (and when its file can't be read).
+    for key in ["version", "build"] {
+        if let Some(value) = info[key].as_str() {
+            row[key] = json!(value);
+        }
+    }
     match (detail, user) {
         (false, _) => row,
         (true, true) => {
-            let mut row = row;
             row["detail"] = json!({ "threads": threads, "attention": items });
             row
         }
@@ -8368,11 +8679,29 @@ async fn ws_status(socket: &Path, name: &str, detail: bool) -> Value {
     }
 }
 
-/// `twr ws new`: makes the workspace's data directory (private, like every data directory).
-fn ws_new(paths: &Paths, name: &str) -> anyhow::Result<()> {
-    create_workspace(&paths.root(), name)?;
-    outln!("created workspace {name}; open it with `twr -w {name}`");
+/// `twr ws new`: makes the workspace ([`create_workspace`]), off the async workers (it may
+/// wait for the registry lock, and delete what stale removals left).
+async fn ws_new(paths: &Paths, name: &str) -> anyhow::Result<()> {
+    let (root, owned) = (paths.root(), name.to_string());
+    let made = tokio::task::spawn_blocking(move || create_workspace(&root, &owned)).await??;
+    outln!("{}", created_line(name, &made));
     Ok(())
+}
+
+/// What `twr ws new` (and the TUI) says it made.
+fn created_line(name: &str, made: &twr_core::workspaces::Created) -> String {
+    let mut line = if made.root_slot {
+        format!(
+            "created workspace {name} again, in twr's own data directory (its hub serves the \
+             boxes and `hub.listen`); open it with `twr -w {name}`"
+        )
+    } else {
+        format!("created workspace {name}; open it with `twr -w {name}`")
+    };
+    if made.made_default {
+        line.push_str("; it is the default workspace (there was none): `twr` opens it");
+    }
+    line
 }
 
 /// Workspaces are created and removed without asking a hub, which would refuse an agent: so
@@ -8703,83 +9032,211 @@ fn test_token_trusted() -> bool {
     cfg!(debug_assertions) && std::env::var_os("TWR_HOME").is_some()
 }
 
-/// Creates workspace `name` of `root`: its data directory, private like every data directory.
-/// Refused to an agent ([`refuse_agent`]), from `twr ws new` and the TUI alike.
-fn create_workspace(root: &Paths, name: &str) -> anyhow::Result<Paths> {
-    use std::os::unix::fs::DirBuilderExt;
-    refuse_agent()?;
-    if name == DEFAULT_WORKSPACE {
-        bail!("the {DEFAULT_WORKSPACE} workspace always exists");
-    }
-    let ws = root.workspace(name)?;
-    check_socket_path(&ws.socket)?;
-    twr_core::paths::ensure_private_dir(&root.data_dir)?;
-    twr_core::paths::ensure_private_dir(&root.workspaces_dir())?;
-    match std::fs::DirBuilder::new().mode(0o700).create(&ws.data_dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            bail!("workspace {name} already exists")
-        }
-        Err(e) => return Err(e).with_context(|| format!("creating {}", ws.data_dir.display())),
-    }
-    Ok(ws)
+/// Creates workspace `name` of `root` ([`twr_core::workspaces::create`]). Refused to an agent
+/// ([`refuse_agent`]), from `twr ws new` and the TUI alike.
+fn create_workspace(root: &Paths, name: &str) -> anyhow::Result<twr_core::workspaces::Created> {
+    let (asides, made) = create_workspace_deferring(root, name);
+    twr_core::workspaces::delete_asides(asides);
+    made
 }
 
-/// `twr ws rm`: removes a named workspace's data directory once nothing in it can be lost by
-/// accident: its hub is not running, it has no threads, and its trash is empty (a trash item's
-/// commits stay referenced in its repository until it is purged), and `consent` allows it: what
-/// goes, the orchestrator's conversation and memory notes, the log and any worktree directories
-/// left behind ([`ws_rm_question`]), is listed and asked about on a terminal, else needs
-/// `--yes`. The workspace's lock is held from the checks through the removal, so no hub opens
-/// it while the question waits.
-async fn ws_rm(paths: &Paths, name: &str, consent: Consent<'_>) -> anyhow::Result<()> {
-    if name == DEFAULT_WORKSPACE {
-        bail!("the {DEFAULT_WORKSPACE} workspace cannot be removed");
+/// [`create_workspace`], with the aside directories still to delete left to the caller
+/// ([`twr_core::workspaces::create_deferring`]).
+fn create_workspace_deferring(
+    root: &Paths,
+    name: &str,
+) -> (Vec<PathBuf>, anyhow::Result<twr_core::workspaces::Created>) {
+    if let Err(e) = refuse_agent() {
+        return (Vec::new(), Err(e));
     }
-    let ws = paths.root().workspace(name)?;
-    if !ws.exists() {
-        bail!("there is no workspace {name} (`twr ws` lists them)");
-    }
-    let running = || {
-        anyhow!(
-            "the hub of workspace {name} is running: stop it first with `twr -w {name} hub stop`"
-        )
-    };
-    if probe_hub(&ws.socket).await? != Probe::Absent {
-        return Err(running());
-    }
-    // The lock every hub of the workspace holds on its data directory, whatever its socket:
-    // held from here to the end, so no hub opens the data while it is checked and removed.
-    let _lock = match lock_workspace(&ws)? {
-        Some(lock) => lock,
-        None => return Err(running()),
-    };
-    let (threads, conversation) = ws_threads(&ws)?;
-    if !threads.is_empty() {
-        bail!(
-            "workspace {name} still has {} thread{} ({}): delete them first (`twr -w {name} \
-             delete <thread>...`, with its hub running), then stop its hub",
-            threads.len(),
-            if threads.len() == 1 { "" } else { "s" },
-            threads.join(", ")
+    twr_core::workspaces::create_deferring(root, name)
+}
+
+/// `twr` alone when there is no default workspace (it was removed): the TUI opens the first
+/// workspace there is, and says so (the note); with none, it asks in the terminal for the name
+/// of one to make (Enter: `default`, the usual one) and opens it. `None`: the question got no
+/// answer (end of input).
+fn tui_without_default(root: &Paths) -> anyhow::Result<Option<(Paths, String)>> {
+    if let Some(first) = root.workspaces()?.into_iter().next() {
+        let note = format!(
+            "no workspace is the default (it was removed): opened {}; Make default in its ⋯ \
+             menu (or `twr ws default <name>`) chooses one",
+            first.name
         );
+        return Ok(Some((first.paths, note)));
     }
-    let trash = ws.data_dir.join("trash");
-    let items = match std::fs::read_dir(&trash) {
-        Ok(entries) => entries.count(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(e) => return Err(e).with_context(|| format!("reading {}", trash.display())),
+    use std::io::{BufRead, IsTerminal};
+    let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if !tty || caller_is_agent() {
+        bail!("{}", no_default_why(root));
+    }
+    let mut lines = std::io::stdin().lock().lines();
+    loop {
+        eprint!("twr: there are no workspaces. Name of the one to make [{DEFAULT_WORKSPACE}]: ");
+        let Some(line) = lines.next() else {
+            eprintln!();
+            return Ok(None);
+        };
+        let line = line.context("reading the name")?;
+        let name = match line.trim() {
+            "" => DEFAULT_WORKSPACE,
+            n => n,
+        };
+        match create_workspace(root, name) {
+            Ok(made) => {
+                let note = created_line(name, &made);
+                return Ok(Some((made.paths, note)));
+            }
+            Err(e) => eprintln!("twr: {e:#}"),
+        }
+    }
+}
+
+/// `twr ws rm`: removes a workspace ([`remove_workspace`]) once `consent` allows it, and says
+/// what went and what stayed.
+async fn ws_rm(paths: &Paths, selector: &str, consent: Consent<'_>) -> anyhow::Result<()> {
+    for line in
+        remove_workspace(&paths.root(), RemovalOf::Selector(selector), None, consent).await?
+    {
+        outln!("{line}");
+    }
+    Ok(())
+}
+
+/// What removing workspace `ws` takes, keeps and changes, as `twr ws rm` and the TUI's
+/// Delete say it: the line of what it removes (with its orchestrator's `notes` memory notes),
+/// the lines of what stays, and the lines of what changes for the rest.
+fn removal_notes(
+    root: &Paths,
+    ws: &Paths,
+    notes: usize,
+    config: Option<&Config>,
+) -> (String, Vec<String>, Vec<String>) {
+    let id = ws.workspace_id();
+    let name = ws.display_name();
+    let mut removed = "its log, its orchestrator's conversation, its input history and its \
+                       worktrees directory"
+        .to_string();
+    if notes > 0 {
+        removed.push_str(&format!(
+            ", with its orchestrator's {notes} memory note{}",
+            if notes == 1 { "" } else { "s" }
+        ));
+    }
+    let mut kept = vec![
+        "its threads' branches, in your repositories".to_string(),
+        "Claude Code's own memory of its orchestrator, in ~/.claude/projects/".to_string(),
+        "config.toml, the boxes, the accounts and their logins, and the other workspaces"
+            .to_string(),
+    ];
+    if ws.workspace.is_none() {
+        kept.push(format!(
+            "what every workspace shares in {} (accounts, job slots, the TUI's and the \
+             speaker's state) and the files there that are not its own",
+            root.data_dir.display()
+        ));
+    }
+    let mut after = Vec::new();
+    if ws.workspace.is_none() {
+        let boxes = config.map_or(0, |c| c.boxes.len());
+        let listen = config.is_some_and(|c| c.hub.listen.is_some());
+        if boxes > 0 || listen {
+            let what = match (boxes, listen) {
+                (0, _) => "`hub.listen`".to_string(),
+                (n, false) => format!("the {n} box{}", if n == 1 { "" } else { "es" }),
+                (n, true) => format!(
+                    "the {n} box{} and `hub.listen`",
+                    if n == 1 { "" } else { "es" }
+                ),
+            };
+            after.push(format!(
+                "only this workspace's hub serves {what}: no hub does until `twr ws new \
+                 {DEFAULT_WORKSPACE}` makes it again (the config stays)"
+            ));
+        }
+        if let Some(phones) = phone_pairing_note(root) {
+            after.push(phones);
+        }
+        if let Some(revoked) = pending_revocations_note(root) {
+            after.push(revoked);
+        }
+    }
+    if root.default_id().as_deref() == Some(id) {
+        // What the default is once it is gone ([`twr_core::workspaces::forget_default`]).
+        let next = (id != DEFAULT_WORKSPACE && !root.root_removed()).then(|| root.display_name());
+        after.push(match next {
+            Some(next) => format!("{next} becomes the default workspace again"),
+            None => "no workspace is the default then: `twr` opens the first one, and commands \
+                     need -w until `twr ws default <name>` chooses one"
+                .to_string(),
+        });
+    }
+    if id != name {
+        after.push(format!(
+            "its names, {name} and {id} (its original name), are free again"
+        ));
+    }
+    (removed, kept, after)
+}
+
+/// What removing `default` does to phones, when phones are paired with this machine, an
+/// invitation is open or `twr phone` set the gateway up (its directory, `mobile/` beside the
+/// config file): until `twr ws new default` makes it again, pairing and managing phones (which
+/// go through `default`'s hub), pushes about `default`, and starting the gateway (which starts
+/// `default`'s hub first) stop. A gateway that already runs keeps serving the paired phones'
+/// other workspaces. The pairings stay in that directory, which a removal never touches.
+/// `None`: nothing to say (nothing is read that isn't there).
+fn phone_pairing_note(root: &Paths) -> Option<String> {
+    let dir = root.root().config_file.with_file_name("mobile");
+    let (devices, open) = if dir.join("devices.json").exists() {
+        twr_core::devices::Auth::open(&dir)
+            .and_then(|a| a.summary())
+            .unwrap_or((0, false))
+    } else {
+        (0, false)
     };
-    if items > 0 {
-        bail!(
-            "the trash of workspace {name} holds {items} deleted thread{}, whose commits stay \
-             referenced in their repositories until purged: empty it first (`twr -w {name} trash \
-             empty --all`, with its hub running), then stop its hub",
-            if items == 1 { "" } else { "s" }
-        );
+    let set_up = twr_app::gateway::settings::Settings::load(&dir)
+        .ok()
+        .flatten()
+        .is_some();
+    let phones = match devices {
+        0 if !open && !set_up => return None,
+        0 => String::new(),
+        1 => " (the paired phone keeps its pairing)".to_string(),
+        n => format!(" (the {n} paired phones keep their pairings)"),
+    };
+    Some(format!(
+        "until `twr ws new {DEFAULT_WORKSPACE}` makes it again, pairing and managing phones \
+         (`twr phone`), pushes about this workspace and starting the phone gateway stop: they \
+         go through this workspace's hub. A gateway that runs keeps serving the other \
+         workspaces{phones}"
+    ))
+}
+
+/// What removing `default` does to runners removed (`twr box remove`) that have not
+/// acknowledged it yet (the runner service's `pending_revocations`): the service retries them
+/// through this workspace's link to the runners, so they wait while it is gone and are
+/// retried once `twr ws new default` makes it again (the runner checks the machine that
+/// paired it, not the workspace). `None`: none waits.
+fn pending_revocations_note(root: &Paths) -> Option<String> {
+    let state = twr_link::state::Machine::of(root).load().ok()?;
+    match state.pending_revocations.len() {
+        0 => None,
+        n => Some(format!(
+            "{n} runner{} you removed (`twr box remove`) {} not acknowledged it yet: the \
+             runner service tells {} through this workspace, so {} until `twr ws new \
+             {DEFAULT_WORKSPACE}` makes it again",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "has" } else { "have" },
+            if n == 1 { "it" } else { "them" },
+            if n == 1 { "that waits" } else { "those wait" },
+        )),
     }
-    // The orchestrator's memory goes with the data: said, since it is the user's notes.
-    let notes = std::fs::read_dir(ws.data_dir.join(twr_hub::MEMORY_DIR))
+}
+
+/// The memory notes of the orchestrator of `ws` (the user's notes, so removal says them).
+fn memory_notes(ws: &Paths) -> usize {
+    std::fs::read_dir(ws.data_dir.join(twr_hub::MEMORY_DIR))
         .map(|d| {
             d.flatten()
                 .filter(|e| {
@@ -8789,13 +9246,271 @@ async fn ws_rm(paths: &Paths, name: &str, consent: Consent<'_>) -> anyhow::Resul
                 })
                 .count()
         })
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// How many deleted threads the trash of `ws` holds.
+fn trash_items(ws: &Paths) -> anyhow::Result<usize> {
+    let trash = ws.data_dir.join("trash");
+    match std::fs::read_dir(&trash) {
+        Ok(entries) => Ok(entries.count()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e).with_context(|| format!("reading {}", trash.display())),
+    }
+}
+
+/// Why workspace `name` can't be removed with `threads` (by name) and `trash` deleted threads
+/// in its trash, and what to do first; `None` when it can.
+fn removal_refusal(name: &str, threads: &[String], trash: usize) -> Option<String> {
+    if !threads.is_empty() {
+        return Some(format!(
+            "workspace {name} still has {} thread{} ({}): delete them first (`twr -w {name} \
+             delete <thread>...`, with its hub running), then stop its hub",
+            threads.len(),
+            if threads.len() == 1 { "" } else { "s" },
+            threads.join(", ")
+        ));
+    }
+    if trash > 0 {
+        return Some(format!(
+            "the trash of workspace {name} holds {trash} deleted thread{}, whose commits stay \
+             referenced in their repositories until purged: empty it first (`twr -w {name} \
+             trash empty --all`, with its hub running), then stop its hub",
+            if trash == 1 { "" } else { "s" }
+        ));
+    }
+    None
+}
+
+/// Removes the workspace `selector` names in `root` once nothing in it can be lost by
+/// accident: its hub is not running, it has no threads, and its trash is empty (a trash item's
+/// commits stay referenced in its repository until it is purged). Under the registry lock
+/// ([`twr_core::workspaces::RegistryLock`]) and the workspace's own (`twr.lock`, which its hub
+/// holds while it runs, whatever its socket), so no rename, removal or hub start passes
+/// between the checks and the removal. A named workspace's directory is moved aside, then
+/// removed; the root slot is marked removed first ([`twr_core::workspaces::REMOVED_FILE`]),
+/// then its own entries are ([`twr_core::workspaces::ROOT_OWNED`]). Either way a removal that
+/// stops half way leaves no workspace that looks whole. What goes, the orchestrator's
+/// conversation and memory notes, the log and any worktree directories left behind
+/// ([`ws_rm_question`]), is listed and asked about first unless `consent` is `--yes` (the
+/// TUI's Delete, which showed it): both locks are held from the checks through the removal, so
+/// nothing changes while the question waits. The lines saying what it did.
+///
+/// With `generation` ([`workspace_generation`], as a plan the user confirmed saw it), only
+/// while the workspace is still that one: not one made since with the same id.
+async fn remove_workspace(
+    root: &Paths,
+    which: RemovalOf<'_>,
+    generation: Option<&str>,
+    consent: Consent<'_>,
+) -> anyhow::Result<Vec<String>> {
+    let mut stale = Vec::new();
+    let done = remove_workspace_deferring(root, which, generation, consent, &mut stale).await;
+    // What removals no longer running left set aside, found under the registry lock, is
+    // deleted once it is let go, whatever came of this one.
+    if !stale.is_empty() {
+        tokio::task::spawn_blocking(move || twr_core::workspaces::delete_asides(stale)).await?;
+    }
+    done
+}
+
+/// [`remove_workspace`], with what removals no longer running left set aside
+/// ([`twr_core::workspaces::stale_asides`]) put in `stale` for the caller to delete: the
+/// TUI's Delete says what it did first.
+async fn remove_workspace_deferring(
+    root: &Paths,
+    which: RemovalOf<'_>,
+    generation: Option<&str>,
+    consent: Consent<'_>,
+    stale: &mut Vec<PathBuf>,
+) -> anyhow::Result<Vec<String>> {
+    let root = root.root();
+    let (ws, selector) = match which {
+        RemovalOf::Selector(s) => (root.find_workspace(s)?, s),
+        RemovalOf::Id(id) => (root.workspace(id)?, id),
+    };
+    if !ws.exists() {
+        bail!("there is no workspace {selector} (`twr ws` lists them)");
+    }
+    let name = ws.display_name();
+    let config = Config::load_from(&root).ok();
+    let socket = config
+        .as_ref()
+        .map_or_else(|| ws.socket.clone(), |c| c.socket_path(&ws));
+    let running = || {
+        anyhow!(
+            "the hub of workspace {name} is running: stop it first with `twr -w {name} hub stop`"
+        )
+    };
+    if probe_hub(&socket).await? != Probe::Absent {
+        return Err(running());
+    }
+    // The rest blocks (locks, the log read, the deletion): off the async workers. The
+    // question, when there is one, is asked with both locks held.
+    let generation = generation.map(str::to_string);
+    let (found, checked) = tokio::task::spawn_blocking(move || {
+        check_removal(root, ws, name, generation.as_deref(), config)
+    })
+    .await?;
+    *stale = found;
+    remove_checked(checked, consent).await
+}
+
+/// [`remove_workspace`] once checked: asks (`consent`), then removes.
+async fn remove_checked(
+    checked: anyhow::Result<CheckedRemoval>,
+    consent: Consent<'_>,
+) -> anyhow::Result<Vec<String>> {
+    let checked = checked?;
+    match consent {
+        Consent::Yes => {}
+        Consent::Ask(ask) => {
+            let reply = ask(&ws_rm_question(
+                &checked.name,
+                &checked.ws.data_dir,
+                &checked.goes,
+            ))?;
+            if !matches!(reply.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                return Ok(vec!["nothing removed".to_string()]);
+            }
+        }
+        Consent::NoTerminal => bail!(
+            "not removing workspace {name} without confirmation (no terminal to ask on). {}Run \
+             `twr ws rm {name} --yes` to remove it",
+            ws_rm_listing(&checked.name, &checked.ws.data_dir, &checked.goes),
+            name = checked.name
+        ),
+    }
+    tokio::task::spawn_blocking(move || checked.remove()).await?
+}
+
+/// A workspace [`check_removal`] found removable, with the locks it took for that held until
+/// it is removed ([`CheckedRemoval::remove`]) or dropped.
+struct CheckedRemoval {
+    root: Paths,
+    ws: Paths,
+    name: String,
+    /// What it removes, keeps and changes ([`removal_notes`]).
+    removed: String,
+    kept: Vec<String>,
+    after: Vec<String>,
+    /// What goes, for the question ([`ws_rm_question`]).
+    goes: WsRemoval,
+    registry: twr_core::workspaces::RegistryLock,
+    lock: WorkspaceLock,
+}
+
+/// [`remove_workspace`] from the registry lock on: checks that workspace `ws` (named `name`
+/// when it was found) can be removed, and says what removing it takes, with the locks held.
+/// With it, what removals no longer running left set aside, found under the registry lock
+/// ([`twr_core::workspaces::stale_asides`]) for the caller to delete once it is let go.
+fn check_removal(
+    root: Paths,
+    ws: Paths,
+    name: String,
+    generation: Option<&str>,
+    config: Option<Config>,
+) -> (Vec<PathBuf>, anyhow::Result<CheckedRemoval>) {
+    let registry = match twr_core::workspaces::RegistryLock::take(&root) {
+        Ok(registry) => registry,
+        Err(e) => return (Vec::new(), Err(e)),
+    };
+    let stale = twr_core::workspaces::stale_asides(&root);
+    let checked = check_locked(root, ws, name, generation, config, registry);
+    (stale, checked)
+}
+
+/// [`check_removal`] under the registry lock (`registry`).
+fn check_locked(
+    root: Paths,
+    ws: Paths,
+    name: String,
+    generation: Option<&str>,
+    config: Option<Config>,
+    registry: twr_core::workspaces::RegistryLock,
+) -> anyhow::Result<CheckedRemoval> {
+    let running = || {
+        anyhow!(
+            "the hub of workspace {name} is running: stop it first with `twr -w {name} hub stop`"
+        )
+    };
+    // Again under the lock: removed, or renamed into another's name, meanwhile.
+    if !ws.exists() || ws.display_name() != name {
+        bail!("workspace {name} changed meanwhile: try again (`twr ws` lists them)");
+    }
+    let lock = match lock_workspace(&ws)? {
+        Some(lock) => lock,
+        None => return Err(running()),
+    };
+    if generation.is_some_and(|g| workspace_generation(&ws).as_deref() != Some(g)) {
+        bail!(replaced_why(&name));
+    }
+    if let Some(why) = refusal_before_stopping(&root, &ws) {
+        bail!(why);
+    }
+    let log = ws_threads(&ws)?;
+    let trash = trash_items(&ws)?.max(log.trash);
+    if let Some(why) = removal_refusal(&name, &log.threads, trash) {
+        bail!(why);
+    }
+    if log.unfinished {
+        bail!(unfinished_why(&name));
+    }
+    if log.queued {
+        bail!(queued_why(&name));
+    }
+    if log.spawning {
+        bail!(spawning_why(&name));
+    }
+    let (removed, kept, after, goes) =
+        removal_listing(&root, &ws, log.conversation, config.as_ref())?;
+    Ok(CheckedRemoval {
+        root,
+        ws,
+        name,
+        removed,
+        kept,
+        after,
+        goes,
+        registry,
+        lock,
+    })
+}
+
+/// Why workspace `ws` can't be removed, from what is beside it rather than in it: what the
+/// TUI's Delete checks before it stops a running hub (so it never stops one for a removal that
+/// is then refused), and [`check_removal`] again under the locks. For `default`, a `twr runner`
+/// keeping its data in twr's data directory ([`runner_in_root_why`]).
+fn refusal_before_stopping(root: &Paths, ws: &Paths) -> Option<String> {
+    // Its log must be of this twr's schema: a newer twr's hub isn't stopped for a removal that
+    // then can't read it.
+    if let Some(why) = log_schema_why(ws) {
+        return Some(why);
+    }
+    ws.workspace
+        .is_none()
+        .then(|| runner_in_root_why(root))
+        .flatten()
+}
+
+/// What removing workspace `ws` takes, keeps and changes, as `twr ws rm` lists it before it
+/// asks and the TUI's Delete shows it ([`ws_rm_listing`]): the line of what it removes, what
+/// stays, what changes for the rest, and what goes with its sizes. `conversation`: its
+/// orchestrator threads and their turns, from its log or its running hub.
+fn removal_listing(
+    root: &Paths,
+    ws: &Paths,
+    conversation: (usize, u64),
+    config: Option<&Config>,
+) -> anyhow::Result<(String, Vec<String>, Vec<String>, WsRemoval)> {
+    let notes = memory_notes(ws);
+    let (removed, kept, after) = removal_notes(root, ws, notes, config);
+    let own = own_entries(ws)?;
     let goes = WsRemoval {
         conversation,
         notes,
-        log_bytes: std::fs::read_dir(&ws.data_dir)
-            .with_context(|| format!("reading {}", ws.data_dir.display()))?
-            .flatten()
+        log_bytes: own
+            .iter()
             .filter(|e| {
                 let n = e.file_name();
                 let n = n.to_string_lossy();
@@ -8805,41 +9520,132 @@ async fn ws_rm(paths: &Paths, name: &str, consent: Consent<'_>) -> anyhow::Resul
             .sum(),
         worktrees: leftover_worktrees(&ws.worktrees_dir()),
         worktree_bytes: tree_bytes(&ws.worktrees_dir()),
-        total_bytes: tree_bytes(&ws.data_dir),
+        total_bytes: own.iter().map(|e| tree_bytes(&e.path())).sum(),
+        root_slot: ws.workspace.is_none(),
+        kept: kept.clone(),
+        after: after.clone(),
     };
-    match consent {
-        Consent::Yes => {}
-        Consent::Ask(ask) => {
-            let reply = ask(&ws_rm_question(name, &ws.data_dir, &goes))?;
-            if !matches!(reply.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-                outln!("nothing removed");
-                return Ok(());
-            }
+    Ok((removed, kept, after, goes))
+}
+
+impl CheckedRemoval {
+    /// Removes the workspace, and deletes what it moved aside once the locks are let go; the
+    /// lines saying what it did. Refused, unchanged, once this process quits (the TUI's,
+    /// [`twr_core::workspaces::REMOVALS`]).
+    fn remove(self) -> anyhow::Result<Vec<String>> {
+        self.remove_in(&twr_core::workspaces::REMOVALS)
+    }
+
+    /// [`CheckedRemoval::remove`], past its checks in `set`.
+    fn remove_in(
+        self,
+        set: &'static twr_core::workspaces::Removals,
+    ) -> anyhow::Result<Vec<String>> {
+        let CheckedRemoval {
+            root,
+            ws,
+            name,
+            removed,
+            kept,
+            after,
+            goes,
+            registry,
+            lock,
+        } = self;
+        let id = ws.workspace_id().to_string();
+        // Checked again after the question, which may have waited long: what a writer that
+        // takes neither lock (`twr runner` keeping its data in twr's data directory) changed
+        // meanwhile is not removed unlisted. (It could still start between here and the move
+        // just below, a few file operations apart.)
+        if let Some(why) = refusal_before_stopping(&root, &ws) {
+            bail!(why);
         }
-        Consent::NoTerminal => bail!(
-            "not removing workspace {name} without confirmation (no terminal to ask on). {}Run \
-             `twr ws rm {name} --yes` to remove it",
-            ws_rm_listing(name, &ws.data_dir, &goes)
-        ),
+        let now = leftover_worktrees(&ws.worktrees_dir());
+        if now != goes.worktrees {
+            bail!(
+                "what removing workspace {name} takes changed since it was listed (its worktree \
+                 directories are now {}): nothing was removed; look again with `twr ws rm {}`",
+                if now.is_empty() {
+                    "none".to_string()
+                } else {
+                    now.join(", ")
+                },
+                ws.workspace_id()
+            );
+        }
+        // Past its checks, before it changes anything: from here a process that quits waits
+        // for it (the TUI), so it is never cut off half deleted; one quitting already refuses
+        // it, unchanged.
+        let _removing = set.begin(&name)?;
+        // What a TUI saves of its input history waits meanwhile, then finds the workspace
+        // gone (`twr_tui::save_history`): it never makes it again.
+        let history = history_lock(&ws)?;
+        let aside = if ws.workspace.is_none() {
+            let marker = ws.removed_marker();
+            twr_core::workspaces::write_atomic(&marker, "removed\n")
+                .with_context(|| format!("writing {}", marker.display()))?;
+            let aside = twr_core::workspaces::move_root_owned_aside(&root)?;
+            // From now on, what appears under its names is not its own: `twr ws new default`
+            // never deletes it unasked.
+            twr_core::workspaces::mark_root_moved(&root)
+                .with_context(|| format!("writing {}", marker.display()))?;
+            aside
+        } else {
+            // Moved aside first (a name no workspace can have), so a half-removed directory is
+            // never taken for the workspace.
+            let doomed = ws
+                .workspaces_dir()
+                .join(twr_core::workspaces::aside_name(&id));
+            std::fs::rename(&ws.data_dir, &doomed)
+                .with_context(|| format!("moving {} aside", ws.data_dir.display()))?;
+            Some(doomed)
+        };
+        twr_core::workspaces::forget_default(&root, &id)
+            .context("updating the default workspace")?;
+        drop((history, lock, registry));
+        // Nothing takes a `.rm-` directory for a workspace: deleted without the locks, which
+        // others may need meanwhile.
+        if let Some(aside) = aside {
+            // (A `twr ws new default` clearing leftovers at once may take it first.)
+            twr_core::workspaces::remove_tree(&aside)
+                .with_context(|| format!("removing {}", aside.display()))?;
+        }
+        // A socket file a hub that died left is left too: the next hub there replaces it, and
+        // removing it here could remove a new hub's.
+        let mut lines = vec![format!("removed workspace {name}: {removed}")];
+        lines.extend(kept.iter().map(|k| format!("  kept: {k}")));
+        lines.extend(after);
+        Ok(lines)
     }
-    // Moved aside first (a name no workspace can have), so a half-removed directory is never
-    // taken for the workspace.
-    let doomed = ws
-        .workspaces_dir()
-        .join(format!(".rm-{name}-{}", std::process::id()));
-    std::fs::rename(&ws.data_dir, &doomed)
-        .with_context(|| format!("moving {} aside", ws.data_dir.display()))?;
-    std::fs::remove_dir_all(&doomed).with_context(|| format!("removing {}", doomed.display()))?;
-    // A socket file a hub that died left is left too: the next hub there replaces it, and
-    // removing it here could remove a new hub's.
-    match notes {
-        0 => outln!("removed workspace {name}"),
-        n => outln!(
-            "removed workspace {name}, with its orchestrator's {n} memory note{}",
-            if n == 1 { "" } else { "s" }
-        ),
-    }
-    Ok(())
+}
+
+/// The lock a TUI takes to save workspace `ws`'s input history (`tui-history.lock`, which
+/// stays when the workspace goes), held until dropped (and then unlocked, as a
+/// [`WorkspaceLock`] is).
+fn history_lock(ws: &Paths) -> anyhow::Result<WorkspaceLock> {
+    let path = ws.data_dir.join("tui-history.lock");
+    let file = twr_core::paths::open_private_append(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("locking {}", path.display()))?;
+    Ok(WorkspaceLock(file))
+}
+
+/// Why `default` can't be removed while a `twr runner` of this machine keeps its data in
+/// twr's data directory (its `runner-<box>.db`): its worktrees and trash are `default`'s
+/// directories too, which the removal would take.
+fn runner_in_root_why(root: &Paths) -> Option<String> {
+    twr_core::workspaces::runner_spool_why(root, true)
+}
+
+/// Why workspace `name` can't be removed while messages are queued for its orchestrator:
+/// its next hub would send them.
+fn queued_why(name: &str) -> String {
+    format!(
+        "messages are queued for the orchestrator of workspace {name}, which its next hub sends: \
+         start it (`twr -w {name}`) and let them run, or take them back, then remove the \
+         workspace"
+    )
 }
 
 /// The exclusive lock on workspace `ws`'s data directory (`twr.lock`, which its hub holds
@@ -8894,28 +9700,136 @@ fn stop_workspace_lock(ws: &Paths) -> anyhow::Result<StopWorkspaceLock> {
     }
 }
 
-/// The names of the worker threads in the stopped workspace's log (deleted ones are gone; the
-/// orchestrator does not count), and the orchestrator threads' conversation: how many there
-/// are (one per runtime it ran on) and their turns in all.
-fn ws_threads(ws: &Paths) -> anyhow::Result<(Vec<String>, (usize, u64))> {
+/// What a stopped workspace's log says ([`ws_threads`]).
+#[derive(Debug, Default)]
+struct WsLog {
+    /// Its worker threads, by name (deleted ones are gone; the orchestrator does not count).
+    threads: Vec<String>,
+    /// The orchestrator threads' conversation: how many there are (one per runtime it ran on)
+    /// and their turns in all.
+    conversation: (usize, u64),
+    /// It shows orchestrator work that never ended: a turn left open, a task, a job or a `!`
+    /// command still recorded running, or a CLI still attached to it. Its hub stopped without
+    /// ending it (a crash, say), so its processes may still run: the workspace's next hub
+    /// finds and ends them.
+    unfinished: bool,
+    /// The trash items it deleted threads into and that were neither purged nor restored,
+    /// on any box (a remote box's live there, not in the workspace's own trash).
+    trash: usize,
+    /// Messages wait in its queue, which its next hub sends.
+    queued: bool,
+    /// Threads were being made when its hub stopped (`spawn_operations` without a result).
+    spawning: bool,
+}
+
+/// What the stopped workspace's log says ([`WsLog`]).
+fn ws_threads(ws: &Paths) -> anyhow::Result<WsLog> {
+    use twr_core::event::EventBody;
     let db = ws.db_file();
     if !db.exists() {
-        return Ok((Vec::new(), (0, 0)));
+        return Ok(WsLog::default());
     }
-    let store = twr_hub::store::Store::open(&db)?;
+    // Read as it is, never migrated: a preview, or a removal the user then declines, leaves
+    // the log as it found it. One of another twr's schema can't be read so.
+    if let Some(why) = log_schema_why(ws) {
+        bail!(why);
+    }
+    let store = twr_hub::store::Store::open_existing(&db)?;
     let events = store.load_all()?;
+    let mut items = std::collections::HashSet::new();
+    for e in &events {
+        match &e.body {
+            EventBody::ThreadDeleted(d) => {
+                if let Some(item) = &d.trash {
+                    items.insert(item.clone());
+                }
+            }
+            EventBody::TrashPurged(p) => {
+                items.remove(&p.item);
+            }
+            EventBody::ThreadRestored(r) => {
+                items.remove(&r.item);
+            }
+            _ => {}
+        }
+    }
     let registry = twr_core::reduce::Registry::from_events(&events);
-    let (orchestrators, workers): (Vec<_>, Vec<_>) = registry
-        .list()
-        .into_iter()
-        .partition(|t| t.is_orchestrator());
-    Ok((
-        workers.into_iter().map(|t| t.name.clone()).collect(),
-        (
+    let views = registry.list();
+    // (A CLI attached to it too: attaching closes the headless turn.)
+    let unfinished = views.iter().any(|t| {
+        t.is_orchestrator()
+            && (t.current_turn.is_some() || !t.background_tasks.is_empty() || t.attached.is_some())
+    });
+    let (orchestrators, workers): (Vec<_>, Vec<_>) =
+        views.into_iter().partition(|t| t.is_orchestrator());
+    let queued = !store.threads_with_pending()?.is_empty();
+    // Threads being made when its hub stopped (a spawn the orchestrator asked for, never
+    // finished), as the running hub's own check counts them.
+    let spawning: i64 = store.conn().query_row(
+        "SELECT COUNT(*) FROM spawn_operations WHERE result IS NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(WsLog {
+        threads: workers.into_iter().map(|t| t.name.clone()).collect(),
+        conversation: (
             orchestrators.len(),
             orchestrators.iter().map(|t| t.turns).sum(),
         ),
-    ))
+        unfinished,
+        trash: items.len(),
+        queued,
+        spawning: spawning > 0,
+    })
+}
+
+/// Why the log of stopped workspace `ws` can't be read as it is: it is of another twr's
+/// schema (looked at without writing anything). `None`: it is this twr's, or there is none.
+fn log_schema_why(ws: &Paths) -> Option<String> {
+    let db = ws.db_file();
+    if !db.exists() {
+        return None;
+    }
+    let version: i32 = twr_hub::store::connect_as_is(&db)
+        .and_then(|c| Ok(c.pragma_query_value(None, "user_version", |r| r.get(0))?))
+        .ok()?;
+    if twr_hub::store::is_own_schema(version) {
+        return None;
+    }
+    let id = ws.workspace_id();
+    Some(if version > twr_hub::store::ACCOUNTS_SCHEMA_VERSION {
+        format!(
+            "the log of workspace {id} is from a newer twr (schema {version}): remove the \
+             workspace with that twr"
+        )
+    } else {
+        format!(
+            "the log of workspace {id} is from an older twr (schema {version}): start its hub \
+             once with this twr, which brings its log up to date (`twr -w {id} hub`, then \
+             Ctrl-C; or open it with `twr -w {id}`), then remove the workspace"
+        )
+    })
+}
+
+/// Why workspace `name` can't be removed while its log shows threads being made when its hub
+/// stopped, and how to end them.
+fn spawning_why(name: &str) -> String {
+    format!(
+        "the log of workspace {name} shows threads being made when its hub stopped (a spawn \
+         that never finished): start its hub (`twr -w {name} hub`, then Ctrl-C; or open it with \
+         `twr -w {name}`), which ends them and says what they left, then remove the workspace"
+    )
+}
+
+/// Why workspace `name` can't be removed while its log shows orchestrator work that never
+/// ended ([`ws_threads`]), and how to end it.
+fn unfinished_why(name: &str) -> String {
+    format!(
+        "the log of workspace {name} shows its orchestrator's work that never ended (its hub \
+         stopped without ending it, a crash say), whose processes may still run: start its hub \
+         (`twr -w {name} hub`, then Ctrl-C; or open it with `twr -w {name}` and stop it with \
+         `twr -w {name} hub stop`), which finds and ends them, then remove the workspace"
+    )
 }
 
 /// What `twr ws rm` removes with a workspace's data directory, for its question.
@@ -8930,8 +9844,27 @@ struct WsRemoval {
     /// Worktree directories still under its `worktrees/` ([`leftover_worktrees`]).
     worktrees: Vec<String>,
     worktree_bytes: u64,
-    /// The whole data directory.
+    /// The whole data directory (the root slot's: its own entries in it,
+    /// [`twr_core::workspaces::ROOT_OWNED`]).
     total_bytes: u64,
+    /// It is the root slot, whose data directory holds what every workspace shares too.
+    root_slot: bool,
+    /// What stays, and what changes for the rest ([`removal_notes`]).
+    kept: Vec<String>,
+    after: Vec<String>,
+}
+
+/// The entries of `ws`'s data directory that are its own: all of a named workspace's, the
+/// root slot's own of the root's ([`twr_core::workspaces::root_owned`]).
+fn own_entries(ws: &Paths) -> anyhow::Result<Vec<std::fs::DirEntry>> {
+    Ok(std::fs::read_dir(&ws.data_dir)
+        .with_context(|| format!("reading {}", ws.data_dir.display()))?
+        .flatten()
+        .filter(|e| {
+            ws.workspace.is_some()
+                || twr_core::workspaces::root_owned(&e.file_name().to_string_lossy())
+        })
+        .collect())
 }
 
 /// The bytes of the files under `path` (or of `path`, a file), symlinks counted as themselves
@@ -9015,10 +9948,20 @@ fn ws_rm_listing(name: &str, dir: &Path, goes: &WsRemoval) -> String {
         ));
     }
     out.push_str(&format!(
-        "  everything else in {} ({} in all)\n",
+        "  everything else {}in {} ({} in all)\n",
+        if goes.root_slot { "of its own " } else { "" },
         dir.display(),
         twr_core::git::human_bytes(goes.total_bytes)
     ));
+    if !goes.kept.is_empty() {
+        out.push_str("It keeps:\n");
+        for k in &goes.kept {
+            out.push_str(&format!("  {k}\n"));
+        }
+    }
+    for a in &goes.after {
+        out.push_str(&format!("{a}\n"));
+    }
     out
 }
 
@@ -9063,14 +10006,64 @@ async fn probe_hub(socket: &Path) -> anyhow::Result<Probe> {
     )
 }
 
+/// Why workspace `paths` (by id, which does not exist) can't be used, `from` saying where
+/// its selector came from: `twr ws new` makes it, unless another workspace has its name
+/// now (one renamed into an id once its own was removed, which a held id never reaches:
+/// [`twr_core::paths::WORKSPACE_ID_ENV`]).
+fn missing_workspace_why(paths: &Paths, from: &str) -> String {
+    let id = paths.workspace_id();
+    let named = paths
+        .root()
+        .find_workspace(id)
+        .is_ok_and(|w| w.exists() && w.workspace_id() != id);
+    if named {
+        format!(
+            "there is no workspace {id}{from}: it was removed, and another workspace has its \
+             name now (`twr ws` lists them)"
+        )
+    } else {
+        format!("there is no workspace {id}{from}: create it with `twr ws new {id}` (`twr ws` lists them)")
+    }
+}
+
+/// The data directory of the workspace a hub is to serve, checked: the root's is made when
+/// there is none yet, a named workspace's never (only `twr ws new` makes it, and a hub starting
+/// while `twr ws rm` removes it must not make it again), and a workspace that was removed has
+/// none ([`Paths::exists`]; the hub checks again under its lock, [`HubOptions::removed_marker`]).
+fn hub_data_dir(paths: &Paths) -> anyhow::Result<()> {
+    if !paths.exists() {
+        bail!("{}", missing_workspace_why(paths, ""));
+    }
+    match paths.workspace {
+        None => twr_core::paths::ensure_private_dir(&paths.data_dir),
+        Some(_) => twr_core::paths::check_private_dir(&paths.data_dir),
+    }
+}
+
 /// Starts `twr hub` detached (a session of its own, without a controlling terminal: neither
 /// it nor what it starts, a runtime or a job, can be stopped or hung up by the terminal `twr`
-/// ran in; output to the hub log).
-fn spawn_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
-    twr_core::paths::ensure_private_dir(&paths.data_dir)?;
+/// ran in; output to the hub log). `false`: none was started, as `default`'s lock is held
+/// (by a hub that is starting, a removal, or a command that looks at it a moment): the caller
+/// tries again ([`wait_for_hub`]).
+fn spawn_hub(socket: &Path, paths: &Paths) -> anyhow::Result<bool> {
+    hub_data_dir(paths)?;
     let log_path = paths.hub_log();
+    // `default`'s directory stays when it is removed: its log is opened under its lock, which
+    // `twr ws rm` holds as it marks it removed, and only while it isn't.
+    let lock = match paths.workspace {
+        None => match lock_workspace(paths)? {
+            Some(lock) => {
+                hub_data_dir(paths)?;
+                Some(lock)
+            }
+            None => return Ok(false),
+        },
+        Some(_) => None,
+    };
     let log = twr_core::paths::open_private_append(&log_path)
         .with_context(|| format!("opening {}", log_path.display()))?;
+    // The hub takes the lock itself.
+    drop(lock);
     // Not `std::env::current_exe`: the TUI starts hubs as it switches workspaces, maybe after
     // an upgrade replaced the file it runs ([`twr_core::current_exe`]).
     let exe = twr_core::current_exe().context("starting the hub")?;
@@ -9078,7 +10071,10 @@ fn spawn_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
     cmd.arg("--socket")
         .arg(socket)
         .arg("--workspace")
-        .arg(paths.workspace_name())
+        // By id: the hub serves this workspace even if it is renamed meanwhile, and none if
+        // it is removed meanwhile ([`twr_core::paths::WORKSPACE_ID_ENV`]).
+        .arg(paths.workspace_id())
+        .env(twr_core::paths::WORKSPACE_ID_ENV, paths.workspace_id())
         .arg("hub")
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
@@ -9101,7 +10097,7 @@ fn spawn_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
         );
     }
     spawn_reaped(&mut cmd).with_context(|| format!("starting the hub ({})", exe.display()))?;
-    Ok(())
+    Ok(true)
 }
 
 /// Spawns `cmd` and waits for it on a detached thread, so a child that exits while this
@@ -9153,28 +10149,39 @@ struct TuiWorkspaces {
 
 impl twr_tui::Workspaces for TuiWorkspaces {
     fn names(&self) -> anyhow::Result<Vec<String>> {
-        let mut names = vec![DEFAULT_WORKSPACE.to_string()];
-        names.extend(self.root.named_workspaces()?);
-        Ok(names)
+        Ok(self.list()?.into_iter().map(|e| e.id).collect())
     }
 
-    fn socket(&self, name: &str) -> anyhow::Result<PathBuf> {
-        Ok(self.config.socket_path(&self.root.workspace(name)?))
+    fn list(&self) -> anyhow::Result<Vec<twr_tui::WsEntry>> {
+        Ok(self
+            .root
+            .workspaces()?
+            .into_iter()
+            .map(|e| twr_tui::WsEntry {
+                id: e.id,
+                name: e.name,
+                default: e.default,
+            })
+            .collect())
+    }
+
+    fn socket(&self, id: &str) -> anyhow::Result<PathBuf> {
+        Ok(self.config.socket_path(&self.root.workspace(id)?))
     }
 
     fn open(
         &self,
-        name: &str,
+        id: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<PathBuf>> + Send>> {
         let ws = self
             .root
-            .workspace(name)
+            .workspace(id)
             .map(|p| (self.config.socket_path(&p), p));
-        let name = name.to_string();
+        let id = id.to_string();
         Box::pin(async move {
             let (socket, paths) = ws?;
             if !paths.exists() {
-                bail!("there is no workspace {name}");
+                bail!("there is no workspace {id}");
             }
             check_socket_path(&socket)?;
             wait_for_hub(&socket, &paths).await?;
@@ -9184,7 +10191,348 @@ impl twr_tui::Workspaces for TuiWorkspaces {
     }
 
     fn create(&self, name: &str) -> anyhow::Result<()> {
-        create_workspace(&self.root, name).map(|_| ())
+        // The TUI switches to it without waiting for what stale removals left to be deleted.
+        let (asides, made) = create_workspace_deferring(&self.root, name);
+        twr_core::workspaces::delete_asides_later(asides);
+        made.map(|_| ())
+    }
+
+    fn rename(&self, id: &str, to: &str) -> anyhow::Result<String> {
+        refuse_agent()?;
+        let r = twr_core::workspaces::rename_id(&self.root, id, to)?;
+        Ok(renamed_line(&r))
+    }
+
+    fn set_default(&self, id: &str) -> anyhow::Result<String> {
+        refuse_agent()?;
+        let (_, name) = twr_core::workspaces::set_default_id(&self.root, id)?;
+        Ok(format!(
+            "{name} is the default workspace now: `twr` and commands without -w use it"
+        ))
+    }
+
+    fn plan_removal(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<twr_tui::RemovalPlan>> + Send>,
+    > {
+        let (root, config, id) = (self.root.clone(), self.config.clone(), id.to_string());
+        Box::pin(async move { removal_plan(&root, &id, &config).await })
+    }
+
+    fn remove(
+        &self,
+        id: &str,
+        stop_hub: bool,
+        generation: Option<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<String>>> + Send>>
+    {
+        let (root, config, id) = (self.root.clone(), self.config.clone(), id.to_string());
+        Box::pin(async move {
+            refuse_agent()?;
+            remove_confirmed(&root, &config, &id, stop_hub, generation).await
+        })
+    }
+}
+
+/// The TUI's confirmed Delete of workspace `id` (by id alone): stops its hub first when
+/// `stop_hub`, but not when it is another workspace than the plan's (`generation`) or the
+/// removal would be refused for what is beside it ([`refusal_before_stopping`]).
+async fn remove_confirmed(
+    root: &Paths,
+    config: &Config,
+    id: &str,
+    stop_hub: bool,
+    generation: Option<String>,
+) -> anyhow::Result<Vec<String>> {
+    let ws = root.workspace(id)?;
+    // Not even its hub stopped when it is another workspace than the plan's.
+    if generation.is_some() && workspace_generation(&ws) != generation {
+        bail!(replaced_why(&ws.display_name()));
+    }
+    if let Some(why) = refusal_before_stopping(root, &ws) {
+        bail!(why);
+    }
+    if stop_hub {
+        stop_hub_for_removal(&config.socket_path(&ws), &ws).await?;
+    }
+    // What stale removals left is deleted after the TUI says what this one did.
+    let mut stale = Vec::new();
+    let done = remove_workspace_deferring(
+        root,
+        RemovalOf::Id(id),
+        generation.as_deref(),
+        Consent::Yes,
+        &mut stale,
+    )
+    .await;
+    twr_core::workspaces::delete_asides_later(stale);
+    done
+}
+
+/// Which workspace a removal is of ([`remove_workspace`]).
+#[derive(Debug, Clone, Copy)]
+enum RemovalOf<'a> {
+    /// As `twr ws rm` names it: a name, else an id ([`Paths::find_workspace`]).
+    Selector(&'a str),
+    /// By id alone (the TUI's, which knows its workspaces by id): a workspace removed meanwhile
+    /// is never taken for another renamed into its id since.
+    Id(&'a str),
+}
+
+/// Which workspace with its id `ws` is ([`twr_core::workspaces::generation`]).
+fn workspace_generation(ws: &Paths) -> Option<String> {
+    twr_core::workspaces::generation(ws)
+}
+
+/// Why a removal the user confirmed was refused: the workspace it was about went, and
+/// another was made with its id meanwhile.
+fn replaced_why(name: &str) -> String {
+    format!(
+        "workspace {name} is not the one you were shown any more (it was removed and made \
+         again meanwhile): nothing was deleted; look again before deleting it"
+    )
+}
+
+/// What removing workspace `id` of `root` would do, for the TUI's Delete to show before it
+/// asks ([`twr_tui::RemovalPlan`]): or why it can't now, as `twr ws rm` would refuse. A hub
+/// that runs is asked for its threads and its trash; it can be stopped for the removal only
+/// while it has neither and its orchestrator is not at work. A stopped one's files are read
+/// (the removal checks them again under its lock).
+async fn removal_plan(
+    root: &Paths,
+    id: &str,
+    config: &Config,
+) -> anyhow::Result<twr_tui::RemovalPlan> {
+    refuse_agent()?;
+    plan_removal_of(root, id, config).await
+}
+
+/// [`removal_plan`], for whoever asks.
+async fn plan_removal_of(
+    root: &Paths,
+    id: &str,
+    config: &Config,
+) -> anyhow::Result<twr_tui::RemovalPlan> {
+    let ws = root.workspace(id)?;
+    if !ws.exists() {
+        bail!("there is no workspace {id} any more");
+    }
+    let name = ws.display_name();
+    let generation = workspace_generation(&ws);
+    let socket = config.socket_path(&ws);
+    let refused = |why: String| {
+        Ok(twr_tui::RemovalPlan {
+            refused: Some(why),
+            ..Default::default()
+        })
+    };
+    // What the removal would refuse whatever its hub says: before it is asked, as its Delete
+    // would stop it.
+    if let Some(why) = refusal_before_stopping(root, &ws) {
+        return refused(why);
+    }
+    let (threads, trash, stops_hub, conversation) = match probe_hub(&socket).await? {
+        Probe::Busy => {
+            return refused("its hub is starting or stopping: try again in a moment".into())
+        }
+        Probe::Answers => {
+            let asked = tokio::time::timeout(PROBE_TIMEOUT * 4, async {
+                let mut c = Client::connect(&socket).await?;
+                let hello = c.hello(json!({ "client": "cli" })).await?;
+                check_workspace_name(&hello, &socket, id)?;
+                let threads = c.call("thread.list", Value::Null).await?;
+                let trash = c.call("trash.list", Value::Null).await?;
+                anyhow::Ok((hello, threads, trash))
+            })
+            .await;
+            let (hello, threads, trash) = match asked {
+                Ok(r) => r?,
+                Err(_) => return refused("its hub did not answer: try again in a moment".into()),
+            };
+            if !stops_if_idle(&hello) {
+                return refused(older_hub_why(&name));
+            }
+            let all = threads.as_array().cloned().unwrap_or_default();
+            // A turn, a task left running, a job or a `!` command (none of which a status
+            // says), as the hub's own check counts them.
+            let background = all.iter().any(|t| {
+                t["background_tasks"]
+                    .as_object()
+                    .is_some_and(|m| !m.is_empty())
+                    || !t["attached"].is_null()
+            });
+            let busy = background
+                || all.iter().any(|t| {
+                    t["role"] == "orchestrator"
+                        && t["retired"] != true
+                        && matches!(
+                            t["status"].as_str(),
+                            Some("running" | "background" | "waiting" | "attached")
+                        )
+                });
+            if busy {
+                return refused(
+                    "its orchestrator, a job or a `!` command is at work: deleting would stop \
+                     it. Wait until it is done, or stop it first"
+                        .into(),
+                );
+            }
+            // Messages queued for it, which its next hub would send.
+            if all
+                .iter()
+                .any(|t| t["pending"].as_u64().is_some_and(|n| n > 0))
+            {
+                return refused(queued_why(&name));
+            }
+            let workers: Vec<String> = all
+                .iter()
+                .filter(|t| t["role"] != "orchestrator")
+                .filter_map(|t| t["name"].as_str().map(str::to_string))
+                .collect();
+            let orchestrators: Vec<&Value> =
+                all.iter().filter(|t| t["role"] == "orchestrator").collect();
+            let conversation = (
+                orchestrators.len(),
+                orchestrators
+                    .iter()
+                    .map(|t| t["turns"].as_u64().unwrap_or(0))
+                    .sum(),
+            );
+            let items = trash["items"].as_array().map_or(0, Vec::len);
+            (workers, items, true, conversation)
+        }
+        Probe::Absent => {
+            // Read under the workspace's lock (as `twr ws rm` and its hub take it): its log is
+            // never opened, and so never made again, once a removal has it.
+            let ws2 = ws.clone();
+            let read = tokio::task::spawn_blocking(move || {
+                let Some(_lock) = lock_workspace(&ws2)? else {
+                    return anyhow::Ok(None);
+                };
+                if !ws2.exists() {
+                    bail!("there is no workspace {} any more", ws2.workspace_id());
+                }
+                anyhow::Ok(Some((ws_threads(&ws2)?, trash_items(&ws2)?)))
+            })
+            .await??;
+            // Its lock is held: by another workspace change (a `twr ws rm` of it, at its
+            // question say), which holds the registry lock too; else by a hub that doesn't
+            // answer on its socket: it runs on another (`--socket`), or is starting or stopping.
+            let Some((log, trash)) = read else {
+                if twr_core::workspaces::RegistryLock::is_held(root) {
+                    return refused(
+                        "another change to the workspaces is in progress (a `twr ws` command, \
+                         maybe asking a question): try again once it is done"
+                            .into(),
+                    );
+                }
+                return refused(format!(
+                    "a hub of it is running on another socket, or starting or stopping: stop it \
+                     with `twr -w {} hub stop` (or `twr --socket <path> hub stop`), or try again \
+                     in a moment",
+                    ws.workspace_id()
+                ));
+            };
+            let trash = trash.max(log.trash);
+            if log.threads.is_empty() && trash == 0 {
+                if log.unfinished {
+                    return refused(unfinished_why(&name));
+                }
+                if log.queued {
+                    return refused(queued_why(&name));
+                }
+                if log.spawning {
+                    return refused(spawning_why(&name));
+                }
+            }
+            (log.threads, trash, false, log.conversation)
+        }
+    };
+    if let Some(why) = removal_refusal(&name, &threads, trash) {
+        return refused(why);
+    }
+    // What `twr ws rm` lists before it asks, the same lines.
+    // (It walks the workspace's files: off the async workers.)
+    let goes = {
+        let (root, ws, config) = (root.clone(), ws.clone(), config.clone());
+        tokio::task::spawn_blocking(move || {
+            removal_listing(&root, &ws, conversation, Some(&config)).map(|(.., goes)| goes)
+        })
+        .await??
+    };
+    let mut lines = vec![String::new()];
+    lines.extend(
+        ws_rm_listing(&name, &ws.data_dir, &goes)
+            .lines()
+            .map(str::to_string),
+    );
+    Ok(twr_tui::RemovalPlan {
+        refused: None,
+        lines,
+        stops_hub,
+        generation,
+    })
+}
+
+/// Whether the hub that said `hello` stops only while nothing would be lost
+/// (`hub.shutdown` with `if_idle`): one that says its `workspace_name` does. An older one
+/// would take the parameter and stop whatever runs.
+fn stops_if_idle(hello: &Value) -> bool {
+    hello["workspace_name"].is_string()
+}
+
+/// Why the TUI can't stop workspace `name`'s hub for its removal: it is older than this twr.
+fn older_hub_why(name: &str) -> String {
+    format!(
+        "its hub is older than this twr and can't be stopped safely from here: stop it with \
+         `twr -w {name} hub stop`, then delete it"
+    )
+}
+
+/// Stops workspace `ws`'s hub on `socket` for its removal, quietly (no checkpoint for a log
+/// about to go, nothing printed over the TUI): asks it to shut down only while nothing would
+/// be lost ([`twr_hub::Hub::shutdown_if_idle`], which refuses new work from then on), then
+/// waits until no hub holds the workspace's lock. The removal checks threads and trash again
+/// under that lock.
+async fn stop_hub_for_removal(socket: &Path, ws: &Paths) -> anyhow::Result<()> {
+    let id = ws.workspace_id().to_string();
+    match Client::connect(socket).await {
+        Ok(mut c) => {
+            let hello = c.hello(json!({ "client": "cli" })).await?;
+            check_workspace_name(&hello, socket, &id)?;
+            if !stops_if_idle(&hello) {
+                bail!(older_hub_why(&ws.display_name()));
+            }
+            match c.call("hub.shutdown", json!({ "if_idle": true })).await {
+                Ok(_) => {}
+                // It may close the connection as it goes; a refusal says why.
+                Err(e) if stop_connection_lost(&e) => {}
+                Err(e) => return Err(e.context("its hub did not stop")),
+            }
+        }
+        Err(e) if nothing_listens(&e) => {}
+        Err(e) => return Err(e),
+    }
+    // As long as its shutdown can take (its jobs, review runs and notification command ended,
+    // its runtimes stopped), and a little more.
+    let wait = twr_hub::SHUTDOWN_LONGEST + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match stop_workspace_lock(ws)? {
+            StopWorkspaceLock::Missing | StopWorkspaceLock::Free(_) => return Ok(()),
+            StopWorkspaceLock::Held => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "the hub of workspace {} is still stopping after {}s: once `twr -w {id} hub \
+                 stop` says it stopped, delete it again",
+                ws.display_name(),
+                wait.as_secs()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -9192,6 +10540,16 @@ impl twr_tui::Workspaces for TuiWorkspaces {
 /// starting another) while one is busy, and fails with why when the socket can't be used
 /// ([`probe_hub`]: another user's, say).
 async fn wait_for_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
+    wait_for_hub_with(socket, paths, || spawn_hub(socket, paths)).await
+}
+
+/// [`wait_for_hub`], starting a hub with `spawn` ([`spawn_hub`]: `false` when none was
+/// started, and it is tried again).
+async fn wait_for_hub_with(
+    socket: &Path,
+    paths: &Paths,
+    mut spawn: impl FnMut() -> anyhow::Result<bool>,
+) -> anyhow::Result<()> {
     let started = tokio::time::Instant::now();
     let mut spawned: Option<tokio::time::Instant> = None;
     loop {
@@ -9201,9 +10559,20 @@ async fn wait_for_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
         match probe {
             Probe::Answers => return Ok(()),
             Probe::Absent => match spawned {
+                // While `default`'s lock is held by something else than a hub (a removal's
+                // checks, `twr hub stop` looking), none is started: tried again until one is,
+                // or a hub that took the lock answers.
+                None if now.duration_since(started) >= HUB_START_TIMEOUT + LOCK_WAIT => bail!(
+                    "the hub did not start within {}s: the lock on its data directory ({}) \
+                     stayed held; see {}",
+                    (HUB_START_TIMEOUT + LOCK_WAIT).as_secs(),
+                    paths.data_dir.join(twr_hub::LOCK_FILE).display(),
+                    paths.hub_log().display()
+                ),
                 None => {
-                    spawn_hub(socket, paths)?;
-                    spawned = Some(now);
+                    if spawn()? {
+                        spawned = Some(now);
+                    }
                 }
                 Some(at) if now.duration_since(at) >= HUB_START_TIMEOUT => bail!(
                     "the hub did not start within {}s; see {}",
@@ -9509,7 +10878,8 @@ mod tests {
 
     /// `twr ws list --detail` prints a hub's lists only to a process the hub took for the user,
     /// as the desktop's read-only companion reads them: an agent's gets the counts it always
-    /// got and why there is no detail. It reads each hub once, and only the two lists.
+    /// got and why there is no detail. It reads each hub once: the two lists, and `hub.info` for
+    /// the engine it runs (its `version` and `build`, on every running row).
     #[tokio::test]
     async fn ws_detail_needs_the_hub_to_take_this_process_for_the_user() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -9536,6 +10906,7 @@ mod tests {
                             json!([{"attn_id": "a1", "reason": "question", "revision": 3}])
                         }
                         "thread.list" => json!([{"id": "t1", "name": "api", "status": "idle"}]),
+                        "hub.info" => json!({"version": "0.6.0", "build": "85ab7b43eecbe2ec"}),
                         _ => panic!("ws list called {method}"),
                     };
                     methods.push(method);
@@ -9554,8 +10925,14 @@ mod tests {
                 assert_eq!(calls, ["hello"]);
                 continue;
             }
-            assert_eq!(calls, ["hello", "thread.list", "attention.list"]);
+            assert_eq!(
+                calls,
+                ["hello", "thread.list", "attention.list", "hub.info"]
+            );
             assert_eq!(row["hub"], "running");
+            // The engine it runs, for the desktop app's notice.
+            assert_eq!(row["version"], "0.6.0");
+            assert_eq!(row["build"], "85ab7b43eecbe2ec");
             assert_eq!(row["threads"], 1);
             assert_eq!(row["waiting"], 1);
             if detail {
@@ -9607,6 +10984,611 @@ mod tests {
         let mut yes = |_: &str| Ok("Y\n".to_string());
         ws_rm(&paths, "a", Consent::Ask(&mut yes)).await.unwrap();
         assert!(!ws.data_dir.exists());
+    }
+
+    /// Waits (10 s at most) until no hub holds workspace `ws`'s lock: a hub let go of
+    /// releases it once its background tasks have.
+    async fn unlocked(ws: &Paths) {
+        for _ in 0..200 {
+            if super::lock_workspace(ws).unwrap().is_some() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the hub kept the workspace's lock");
+    }
+
+    /// Removing `default` says what it does to phone pairing when phones are paired (the
+    /// gateway serves them through its hub), and nothing when none is set up. The pairings
+    /// are beside the config file, which the removal leaves as it was: `twr ws new default`
+    /// finds the same ones.
+    #[tokio::test]
+    async fn removing_default_names_the_paired_phones_and_keeps_them() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        std::fs::create_dir_all(&root.data_dir).unwrap();
+        let notes = |root: &Paths| removal_notes(root, root, 0, None).2.join("\n");
+        assert!(!notes(&root).contains("phone"), "{}", notes(&root));
+        let mobile = root.config_file.with_file_name("mobile");
+        let auth = twr_core::devices::Auth::open(&mobile).unwrap();
+        let code = auth.begin(vec!["read".into()]).unwrap();
+        auth.pair(&code, "phone").unwrap();
+        let said = notes(&root);
+        assert!(
+            said.contains("pairing and managing phones (`twr phone`), pushes about this workspace")
+                && said.contains("(the paired phone keeps its pairing)"),
+            "{said}"
+        );
+        // A named workspace's removal leaves pairing alone, and says nothing of it.
+        let a = twr_core::workspaces::create(&root, "a").unwrap().paths;
+        assert!(!removal_notes(&root, &a, 0, None)
+            .2
+            .join(" ")
+            .contains("phone"));
+        let before = std::fs::read(mobile.join("devices.json")).unwrap();
+        let lines = remove_workspace(&root, RemovalOf::Selector("default"), None, Consent::Yes)
+            .await
+            .unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("paired phone")),
+            "{lines:?}"
+        );
+        assert!(root.root_removed());
+        twr_core::workspaces::create(&root, "default").unwrap();
+        assert_eq!(std::fs::read(mobile.join("devices.json")).unwrap(), before);
+        assert_eq!(
+            twr_core::devices::Auth::open(&mobile)
+                .unwrap()
+                .summary()
+                .unwrap(),
+            (1, false)
+        );
+    }
+
+    /// `twr ws new default` never deletes what came under `default`'s names after its removal
+    /// (a `twr runner` keeping its data in twr's data directory, say): it refuses, listing it,
+    /// and its spool's refusal names what the runner left too. Empty, it goes.
+    #[tokio::test]
+    async fn making_default_again_keeps_what_came_after_its_removal() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        std::fs::create_dir_all(&root.data_dir).unwrap();
+        twr_core::workspaces::create(&root, "a").unwrap();
+        remove_workspace(&root, RemovalOf::Selector("default"), None, Consent::Yes)
+            .await
+            .unwrap();
+        let file = root.data_dir.join("worktrees/p/t/file");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "a thread's work").unwrap();
+        std::fs::write(root.data_dir.join("runner-gpu.db"), "").unwrap();
+        let e = twr_core::workspaces::create(&root, "default")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("runner-gpu.db"), "{e}");
+        assert!(e.contains("worktrees/ (1 file, 15 bytes) stays"), "{e}");
+        assert!(!e.contains("loses only"), "{e}");
+        std::fs::remove_file(root.data_dir.join("runner-gpu.db")).unwrap();
+        let e = twr_core::workspaces::create(&root, "default")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("came after it was removed") && e.contains("worktrees/ (1 file, 15 bytes)"),
+            "{e}"
+        );
+        assert!(file.exists());
+        assert!(root.root_removed());
+        // Emptied, it is no one's: it goes, and `default` is made again. So does a link
+        // identity the runner service wrote meanwhile, which holds no one's work.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(root.data_dir.join("link-identity"), [7u8; 64]).unwrap();
+        twr_core::workspaces::create(&root, "default").unwrap();
+        assert!(!root.root_removed());
+        assert!(!root.data_dir.join("worktrees").exists());
+        assert!(!root.data_dir.join("link-identity").exists());
+    }
+
+    /// Removing `default` says when revoked runners haven't acknowledged their revocation:
+    /// the runner service retries through it, so they wait until it is made again.
+    #[test]
+    fn removing_default_names_revocations_that_wait() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        std::fs::create_dir_all(&root.data_dir).unwrap();
+        assert_eq!(pending_revocations_note(&root), None);
+        let mut state = twr_link::state::State::default();
+        state.pending_revocations.insert(
+            "gpu".into(),
+            twr_link::state::Runner {
+                addresses: Vec::new(),
+                endpoint: "e".into(),
+                relay: "r".into(),
+                receipt: "x".into(),
+                committed: true,
+            },
+        );
+        twr_link::state::Machine::of(&root).save(&state).unwrap();
+        let note = removal_notes(&root, &root, 0, None).2.join("\n");
+        assert!(
+            note.contains("1 runner you removed (`twr box remove`) has not acknowledged it yet"),
+            "{note}"
+        );
+        let a = twr_core::workspaces::create(&root, "a").unwrap().paths;
+        assert!(!removal_notes(&root, &a, 0, None)
+            .2
+            .join(" ")
+            .contains("revoked"));
+    }
+
+    /// An in-process hub of `paths` on its socket, serving until dropped.
+    async fn serving(paths: &Paths) -> (twr_hub::Hub, tokio::task::JoinHandle<()>) {
+        let listener = twr_hub::server::bind(&paths.socket).await.unwrap();
+        let hub = twr_hub::Hub::open(HubOptions::new(paths.db_file(), Config::default()))
+            .await
+            .unwrap();
+        let server = tokio::spawn({
+            let (hub, socket) = (hub.clone(), paths.socket.clone());
+            async move {
+                let _ = twr_hub::server::serve(hub, listener, socket, false).await;
+            }
+        });
+        (hub, server)
+    }
+
+    /// The TUI's Delete of a running `default` refuses what the removal would refuse for what
+    /// is beside the workspace (a `twr runner` keeping its data in twr's data directory) in its
+    /// plan, and never stops the hub for it: the hub still answers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_running_default_is_not_stopped_for_a_removal_that_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        std::fs::create_dir_all(&root.data_dir).unwrap();
+        let (hub, server) = serving(&root).await;
+        let config = Config::default();
+        let plan = plan_removal_of(&root, "default", &config).await.unwrap();
+        assert!(plan.refused.is_none() && plan.stops_hub, "{plan:?}");
+        std::fs::write(root.data_dir.join("runner-gpu.db"), "").unwrap();
+        let plan = plan_removal_of(&root, "default", &config).await.unwrap();
+        assert!(
+            plan.refused
+                .as_deref()
+                .is_some_and(|r| r.contains("a `twr runner` for box gpu keeps its data")),
+            "{plan:?}"
+        );
+        let e = remove_confirmed(&root, &config, "default", true, plan.generation)
+            .await
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("a `twr runner` for box gpu"),
+            "{e:#}"
+        );
+        assert_eq!(probe_hub(&root.socket).await.unwrap(), Probe::Answers);
+        assert!(!root.root_removed());
+        server.abort();
+        hub.shutdown().await;
+    }
+
+    /// A preview of a removal, and a removal checked then declined, read a stopped
+    /// workspace's log as it is: one of an older schema is refused, not migrated.
+    #[tokio::test]
+    async fn a_removal_preview_never_migrates_a_log() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        let a = twr_core::workspaces::create(&root, "a").unwrap().paths;
+        {
+            let hub = twr_hub::Hub::open(twr_hub::HubOptions::new(a.db_file(), Config::default()))
+                .await
+                .unwrap();
+            hub.shutdown().await;
+        }
+        // (The hub's tasks let go of its lock as they end, a moment after: under load, later.)
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while lock_workspace(&a).unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the hub kept its lock"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let version = |v: Option<i32>| {
+            let conn = twr_hub::store::connect(&a.db_file()).unwrap();
+            if let Some(v) = v {
+                conn.pragma_update(None, "user_version", v).unwrap();
+            }
+            conn.pragma_query_value(None, "user_version", |r| r.get::<_, i32>(0))
+                .unwrap()
+        };
+        version(Some(8));
+        let plan = plan_removal_of(&root, "a", &Config::default())
+            .await
+            .unwrap()
+            .refused
+            .unwrap();
+        assert!(plan.contains("from an older twr (schema 8)"), "{plan}");
+        // The command it names really starts the hub (`thread list` only connects).
+        assert!(plan.contains("`twr -w a hub`"), "{plan}");
+        let e = remove_workspace(&root, RemovalOf::Selector("a"), None, Consent::Yes)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("older twr"), "{e}");
+        assert_eq!(version(None), 8);
+        assert!(a.data_dir.is_dir());
+    }
+
+    /// A stopped workspace whose log shows threads being made when its hub stopped (a spawn
+    /// that never finished) is kept, as the running hub's idle check keeps it, in the plan and
+    /// in the removal.
+    #[tokio::test]
+    async fn an_unfinished_spawn_keeps_a_stopped_workspace() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        let a = twr_core::workspaces::create(&root, "a").unwrap().paths;
+        {
+            let hub = twr_hub::Hub::open(twr_hub::HubOptions::new(a.db_file(), Config::default()))
+                .await
+                .unwrap();
+            hub.shutdown().await;
+        }
+        twr_hub::store::connect(&a.db_file())
+            .unwrap()
+            .execute(
+                "INSERT INTO spawn_operations (operation_id, owner, request, result, created) \
+                 VALUES ('op1', 'o', '{}', NULL, '2026-11-24T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        let plan = plan_removal_of(&root, "a", &Config::default())
+            .await
+            .unwrap();
+        assert!(
+            plan.refused
+                .as_deref()
+                .is_some_and(|r| r.contains("threads being made")),
+            "{plan:?}"
+        );
+        let e = remove_workspace(&root, RemovalOf::Selector("a"), None, Consent::Yes)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("threads being made"), "{e}");
+        assert!(a.data_dir.is_dir());
+    }
+
+    /// A removal checks again after its question what a writer that takes neither lock may
+    /// have changed meanwhile: a `twr runner` that started keeping its data in twr's data
+    /// directory (its spool, a thread's worktree) refuses it, and nothing is removed.
+    #[test]
+    fn a_runner_that_starts_during_the_question_keeps_default() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        std::fs::create_dir_all(&root.data_dir).unwrap();
+        let name = root.display_name();
+        let checked = check_removal(root.clone(), root.clone(), name.clone(), None, None)
+            .1
+            .unwrap();
+        // The runner starts meanwhile: its spool, and a thread's worktree.
+        std::fs::write(root.data_dir.join("runner-gpu.db"), "").unwrap();
+        let e = checked.remove().unwrap_err().to_string();
+        assert!(e.contains("a `twr runner` for box gpu"), "{e}");
+        assert!(!root.root_removed());
+        std::fs::remove_file(root.data_dir.join("runner-gpu.db")).unwrap();
+        let checked = check_removal(root.clone(), root.clone(), name, None, None)
+            .1
+            .unwrap();
+        let work = root.data_dir.join("worktrees/p/t");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("file"), "a thread's work").unwrap();
+        let e = checked.remove().unwrap_err().to_string();
+        assert!(
+            e.contains("changed since it was listed") && e.contains("p/t"),
+            "{e}"
+        );
+        assert!(!root.root_removed());
+        assert!(work.join("file").exists());
+    }
+
+    /// A removal that gets past its checks once the process quits (the TUI's quit closed its
+    /// removals) is refused before it changes anything: the workspace, and the default, stay.
+    #[test]
+    fn a_removal_after_the_quit_changes_nothing() {
+        static CLOSED: twr_core::workspaces::Removals = twr_core::workspaces::Removals::new();
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        std::fs::create_dir_all(&root.data_dir).unwrap();
+        let a = twr_core::workspaces::create(&root, "a").unwrap().paths;
+        // The default, which its removal would forget.
+        std::fs::write(
+            root.data_dir.join(twr_core::workspaces::DEFAULT_FILE),
+            "a\n",
+        )
+        .unwrap();
+        let checked = check_removal(root.clone(), a.clone(), "a".into(), None, None)
+            .1
+            .unwrap();
+        CLOSED.close();
+        let e = checked.remove_in(&CLOSED).unwrap_err().to_string();
+        assert!(
+            e.contains("not deleted: twr is quitting; delete it again"),
+            "{e}"
+        );
+        assert!(a.exists() && a.display_name() == "a");
+        assert_eq!(root.default_id().as_deref(), Some("a"));
+        let left: Vec<_> = std::fs::read_dir(root.workspaces_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["a"]);
+        assert!(CLOSED.in_progress().is_empty());
+        // The locks went with it: it is removed once asked again (the process's own removals
+        // are open).
+        let (_, checked) = check_removal(root.clone(), a.clone(), "a".into(), None, None);
+        checked.unwrap().remove().unwrap();
+        assert!(!a.exists());
+    }
+
+    /// The TUI's Delete plan of a stopped workspace whose lock is held says why: another
+    /// workspace change (a `twr ws rm` of it at its question) when the registry lock is held
+    /// too, else a hub on another socket.
+    #[tokio::test]
+    async fn a_delete_plan_names_what_holds_the_workspace() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        let a = twr_core::workspaces::create(&root, "a").unwrap().paths;
+        let config = Config::default();
+        let lock = lock_workspace(&a).unwrap().unwrap();
+        let plan = plan_removal_of(&root, "a", &config).await.unwrap();
+        assert!(
+            plan.refused
+                .as_deref()
+                .is_some_and(|r| r.contains("running on another socket")),
+            "{plan:?}"
+        );
+        let registry = twr_core::workspaces::RegistryLock::take(&root).unwrap();
+        let plan = plan_removal_of(&root, "a", &config).await.unwrap();
+        assert!(
+            plan.refused
+                .as_deref()
+                .is_some_and(|r| r.contains("another change to the workspaces")),
+            "{plan:?}"
+        );
+        drop((registry, lock));
+    }
+
+    /// The TUI's Delete shows what `twr ws rm` lists before it asks: worktree directories left
+    /// behind with their size, the log's size and the whole, and what stays.
+    #[tokio::test]
+    async fn the_delete_plan_lists_what_twr_ws_rm_lists() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        let a = twr_core::workspaces::create(&root, "a").unwrap().paths;
+        std::fs::create_dir_all(a.worktrees_dir().join("proj/old")).unwrap();
+        std::fs::write(a.worktrees_dir().join("proj/old/notes.txt"), "unsaved\n").unwrap();
+        let plan = plan_removal_of(&root, "a", &Config::default())
+            .await
+            .unwrap();
+        assert!(plan.refused.is_none(), "{plan:?}");
+        let text = plan.lines.join("\n");
+        assert!(
+            text.contains("This removes workspace a for good:"),
+            "{text}"
+        );
+        assert!(
+            text.contains("1 worktree directory left in its worktrees/ (proj/old, 8 bytes)"),
+            "{text}"
+        );
+        assert!(text.contains("  its log ("), "{text}");
+        assert!(text.contains("It keeps:"), "{text}");
+    }
+
+    /// A removal's aside names never repeat, even in one process.
+    #[test]
+    fn aside_names_are_new_each_time() {
+        let one = twr_core::workspaces::aside_name("a");
+        let two = twr_core::workspaces::aside_name("a");
+        assert!(
+            one.starts_with(&format!(".rm-a-{}-", std::process::id())),
+            "{one}"
+        );
+        assert_ne!(one, two);
+    }
+
+    /// A stopped workspace whose log shows its orchestrator's work that never ended (its hub
+    /// went without ending it, as a crash leaves it) is kept: its processes may still run,
+    /// and its next hub ends them. Ended, it is removed.
+    #[tokio::test]
+    async fn a_stopped_workspace_with_unfinished_orchestrator_work_is_kept() {
+        use twr_core::event::{EventBody, Source, TaskUpdated, ThreadCreated};
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        let a = twr_core::workspaces::create(&root, "a").unwrap().paths;
+        let mut ext = serde_json::Map::new();
+        ext.insert("twr".into(), serde_json::json!({"role": "orchestrator"}));
+        let task = |running| {
+            EventBody::TaskUpdated(TaskUpdated {
+                task_id: "sh1".into(),
+                running,
+                description: "cargo test".into(),
+                ..Default::default()
+            })
+        };
+        {
+            let hub = twr_hub::Hub::open(twr_hub::HubOptions::new(a.db_file(), Config::default()))
+                .await
+                .unwrap();
+            let created = EventBody::ThreadCreated(ThreadCreated {
+                name: "orchestrator".into(),
+                box_name: "local".into(),
+                runtime: "fake".into(),
+                mode: "manual".into(),
+                ext: Some(ext),
+                ..Default::default()
+            });
+            hub.append("o", None, Source::User("t".into()), created, None)
+                .unwrap();
+            hub.append("o", None, Source::Adapter("fake".into()), task(true), None)
+                .unwrap();
+        }
+        unlocked(&a).await;
+        let e = remove_workspace(&root, RemovalOf::Selector("a"), None, Consent::Yes)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("never ended"), "{e:#}");
+        assert!(a.data_dir.is_dir());
+        let plan = plan_removal_of(&root, "a", &Config::default())
+            .await
+            .unwrap();
+        assert!(plan.refused.unwrap().contains("never ended"));
+        {
+            let hub = twr_hub::Hub::open(twr_hub::HubOptions::new(a.db_file(), Config::default()))
+                .await
+                .unwrap();
+            hub.append("o", None, Source::Adapter("fake".into()), task(false), None)
+                .unwrap();
+        }
+        // A CLI still attached to it (attaching closed its headless turn) keeps it too.
+        {
+            let hub = twr_hub::Hub::open(twr_hub::HubOptions::new(a.db_file(), Config::default()))
+                .await
+                .unwrap();
+            let attached = EventBody::ThreadAttached(twr_core::event::ClientPayload {
+                client: "cli".into(),
+                ..Default::default()
+            });
+            hub.append("o", None, Source::User("t".into()), attached, None)
+                .unwrap();
+        }
+        unlocked(&a).await;
+        let e = remove_workspace(&root, RemovalOf::Selector("a"), None, Consent::Yes)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("never ended"), "{e:#}");
+        {
+            let hub = twr_hub::Hub::open(twr_hub::HubOptions::new(a.db_file(), Config::default()))
+                .await
+                .unwrap();
+            let detached = EventBody::ThreadDetached(Default::default());
+            hub.append("o", None, Source::User("t".into()), detached, None)
+                .unwrap();
+        }
+        unlocked(&a).await;
+        remove_workspace(&root, RemovalOf::Selector("a"), None, Consent::Yes)
+            .await
+            .unwrap();
+        assert!(!a.data_dir.exists());
+    }
+
+    /// What a stopped workspace's log still holds keeps it: a trash item on a box (not in its
+    /// own trash directory) until purged, messages queued for its orchestrator, and, for
+    /// `default`, a `twr runner` keeping its data in twr's data directory.
+    #[tokio::test]
+    async fn remote_trash_queued_messages_and_a_runner_keep_a_workspace() {
+        use twr_core::event::{EventBody, Source, ThreadCreated, ThreadDeleted, TrashPurged};
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        let a = twr_core::workspaces::create(&root, "a").unwrap().paths;
+        let user = || Source::User("t".into());
+        {
+            let hub = twr_hub::Hub::open(twr_hub::HubOptions::new(a.db_file(), Config::default()))
+                .await
+                .unwrap();
+            let created = EventBody::ThreadCreated(ThreadCreated {
+                name: "api".into(),
+                box_name: "gpu".into(),
+                runtime: "fake".into(),
+                mode: "manual".into(),
+                ..Default::default()
+            });
+            hub.append("w", None, user(), created, None).unwrap();
+            let deleted = EventBody::ThreadDeleted(ThreadDeleted {
+                name: "api".into(),
+                trash: Some("item1".into()),
+                ..Default::default()
+            });
+            hub.append("w", None, user(), deleted, None).unwrap();
+            hub.shutdown().await;
+        }
+        unlocked(&a).await;
+        assert!(!a.data_dir.join("trash").exists());
+        let e = remove_workspace(&root, RemovalOf::Selector("a"), None, Consent::Yes)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("holds 1 deleted thread"), "{e:#}");
+        let plan = plan_removal_of(&root, "a", &Config::default())
+            .await
+            .unwrap();
+        assert!(plan.refused.unwrap().contains("holds 1 deleted thread"));
+        {
+            let hub = twr_hub::Hub::open(twr_hub::HubOptions::new(a.db_file(), Config::default()))
+                .await
+                .unwrap();
+            let purged = EventBody::TrashPurged(TrashPurged {
+                item: "item1".into(),
+                thread: "w".into(),
+                ..Default::default()
+            });
+            hub.append(twr_core::event::HUB_THREAD, None, Source::Hub, purged, None)
+                .unwrap();
+            hub.shutdown().await;
+        }
+        unlocked(&a).await;
+        {
+            let mut store = twr_hub::store::Store::open(&a.db_file()).unwrap();
+            store
+                .enqueue_prompt("o", "then do X", Default::default(), None, &user(), 0)
+                .unwrap();
+        }
+        unlocked(&a).await;
+        let e = remove_workspace(&root, RemovalOf::Selector("a"), None, Consent::Yes)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("messages are queued"), "{e:#}");
+        assert!(a.data_dir.is_dir());
+        // `default` with a runner's spool beside it.
+        std::fs::create_dir_all(&root.data_dir).unwrap();
+        std::fs::write(root.data_dir.join("runner-gpu.db"), "").unwrap();
+        let e = remove_workspace(&root, RemovalOf::Selector("default"), None, Consent::Yes)
+            .await
+            .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("a `twr runner` for box gpu keeps its data"),
+            "{e:#}"
+        );
+        assert!(!root.root_removed());
+    }
+
+    /// A plan's generation names the workspace it saw: one removed and made again with the
+    /// same id (named, or `default` in place) has another, and a removal confirmed on the old
+    /// plan deletes nothing.
+    #[tokio::test]
+    async fn a_removal_confirmed_on_a_replaced_workspace_deletes_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        let a = twr_core::workspaces::create(&root, "a").unwrap().paths;
+        let seen = workspace_generation(&a).unwrap();
+        assert_eq!(workspace_generation(&a).as_deref(), Some(seen.as_str()));
+        std::fs::remove_dir_all(&a.data_dir).unwrap();
+        twr_core::workspaces::create(&root, "a").unwrap();
+        std::fs::write(a.data_dir.join("keep"), "new").unwrap();
+        assert_ne!(workspace_generation(&a).as_deref(), Some(seen.as_str()));
+        let e = remove_workspace(&root, RemovalOf::Selector("a"), Some(&seen), Consent::Yes)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("nothing was deleted"), "{e:#}");
+        assert!(a.data_dir.join("keep").exists());
+        // `default`, made again in place: a new token.
+        std::fs::create_dir_all(&root.data_dir).unwrap();
+        let seen = workspace_generation(&root).unwrap();
+        twr_core::workspaces::write_atomic(&root.removed_marker(), "").unwrap();
+        twr_core::workspaces::create(&root, "default").unwrap();
+        assert_ne!(workspace_generation(&root).unwrap(), seen);
+        let fresh = workspace_generation(&a).unwrap();
+        assert!(
+            remove_workspace(&root, RemovalOf::Selector("a"), Some(&fresh), Consent::Yes)
+                .await
+                .is_ok()
+        );
+        assert!(!a.data_dir.exists());
     }
 
     /// A workspace that was present during discovery can be moved aside by ws rm before
@@ -12475,6 +14457,59 @@ mod tests {
         assert!(!test_user_waived(true, named, uid));
         mode(0o622).unwrap();
         assert!(!test_user_waived(true, named, uid));
+    }
+
+    /// The TUI's Delete waits for a hub it asked to stop for as long as the hub's shutdown can
+    /// take: one that holds its lock longer than a start's wait (5 s) is still waited for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delete_waits_for_a_hub_that_takes_a_while_to_stop() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        let a = twr_core::workspaces::create(&root, "a").unwrap().paths;
+        assert!(twr_hub::SHUTDOWN_LONGEST > HUB_START_TIMEOUT);
+        let held = lock_workspace(&a).unwrap().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(HUB_START_TIMEOUT + Duration::from_secs(1));
+            drop(held);
+        });
+        stop_hub_for_removal(&home.path().join("none.sock"), &a)
+            .await
+            .unwrap();
+        release.join().unwrap();
+    }
+
+    /// A hub start that finds `default`'s lock held (a removal's checks, `twr hub stop`
+    /// looking) starts no hub, and is tried again once the lock is free: the hub is not taken
+    /// for started and waited for until the timeout.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hub_is_started_once_its_lock_is_let_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_home(dir.path());
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        let sock = dir.path().join("hub.sock");
+        let held = lock_workspace(&paths).unwrap().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        let mut tries = 0;
+        let start = std::time::Instant::now();
+        wait_for_hub_with(&sock, &paths, || {
+            tries += 1;
+            // What `spawn_hub` does with `default`'s lock.
+            match lock_workspace(&paths)? {
+                None => Ok(false),
+                Some(_lock) => {
+                    slow_hub(&sock, Duration::ZERO);
+                    Ok(true)
+                }
+            }
+        })
+        .await
+        .unwrap();
+        release.join().unwrap();
+        assert!(tries > 1, "{tries}");
+        assert!(start.elapsed() < HUB_START_TIMEOUT, "{:?}", start.elapsed());
     }
 
     #[tokio::test]

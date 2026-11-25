@@ -1491,7 +1491,6 @@ fn sidebar_surfaces() -> Vec<Surface> {
         questions: 0,
     };
     let orch = |name: &str, status, active, waiting| Tab {
-        name: name.into(),
         hub: running(waiting),
         glance: Some(Glance {
             active,
@@ -1501,6 +1500,7 @@ fn sidebar_surfaces() -> Vec<Surface> {
             }),
             workers: None,
         }),
+        ..Tab::new(name)
     };
     let statuses = [
         ThreadStatus::Running,
@@ -1525,11 +1525,7 @@ fn sidebar_surfaces() -> Vec<Surface> {
         })
         .collect();
     let mut tabs = vec![
-        Tab {
-            name: "default".into(),
-            hub: TabHub::Unknown,
-            glance: None,
-        },
+        Tab::new("default"),
         orch("ws-run", ThreadStatus::Running, true, 0),
         orch("ws-bg", ThreadStatus::Background, true, 0),
         orch("ws-wait", ThreadStatus::Waiting, false, 1),

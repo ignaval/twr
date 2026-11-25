@@ -662,6 +662,26 @@ try {
     .locator(".thread-list .thread-card")
     .filter({ hasText: "api" })
     .click();
+  // The hub on another engine than the app's (docs/desktop.md): a packaged app runs its own
+  // engine, a release build, and this hub runs ../target/debug's, of the same version, so its
+  // notice shows, ahead of the disclosure, which is then under +1. A development run stages
+  // the very binaries the hub runs: no notice.
+  const engineNotice = page.locator('[data-notice="version"]');
+  if (process.env.TWR_DESKTOP_EXECUTABLE) {
+    await engineNotice.waitFor({ timeout: 15000 });
+    assert.match(
+      await engineNotice.textContent(),
+      /a different build of twr \S+ \([0-9a-f]{8}\) than this hub runs \([0-9a-f]{8}\)|this hub still runs/,
+    );
+    assert.equal(
+      await engineNotice.getByRole("button", { name: "Stop hub…" }).count(),
+      1,
+    );
+    await page.locator(".status-strip-more").click();
+    console.log(
+      "PASS: a hub on another build of the app's version shows the engine notice",
+    );
+  } else assert.equal(await engineNotice.count(), 0);
   await page
     .getByRole("button", {
       name: "Continue with configured features",

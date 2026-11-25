@@ -35,6 +35,8 @@ mod loops_tests;
 pub mod md;
 pub mod notify;
 pub mod order;
+pub mod phone;
+pub mod qr;
 pub mod queue;
 #[cfg(test)]
 mod reconnect_tests;
@@ -53,6 +55,7 @@ pub mod summary;
 pub mod terminal_setup;
 pub mod ui;
 pub mod workspace;
+pub mod wsmenu;
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -511,9 +514,15 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
         Action::Quit
         | Action::Runner { .. }
         | Action::CancelRunner { .. }
+        | Action::Phone { .. }
+        | Action::CancelPhone
         | Action::Copy { .. }
         | Action::Mouse(_)
         | Action::Workspace { .. }
+        | Action::WsRename { .. }
+        | Action::WsDefault { .. }
+        | Action::WsPlan { .. }
+        | Action::WsRemove { .. }
         | Action::WsSidebar(_)
         | Action::Setting(_)
         | Action::SettingsFile
@@ -820,19 +829,46 @@ pub fn repaint<B: ratatui::backend::Backend>(
 
 /// Writes what this run told the user that is not saved yet ([`AppState::seen`]) to `file`,
 /// off the IO loop (the file's lock may be another TUI's for a moment); nowhere without one.
-fn save_seen(state: &mut AppState, file: Option<&Path>) {
+fn save_seen(state: &mut AppState, file: Option<&Path>) -> Option<tokio::task::JoinHandle<()>> {
     if !std::mem::take(&mut state.seen_dirty) {
-        return;
+        return None;
     }
-    let Some(file) = file else {
-        return;
-    };
-    let (file, seen) = (file.to_path_buf(), state.seen.clone());
-    tokio::task::spawn_blocking(move || {
+    let (file, seen) = (file?.to_path_buf(), state.seen.clone());
+    Some(tokio::task::spawn_blocking(move || {
         if let Err(e) = firstrun::save(&file, &seen) {
             twr_core::trace::mark_with(|| format!("tui: saving {}: {e}", file.display()));
         }
-    });
+    }))
+}
+
+/// Waits for the removals of workspaces this process has past their checks
+/// ([`twr_core::workspaces::REMOVALS`]), saying so on `out` once, with no time limit: quitting
+/// never cuts one off half deleted. It closes them first, so one still in its checks never
+/// begins to change anything (it was given up).
+fn finish_removals(out: &mut dyn std::io::Write) {
+    finish_removals_in(&twr_core::workspaces::REMOVALS, out);
+}
+
+/// [`finish_removals`], of `set`.
+fn finish_removals_in(set: &twr_core::workspaces::Removals, out: &mut dyn std::io::Write) {
+    // Each removal is either listed here or never begins.
+    let mut left = set.close();
+    let mut said = false;
+    loop {
+        if left.is_empty() {
+            return;
+        }
+        if !said {
+            let _ = writeln!(
+                out,
+                "twr: finishing deleting workspace {}...",
+                left.join(", ")
+            );
+            said = true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        left = set.in_progress();
+    }
 }
 
 /// Writes setting `change` to the config file the environment names, where the settings
@@ -929,14 +965,47 @@ pub const HISTORY_ENTRY_MAX: usize = 16 * 1024;
 /// Appends `entries` to the history file at `path`, kept to the newest
 /// [`app::HISTORY_MAX`] entries (rewritten when it grows past twice that). Several TUIs share
 /// the file: each save holds an exclusive lock on `<path>.lock` for its append and rewrite,
-/// and a rewrite goes through a temporary file of its own.
+/// and a rewrite goes through a temporary file of its own. Its directory is the workspace's,
+/// which its hub made: never made here, so a save left over once the workspace was removed
+/// (`twr ws rm`) does not make it again.
 pub fn save_history(path: &Path, entries: &[String]) -> std::io::Result<()> {
+    save_history_of(path, entries, None)
+}
+
+/// [`save_history`] into the workspace that was `generation` as its session started
+/// ([`twr_core::workspaces::dir_generation`]): none once it was removed and another made with
+/// its id, which a save that waited for the removal's lock would otherwise write into.
+fn save_history_of(
+    path: &Path,
+    entries: &[String],
+    generation: Option<&str>,
+) -> std::io::Result<()> {
     use std::io::Write;
+    let removed = || {
+        path.parent()
+            .is_some_and(|d| d.join(twr_core::workspaces::REMOVED_FILE).exists())
+    };
+    let gone = || std::io::Error::other("its workspace was removed");
     if let Some(dir) = path.parent() {
-        twr_core::paths::ensure_private_dir(dir).map_err(std::io::Error::other)?;
+        twr_core::paths::check_private_dir(dir).map_err(std::io::Error::other)?;
+    }
+    // `default`'s directory stays when it is removed: its mark says so. Checked again under
+    // the lock, which the removal holds as it marks it and takes its files.
+    if removed() {
+        return Err(gone());
     }
     let lock = twr_core::paths::open_private_append(&path.with_extension("lock"))?;
     lock.lock()?;
+    if removed() {
+        return Err(gone());
+    }
+    if let (Some(was), Some(dir)) = (generation, path.parent()) {
+        if twr_core::workspaces::dir_generation(dir).as_deref() != Some(was) {
+            return Err(std::io::Error::other(
+                "its workspace was removed and another made with its name",
+            ));
+        }
+    }
     let mut f = twr_core::paths::open_private_append(path)?;
     // A last line a crash left unfinished is ended first: the new lines start their own.
     if ends_unfinished(path)? {
@@ -1130,6 +1199,17 @@ async fn connect(socket: &Path) -> anyhow::Result<Client> {
         Ok(c)
     })
     .await
+}
+
+/// The id of the workspace `twr` without `-w` selects in this TUI's shell
+/// ([`twr_core::paths::bare_selection`]): commands it shows name another with `-w`.
+fn bare_workspace() -> Option<String> {
+    let root =
+        twr_core::paths::Paths::from_env_in(Some(twr_core::paths::DEFAULT_WORKSPACE)).ok()?;
+    twr_core::paths::bare_selection(
+        &root,
+        std::env::var_os(twr_core::paths::WORKSPACE_ENV).as_deref(),
+    )
 }
 
 /// The workspace the hub on each socket must serve, by socket ([`expect_workspace`]).
@@ -1656,23 +1736,92 @@ impl TypedAhead {
     }
 }
 
+/// A workspace as [`Workspaces::list`] lists it ([`twr_core::workspaces`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WsEntry {
+    /// Its id, which a rename leaves: what the TUI knows it by.
+    pub id: String,
+    /// Its name.
+    pub name: String,
+    /// Commands without `-w` (and a bare `twr`) select it.
+    pub default: bool,
+}
+
+/// What removing a workspace would do, as the TUI's Delete shows it before asking
+/// ([`Workspaces::plan_removal`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemovalPlan {
+    /// Why it can't be removed now, and what to do first; `None`: it can.
+    pub refused: Option<String>,
+    /// What it removes, keeps and changes, a line each.
+    pub lines: Vec<String>,
+    /// Its hub runs (with nothing in it the removal would lose): removing it stops it first.
+    pub stops_hub: bool,
+    /// Which workspace with that id the plan is about (its data's identity on disk): the
+    /// removal refuses one made since with the same id.
+    pub generation: Option<String>,
+}
+
 /// The workspaces a TUI can switch between (`twr ws`): the CLI provides them, as it knows
-/// where they are and how to start their hubs.
+/// where they are and how to start their hubs. Workspaces are named by id
+/// ([`twr_core::workspaces`]) but in [`Workspaces::create`].
 pub trait Workspaces: Send + Sync {
-    /// Their names, in the tab strip's order (`default` first).
+    /// Their ids, in the tab strip's order (the default first).
     fn names(&self) -> anyhow::Result<Vec<String>>;
-    /// The socket of workspace `name`'s hub, whether it runs or not.
-    fn socket(&self, name: &str) -> anyhow::Result<PathBuf>;
-    /// Makes sure workspace `name`'s hub answers, starting it when none runs; its socket.
-    fn open(&self, name: &str) -> futures::future::BoxFuture<'static, anyhow::Result<PathBuf>>;
-    /// Creates workspace `name`.
+    /// The socket of workspace `id`'s hub, whether it runs or not.
+    fn socket(&self, id: &str) -> anyhow::Result<PathBuf>;
+    /// Makes sure workspace `id`'s hub answers, starting it when none runs; its socket.
+    fn open(&self, id: &str) -> futures::future::BoxFuture<'static, anyhow::Result<PathBuf>>;
+    /// Creates workspace `name` (its id: a new workspace's id is its name).
     fn create(&self, name: &str) -> anyhow::Result<()>;
+    /// Them, with their names, in the tab strip's order; by default each named as its id, the
+    /// first the default.
+    fn list(&self) -> anyhow::Result<Vec<WsEntry>> {
+        Ok(self
+            .names()?
+            .into_iter()
+            .enumerate()
+            .map(|(i, id)| WsEntry {
+                name: id.clone(),
+                id,
+                default: i == 0,
+            })
+            .collect())
+    }
+    /// Renames workspace `id` to `to`; what to say it did.
+    fn rename(&self, _id: &str, _to: &str) -> anyhow::Result<String> {
+        anyhow::bail!("workspaces can't be renamed here")
+    }
+    /// Makes workspace `id` the default; what to say it did.
+    fn set_default(&self, _id: &str) -> anyhow::Result<String> {
+        anyhow::bail!("the default workspace can't be changed here")
+    }
+    /// What removing workspace `id` would do, or why it can't be removed now.
+    fn plan_removal(
+        &self,
+        _id: &str,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<RemovalPlan>> {
+        Box::pin(async { anyhow::bail!("workspaces can't be removed here") })
+    }
+    /// Removes workspace `id`, stopping its hub first when `stop_hub` (once
+    /// [`Workspaces::plan_removal`] said it can), only while it is the one the plan's
+    /// `generation` names; what to say it did.
+    fn remove(
+        &self,
+        _id: &str,
+        _stop_hub: bool,
+        _generation: Option<String>,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<Vec<String>>> {
+        Box::pin(async { anyhow::bail!("workspaces can't be removed here") })
+    }
 }
 
 /// The workspace a TUI opens on, and the ones it can switch to.
 pub struct Switching {
-    /// The workspace of the socket the TUI opens on.
+    /// The id of the workspace of the socket the TUI opens on.
     pub current: String,
+    /// What to say as it opens (that it opened this one for want of a default).
+    pub note: Option<String>,
     /// All of them.
     pub workspaces: std::sync::Arc<dyn Workspaces>,
 }
@@ -1915,10 +2064,77 @@ fn accounts_failure(e: &anyhow::Error) -> Value {
     }
 }
 
+/// What gives up the TUI's waiting workspace changes ([`Shared::cancel`]).
+type Cancel = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
+/// A removal the workspace menu confirmed of the workspace shown ([`Shared::pending_removal`]):
+/// it runs once the open `open` (the switch away from it) is done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingRemoval {
+    open: u64,
+    id: String,
+    stop_hub: bool,
+    generation: Option<String>,
+}
+
+/// What a session's end does with the removal that waits in `pending` ([`PendingRemoval`]):
+/// it is let go whatever the end, and runs (returned) only when that end is the switch its
+/// open made (`opened`, to `to`) away from the workspace it removes. A reconnect, a quit or
+/// another open's switch drops it, so a confirmation never runs later, on a workspace used
+/// since.
+fn due_removal(
+    pending: &mut Option<PendingRemoval>,
+    opened: Option<u64>,
+    to: &str,
+) -> Option<PendingRemoval> {
+    let p = pending.take()?;
+    (opened == Some(p.open) && p.id != to).then_some(p)
+}
+
+/// Deletes workspace `id` off the loop ([`Workspaces::remove`]); what it did, and the
+/// workspaces as listed after, go to `done`.
+fn spawn_removal(
+    ws: std::sync::Arc<dyn Workspaces>,
+    id: String,
+    stop_hub: bool,
+    generation: Option<String>,
+    done: mpsc::UnboundedSender<(String, Option<Vec<WsEntry>>)>,
+) {
+    tokio::spawn(async move {
+        let msg = match ws.remove(&id, stop_hub, generation).await {
+            // What went and what changes (what stays was in the plan).
+            Ok(lines) => lines
+                .iter()
+                .filter(|l| !l.starts_with(' '))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; "),
+            Err(e) => format!("workspace {id} not deleted: {e:#}"),
+        };
+        let listed = tokio::task::spawn_blocking(move || ws.list().ok())
+            .await
+            .ok()
+            .flatten();
+        let _ = done.send((msg, listed));
+    });
+}
+
 /// Creates workspace `name` when asked, opens its hub and connects to it.
-async fn open_workspace(ws: &dyn Workspaces, name: &str, create: bool) -> anyhow::Result<Session> {
+async fn open_workspace(
+    ws: &dyn Workspaces,
+    name: &str,
+    create: bool,
+    cancel: &Cancel,
+) -> anyhow::Result<Session> {
     if create {
-        create_workspace(ws, name)?;
+        // It waits for the registry's lock, which a removal may hold a moment (or while its
+        // question waits), until the TUI quits ([`Shared::cancel`]).
+        // (Only a multi-threaded runtime, the CLI's, can let a worker block.)
+        let made = || twr_core::workspaces::cancellable(cancel, || create_workspace(ws, name));
+        match tokio::runtime::Handle::current().runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(made)?,
+            _ => made()?,
+        }
     }
     let socket = ws.open(name).await?;
     Session::connect(&socket, Some(name)).await
@@ -2163,11 +2379,14 @@ fn spawn_history_writer(
     Option<std::thread::JoinHandle<()>>,
 ) {
     let (tx, rx) = std::sync::mpsc::channel::<Vec<String>>();
+    // Which workspace this session's history is of: a save never goes into another made
+    // since with its id.
+    let generation = path.parent().and_then(twr_core::workspaces::dir_generation);
     let writer = std::thread::Builder::new()
         .name("twr-history".into())
         .spawn(move || {
             for added in rx {
-                if let Err(e) = save_history(&path, &added) {
+                if let Err(e) = save_history_of(&path, &added, generation.as_deref()) {
                     status.send((format!("input history: {e}"), false));
                 }
             }
@@ -2500,9 +2719,11 @@ enum End {
     /// The user quit.
     Quit,
     /// The user switched to workspace `to`, whose hub `next` is connected: the view of the
-    /// workspace left, the tabs and whether the TUI has the mouse go with it.
+    /// workspace left, the tabs and whether the TUI has the mouse go with it. `opened`: the
+    /// open that connected it ([`Shared::opens`]).
     Switch {
         to: String,
+        opened: u64,
         next: Box<Session>,
         view: Box<workspace::SavedView>,
         tabs: Vec<workspace::Tab>,
@@ -2605,6 +2826,21 @@ struct Shared {
     /// Errors of calls a workspace left asked for, once another one shows ([`serve_calls`]).
     late_tx: mpsc::UnboundedSender<StatusMsg>,
     late_rx: mpsc::UnboundedReceiver<StatusMsg>,
+    /// A workspace being deleted from the workspace menu ([`Action::WsRemove`]): the one the
+    /// TUI showed, deleted once the switch away from it is done ([`due_removal`]).
+    pending_removal: Option<PendingRemoval>,
+    /// Set as the TUI quits: what gives up a workspace change of its that still waits for the
+    /// registry lock (`twr ws rm` asking its question elsewhere), so nothing is applied after
+    /// the user left ([`twr_core::workspaces::cancellable`]).
+    cancel: Cancel,
+    /// The opens of a workspace's hub started so far ([`Action::Workspace`],
+    /// [`Action::WsRemove`]): each one's number, so a removal waits for its own.
+    opens: u64,
+    /// What to say on the first view ([`Switching::note`]).
+    note: Option<String>,
+    /// What a workspace change from the menu did, and the workspaces as listed after it.
+    ws_done_tx: mpsc::UnboundedSender<(String, Option<Vec<WsEntry>>)>,
+    ws_done_rx: mpsc::UnboundedReceiver<(String, Option<Vec<WsEntry>>)>,
     /// Each workspace left by a switch: its followed results' channel ([`ResultsOut`]).
     followed: std::collections::HashMap<String, (ResultTx, ResultRx)>,
     tui: twr_core::config::TuiConfig,
@@ -2807,6 +3043,20 @@ pub async fn run_with(
         .context("enabling focus reporting")?;
     let mut input = Input::terminal()?;
     let (late_tx, late_rx) = mpsc::unbounded_channel::<StatusMsg>();
+    let (ws_done_tx, ws_done_rx) = mpsc::unbounded_channel();
+    // A workspace change that has to wait for another (`twr ws rm` asking its question in
+    // another terminal) says so in the status line rather than seeming to hang.
+    {
+        let tx: mpsc::UnboundedSender<(String, Option<Vec<WsEntry>>)> = ws_done_tx.clone();
+        twr_core::workspaces::on_registry_wait(move || {
+            let _ = tx.send((
+                "waiting for another change to the workspaces to finish (a `twr ws` command \
+                 elsewhere, maybe asking a question)..."
+                    .into(),
+                None,
+            ));
+        });
+    }
     let (saved_tx, saved_rx) = mpsc::unbounded_channel::<Saved>();
     let (saves, settings_writer) = spawn_settings_writer(saved_tx);
     let own = speaker::Place {
@@ -2820,6 +3070,12 @@ pub async fn run_with(
         all_callers: Vec::new(),
         late_tx,
         late_rx,
+        pending_removal: None,
+        cancel: Cancel::default(),
+        opens: 0,
+        note: None,
+        ws_done_tx,
+        ws_done_rx,
         followed: std::collections::HashMap::new(),
         tui,
         // The working icon's clock: every icon's frame comes from the time since this instant.
@@ -2843,16 +3099,17 @@ pub async fn run_with(
         speaker,
         signals,
     };
+    ctx.note = switching.as_ref().and_then(|s| s.note.clone());
     let current = switching.map(|s| s.current);
     // The tabs are known from the start (their hubs are asked at the first poll), so `/ws`
     // never takes an existing workspace for a new one.
     let tabs = ctx
         .workspaces
         .as_ref()
-        .and_then(|ws| ws.names().ok())
+        .and_then(|ws| ws.list().ok())
         .unwrap_or_default()
-        .into_iter()
-        .map(workspace::Tab::new)
+        .iter()
+        .map(workspace::Tab::of)
         .collect();
     let carried = Carried {
         mouse: ctx.tui.mouse,
@@ -2870,7 +3127,9 @@ pub async fn run_with(
     )
     .await;
     // Nothing is sent once the user quit, from any workspace: no suggestion asked either,
-    // and nothing more read aloud.
+    // and nothing more read aloud. A workspace change still waiting for the registry lock
+    // gives up, unapplied.
+    ctx.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
     abort_all(&mut ctx.all_callers);
     ctx.asking.settle(false);
     ctx.summarizing.settle(false);
@@ -2881,6 +3140,8 @@ pub async fn run_with(
     drop(terminal);
     // The terminal is the user's again before anything else waits.
     drop(guard);
+    // A Delete past its checks finishes, whatever it takes (it deletes a workspace's files).
+    finish_removals(&mut std::io::stderr());
     // The lines sent last are written before the TUI exits, unless another TUI holds the
     // file's lock past [`HISTORY_FLUSH`]; so are the settings changed last.
     flush_history(history_writer);
@@ -2924,6 +3185,7 @@ where
         match end {
             Ok(End::Switch {
                 to,
+                opened,
                 next,
                 view,
                 tabs,
@@ -2934,6 +3196,17 @@ where
                 flush_history(writer);
                 if let Some(left) = current.replace(to.clone()) {
                     saved.insert(left, *view);
+                }
+                // A workspace no longer listed (deleted, here or elsewhere) leaves no view: one
+                // made later with its id starts afresh.
+                saved.retain(|id, _| tabs.iter().any(|t| &t.name == id));
+                // The workspace left, to delete now that it is not shown (only after the switch
+                // its removal waited for).
+                if let Some(p) = due_removal(&mut ctx.pending_removal, Some(opened), &to) {
+                    saved.remove(&p.id);
+                    if let Some(ws) = ctx.workspaces.clone() {
+                        spawn_removal(ws, p.id, p.stop_hub, p.generation, ctx.ws_done_tx.clone());
+                    }
                 }
                 carried = Carried {
                     mouse,
@@ -2951,6 +3224,21 @@ where
                 mouse,
             }) => {
                 flush_history(writer);
+                // The open a removal waited for ended with the session: the removal is let go,
+                // and said so, rather than run on a later switch.
+                if let Some(p) = ctx.pending_removal.take() {
+                    let label = tabs
+                        .iter()
+                        .find(|t| t.name == p.id)
+                        .map_or(p.id.clone(), |t| t.label.clone());
+                    let _ = ctx.ws_done_tx.send((
+                        format!(
+                            "workspace {label} not deleted: its hub was reconnected to before \
+                             the switch away from it was done; delete it again"
+                        ),
+                        None,
+                    ));
+                }
                 carried = Carried {
                     mouse,
                     view: Some(*view),
@@ -3051,7 +3339,7 @@ where
     let selection = workspace::attach_via(
         ctx.workspaces.is_none().then_some(socket.as_path()),
         info["workspace"].as_str(),
-        std::env::var_os(twr_core::paths::WORKSPACE_ENV).as_deref(),
+        bare_workspace().as_deref(),
     );
     let status = StatusOut {
         tx: err_tx,
@@ -3073,6 +3361,8 @@ where
         followed: followed_tx.clone(),
     };
     let private_results = results.view.clone();
+    // Stops the `twr phone` that `/phone` runs ([`crate::phone::run`]).
+    let mut phone_stop: Option<tokio::sync::oneshot::Sender<()>> = None;
     let calls = HubCalls {
         socket: socket.clone(),
         client: Some(calls),
@@ -3111,6 +3401,10 @@ where
     state.view.picker = Picker::from_show(&show, &state.accounts);
     state.workspace = current;
     state.set_tabs(carried.tabs);
+    // What the CLI said as it opened (no default workspace, so it opened this one).
+    if let Some(note) = ctx.note.take() {
+        state.view.status = Some(note);
+    }
     if let Some(view) = carried.view {
         state.restore_view(view);
     }
@@ -3186,15 +3480,17 @@ where
     // A poll's answers: the workspaces listed (`None`: they could not be), how the hubs
     // asked were, and when they were asked.
     let (tabs_tx, mut tabs_rx) = mpsc::unbounded_channel::<(
-        Option<Vec<String>>,
+        Option<Vec<WsEntry>>,
         Vec<workspace::Polled>,
         std::time::Instant,
     )>();
     // The workspaces as listed for a poll (`None`: they could not be), read off the loop: a
     // directory on a slow mount never holds up the view.
-    let (names_tx, mut names_rx) = mpsc::unbounded_channel::<Option<Vec<String>>>();
+    let (names_tx, mut names_rx) = mpsc::unbounded_channel::<Option<Vec<WsEntry>>>();
+    // What deleting a workspace would do, for the workspace menu ([`Action::WsPlan`]).
+    let (plan_tx, mut plan_rx) = mpsc::unbounded_channel::<(String, anyhow::Result<RemovalPlan>)>();
     // A workspace switched to, once its hub is connected ([`open_workspace`]).
-    type Opened = (String, anyhow::Result<Session>);
+    type Opened = (String, u64, anyhow::Result<Session>);
     let (open_tx, mut open_rx) = mpsc::unbounded_channel::<Opened>();
     // What the last frame showed: another thread or screen repaints the whole terminal.
     let mut shown: Option<(Option<String>, app::Screen)> = None;
@@ -3333,7 +3629,7 @@ where
                 }
                 // What this frame drew in full is all an option key may answer.
                 state.note_drawn(std::time::Instant::now());
-                save_seen(&mut state, ctx.seen_file.as_deref());
+                let _ = save_seen(&mut state, ctx.seen_file.as_deref());
                 if shown.replace(now_showing).is_none() {
                     typed_ahead.start(std::time::Instant::now());
                 }
@@ -3499,6 +3795,27 @@ where
                                 }).abort_handle());
                                 continue;
                             }
+                            Action::Phone { generation, level } => {
+                                // One invitation at a time: an older run's is cancelled.
+                                if let Some(stop) = phone_stop.take() {
+                                    let _ = stop.send(());
+                                }
+                                let (stop, stopped) = tokio::sync::oneshot::channel();
+                                phone_stop = Some(stop);
+                                let sender = private_results.clone();
+                                let send = move |mut value: serde_json::Value| {
+                                    value["generation"] = generation.into();
+                                    let _ = sender.send(("phone.local", value));
+                                };
+                                ctx.all_callers.push(tokio::spawn(crate::phone::run(level, send, stopped)).abort_handle());
+                                continue;
+                            }
+                            Action::CancelPhone => {
+                                if let Some(stop) = phone_stop.take() {
+                                    let _ = stop.send(());
+                                }
+                                continue;
+                            }
                             Action::Copy { text } => {
                                 copy_text(text, status.clone(), written_tx.clone());
                                 continue;
@@ -3519,7 +3836,7 @@ where
                                     state.view.status =
                                         Some(firstrun::edit_status(terminal, &outcome, &place.home));
                                 }
-                                save_seen(&mut state, ctx.seen_file.as_deref());
+                                let _ = save_seen(&mut state, ctx.seen_file.as_deref());
                                 continue;
                             }
                             // Kept for the next runs (and the next workspaces shown).
@@ -3549,6 +3866,90 @@ where
                                 }
                                 continue;
                             }
+                            // The workspace menu's changes ([`wsmenu`]): the CLI makes them,
+                            // and the tabs are listed again at once.
+                            // Off the loop: they wait for the lock a removal holds meanwhile.
+                            Action::WsRename { id, to } => {
+                                if let Some(ws) = ctx.workspaces.clone() {
+                                    let (done, cancel) = (ctx.ws_done_tx.clone(), ctx.cancel.clone());
+                                    tokio::task::spawn_blocking(move || {
+                                        // Given up, unapplied, once the TUI quits.
+                                        let renamed = twr_core::workspaces::cancellable(&cancel, || {
+                                            ws.rename(&id, &to)
+                                        });
+                                        let msg = match renamed {
+                                            Ok(msg) => msg,
+                                            Err(e) => format!("rename: {e:#}"),
+                                        };
+                                        let _ = done.send((msg, ws.list().ok()));
+                                    });
+                                }
+                                continue;
+                            }
+                            Action::WsDefault { id } => {
+                                if let Some(ws) = ctx.workspaces.clone() {
+                                    let (done, cancel) = (ctx.ws_done_tx.clone(), ctx.cancel.clone());
+                                    tokio::task::spawn_blocking(move || {
+                                        let made = twr_core::workspaces::cancellable(&cancel, || {
+                                            ws.set_default(&id)
+                                        });
+                                        let msg = match made {
+                                            Ok(msg) => msg,
+                                            Err(e) => format!("make default: {e:#}"),
+                                        };
+                                        let _ = done.send((msg, ws.list().ok()));
+                                    });
+                                }
+                                continue;
+                            }
+                            Action::WsPlan { id } => {
+                                if let Some(ws) = ctx.workspaces.clone() {
+                                    let tx = plan_tx.clone();
+                                    tokio::spawn(async move {
+                                        let r = ws.plan_removal(&id).await;
+                                        let _ = tx.send((id, r));
+                                    });
+                                }
+                                continue;
+                            }
+                            // The workspace shown is deleted once the switch away from it is
+                            // done ([`Shared::pending_removal`]); another one at once.
+                            Action::WsRemove { id, stop_hub, via, generation } => {
+                                let Some(ws) = ctx.workspaces.clone() else {
+                                    continue;
+                                };
+                                match via {
+                                    Some(to) => {
+                                        if !state.begin_switch(&to) {
+                                            continue;
+                                        }
+                                        ctx.opens += 1;
+                                        let open = ctx.opens;
+                                        ctx.pending_removal = Some(PendingRemoval {
+                                            open,
+                                            id,
+                                            stop_hub,
+                                            generation,
+                                        });
+                                        let (tx, cancel) = (open_tx.clone(), ctx.cancel.clone());
+                                        tokio::spawn(async move {
+                                            let r = open_workspace(ws.as_ref(), &to, false, &cancel)
+                                                .await;
+                                            let _ = tx.send((to, open, r));
+                                        });
+                                    }
+                                    None => {
+                                        spawn_removal(
+                                            ws,
+                                            id,
+                                            stop_hub,
+                                            generation,
+                                            ctx.ws_done_tx.clone(),
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
                             // The workspace's hub is opened (started when needed) and
                             // connected to off the loop; this one stays until it is.
                             Action::Workspace { name, create } => {
@@ -3556,10 +3957,14 @@ where
                                     if !state.begin_switch(&name) {
                                         continue;
                                     }
-                                    let (ws, tx) = (ws.clone(), open_tx.clone());
+                                    let (ws, tx, cancel) =
+                                        (ws.clone(), open_tx.clone(), ctx.cancel.clone());
+                                    ctx.opens += 1;
+                                    let open = ctx.opens;
                                     tokio::spawn(async move {
-                                        let r = open_workspace(ws.as_ref(), &name, create).await;
-                                        let _ = tx.send((name, r));
+                                        let r = open_workspace(ws.as_ref(), &name, create, &cancel)
+                                            .await;
+                                        let _ = tx.send((name, open, r));
                                     });
                                 }
                                 continue;
@@ -3800,7 +4205,7 @@ where
                         tabs_pending = true;
                         let tx = names_tx.clone();
                         tokio::spawn(async move {
-                            let names = tokio::task::spawn_blocking(move || ws.names().ok())
+                            let names = tokio::task::spawn_blocking(move || ws.list().ok())
                                 .await
                                 .ok()
                                 .flatten();
@@ -3813,7 +4218,7 @@ where
                     match ctx.workspaces.clone() {
                         Some(ws) => {
                             let listed: Vec<String> = match &names {
-                                Some(n) => n.clone(),
+                                Some(n) => n.iter().map(|e| e.id.clone()).collect(),
                                 None => state.tabs.iter().map(|t| t.name.clone()).collect(),
                             };
                             let now = std::time::Instant::now();
@@ -3832,7 +4237,7 @@ where
                     for p in &polled {
                         ctx.poll_clock.answered(&p.name, &p.hub, asked);
                     }
-                    state.merge_poll(names, polled);
+                    state.merge_listing(names, polled);
                     let alerts = workspace::waiting_alerts(
                         &mut ctx.waiting_seen,
                         &state.tabs,
@@ -3865,7 +4270,16 @@ where
                 Some((msg, transient)) = ctx.late_rx.recv() => {
                     state.set_status(msg, transient, std::time::Instant::now());
                 }
-                Some((name, r)) = open_rx.recv() => match r {
+                Some((msg, listed)) = ctx.ws_done_rx.recv() => {
+                    state.set_status(msg, false, std::time::Instant::now());
+                    if listed.is_some() {
+                        state.merge_listing(listed, Vec::new());
+                    }
+                }
+                Some((id, plan)) = plan_rx.recv() => {
+                    state.ws_planned(&id, plan, std::time::Instant::now());
+                }
+                Some((name, opened, r)) = open_rx.recv() => match r {
                     Ok(next) => {
                         // What the user saw of this workspace's waiting items: no alert for
                         // them once it is in the background.
@@ -3882,6 +4296,7 @@ where
                         state.keep_live_glance();
                         return Ok(End::Switch {
                             to: name,
+                            opened,
                             next: Box::new(next),
                             view: Box::new(state.take_view()),
                             tabs: state.tabs.clone(),
@@ -3890,7 +4305,20 @@ where
                     }
                     Err(e) => {
                         state.switching = None;
-                        state.view.status = Some(format!("workspace {name}: {e:#}"));
+                        let label = state.ws_label(&name);
+                        // A removal waiting for this open goes with it.
+                        let waited = ctx
+                            .pending_removal
+                            .as_ref()
+                            .is_some_and(|p| p.open == opened);
+                        let removal = if waited { ctx.pending_removal.take() } else { None };
+                        state.view.status = Some(match removal {
+                            Some(p) => format!(
+                                "workspace {} not deleted: the switch to {label} failed: {e:#}",
+                                state.ws_label(&p.id)
+                            ),
+                            None => format!("workspace {label}: {e:#}"),
+                        });
                     }
                 },
                 Some((t, generation, r)) = sub_rx.recv() => {
@@ -3928,7 +4356,10 @@ where
     ctx.tui.notify.terminal = state.view.notify_terminal;
     ctx.tui.colors = state.view.color_mode;
     ctx.summaries = Some(state.summary.on);
-    save_seen(&mut state, ctx.seen_file.as_deref());
+    // Written before the next workspace's view, or the TUI's exit (bounded as the history is).
+    if let Some(saving) = save_seen(&mut state, ctx.seen_file.as_deref()) {
+        let _ = tokio::time::timeout(HISTORY_FLUSH, saving).await;
+    }
     ctx.seen = state.seen.clone();
     // Leaving this hub: its attendance connection closes, and the hub forgets it.
     drop(looking_tx);
@@ -4036,6 +4467,65 @@ mod asks_tests {
 
 #[cfg(test)]
 mod tests {
+    /// Quitting waits for a removal past its checks, however long it takes, and says so; one
+    /// that gets past its checks after that is refused, so it never begins.
+    #[test]
+    fn quitting_waits_for_a_removal_past_its_checks() {
+        static SET: twr_core::workspaces::Removals = twr_core::workspaces::Removals::new();
+        let removing = std::thread::spawn(|| {
+            let _r = SET.begin("slow-to-delete").unwrap();
+            std::thread::sleep(Duration::from_millis(1500));
+        });
+        // (Until it began.)
+        while !SET.in_progress().contains(&"slow-to-delete".into()) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let start = std::time::Instant::now();
+        let mut said = Vec::new();
+        finish_removals_in(&SET, &mut said);
+        assert!(SET.in_progress().is_empty());
+        let late = SET.begin("too-late").err().unwrap().to_string();
+        assert!(late.contains("twr is quitting; delete it again"), "{late}");
+        assert!(
+            start.elapsed() >= Duration::from_millis(1000),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(String::from_utf8(said)
+            .unwrap()
+            .contains("finishing deleting workspace slow-to-delete"),);
+        removing.join().unwrap();
+    }
+
+    /// A confirmed removal of the workspace shown runs only after the switch its own open
+    /// made away from it: a reconnect, a quit or another open's switch lets it go, so it never
+    /// runs later on a workspace used since.
+    #[test]
+    fn a_pending_removal_runs_only_after_its_own_open() {
+        let pending = |open| {
+            Some(PendingRemoval {
+                open,
+                id: "x".into(),
+                stop_hub: true,
+                generation: Some("g".into()),
+            })
+        };
+        let mut p = pending(3);
+        assert_eq!(due_removal(&mut p, Some(3), "d"), pending(3));
+        assert!(p.is_none());
+        // Ended otherwise (a reconnect to its own hub): let go, never run after.
+        let mut p = pending(3);
+        assert_eq!(due_removal(&mut p, None, "x"), None);
+        assert!(p.is_none());
+        assert_eq!(due_removal(&mut p, Some(3), "d"), None);
+        // Another open's switch, or one back to the workspace itself.
+        let mut p = pending(3);
+        assert_eq!(due_removal(&mut p, Some(4), "d"), None);
+        assert!(p.is_none());
+        let mut p = pending(3);
+        assert_eq!(due_removal(&mut p, Some(3), "x"), None);
+    }
+
     /// A hub that records the calls it gets, fails `fail` (and a `message.withdraw` or an
     /// `account.list` whose params say `fail`; an `account.list` whose params say `old` as a
     /// hub older than accounts does), answers `slow` once its oneshot fires, and a
@@ -5968,6 +6458,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub").join("tui-history");
         assert!(load_history(&path).is_empty());
+        // A directory that is gone (its workspace removed) is not made again.
+        assert!(save_history(&path, &["lost".into()]).is_err());
+        assert!(!dir.path().join("sub").exists());
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        // `default` removed (its directory stays, marked): not written again either.
+        std::fs::write(dir.path().join("sub").join("workspace-removed"), "").unwrap();
+        assert!(save_history(&path, &["lost".into()]).is_err());
+        assert!(!path.exists());
+        std::fs::remove_file(dir.path().join("sub").join("workspace-removed")).unwrap();
+        // A session's saves go into its own workspace only: not one made since with its id.
+        std::fs::write(dir.path().join("sub/workspace-generation"), "g1\n").unwrap();
+        save_history_of(&path, &["mine".into()], Some("g1")).unwrap();
+        std::fs::write(dir.path().join("sub/workspace-generation"), "g2\n").unwrap();
+        assert!(save_history_of(&path, &["stale".into()], Some("g1")).is_err());
+        assert_eq!(load_history(&path), ["mine"]);
+        std::fs::remove_file(&path).unwrap();
         save_history(&path, &["a \"quoted\" line".into(), "/help".into()]).unwrap();
         assert_eq!(load_history(&path), ["a \"quoted\" line", "/help"]);
         let many: Vec<String> = (0..2 * app::HISTORY_MAX).map(|i| i.to_string()).collect();

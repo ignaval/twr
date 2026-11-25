@@ -8,7 +8,7 @@ You can also ask the orchestrator to change a key, as in "turn off suggestions".
 
 ## Workspaces
 
-[Workspaces](workspaces.md) (`twr ws new <name>`, then `twr -w <name>` or `TWR_WORKSPACE`) are separate hubs on one machine that share this file. A named workspace ignores what belongs to the `default` workspace's hub: `hub.socket` (it has its own socket), `hub.listen` and `hub.tls` (runners connect to `default`), and `[orchestrator] cwd` (its orchestrator works in the workspace's own directory, so a Claude Code orchestrator keeps its own memories). The default workspace refuses a `hub.socket` in the directory of the workspaces' sockets (`<socket dir>/ws/`), where it could be one of theirs; `--socket` still works. Restart a workspace's hub (`twr -w <name> hub stop`, then `twr -w <name>`) after a change, like any hub.
+[Workspaces](workspaces.md) (`twr ws new <name>`, then `twr -w <name>` or `TWR_WORKSPACE`) are separate hubs on one machine that share this file. A workspace you create ignores what belongs to the hub of the one in twr's own data directory (`default`, whatever it is renamed to): `hub.socket` (it has its own socket), `hub.listen` and `hub.tls` (runners connect to that hub), and `[orchestrator] cwd` (its orchestrator works in the workspace's own directory, so a Claude Code orchestrator keeps its own memories). That workspace refuses a `hub.socket` in the directory of the workspaces' sockets (`<socket dir>/ws/`), where it could be one of theirs; `--socket` still works. Restart a workspace's hub (`twr -w <name> hub stop`, then `twr -w <name>`) after a change, like any hub.
 
 ## A second instance
 
@@ -156,7 +156,7 @@ native = true                     # names the native account (the runtime's own 
 
 [notify]                          # the hub runs a command when something needs you; see notifications.md
 # command = ["notify-send", "--app-name=twr", "{title}", "{body}"]  # unset = off; no shell; {title} {body} {workspace}
-events = ["permission", "question", "confirm", "error", "review", "hung", "report", "reply"]  # add "stalled" for stalls
+events = ["permission", "question", "confirm", "error", "review", "hung", "offline", "report", "reply"]  # add "stalled" for stalls
 detail = false                    # true: what's asked or reported goes along (it may hold secrets)
 timeout_secs = 30                 # the command is ended after this long (1 to 600)
 
@@ -174,7 +174,7 @@ colors = "auto"                   # "256", "16" or "none"; auto: from NO_COLOR, 
 [tui.notify]
 terminal = "off"                  # bell | osc9 | osc777: alert the terminal when something needs you
 when = "unfocused"                # always: also while the terminal has focus
-events = ["permission", "question", "confirm", "error", "review", "hung", "report", "reply"]  # add "stalled" for stalls
+events = ["permission", "question", "confirm", "error", "review", "hung", "offline", "report", "reply"]  # add "stalled" for stalls
 
 [speech]                          # reading aloud, on the machine you listen on; see read-aloud.md
 engine = "auto"                   # say (macOS) | avspeech (macOS) | spd (Linux) | command; auto: say, else spd if installed
@@ -223,6 +223,10 @@ efforts = ["low", "medium", "high", "xhigh", "max"]
 # A non-loopback listen address needs one of these:
 # tls = { cert = "hub.pem", key = "hub.key" }   # serve wss:// (PEM files)
 allow_insecure_remote = false     # true: plain ws:// on the network (events in clear text)
+connectivity_check_secs = 30      # how often the hub checks it reaches the internet; 0 = never
+# connectivity_targets = ["api.anthropic.com:443"]  # host:port it connects to (any one answering
+                                  # is enough); unset = the proxy of HTTPS_PROXY / ALL_PROXY when
+                                  # set, else api.anthropic.com, api.openai.com and api.x.ai on 443
 
 [boxes.gpu]                       # example: a box the hub reaches over SSH; see runners.md
 transport = "ssh"                 # the hub connects to it; unset = "token" (its runner connects to the hub)
@@ -268,7 +272,7 @@ When `[orchestrator] runtime` isn't set and no orchestrator exists yet, the TUI 
 
 The TUI reads `[tui]` when it opens; the hub ignores it. Its [settings](tui.md#settings) (`/settings`) change `suggest`, `summaries`, `card_order`, `colors`, `compact_width` and `[tui.notify] terminal` while it runs and write them back here, changing that one line and nothing else of the file, or leave the file alone and say why when they can't be sure of that. With `mouse = true` the TUI captures the mouse: a drag copies text from one pane, without borders, and the wheel scrolls. Shift-drag, or Option-drag in iTerm2, still uses the terminal's own selection. `/mouse` toggles it while the TUI runs. See [tui.md](tui.md#mouse).
 
-`animate = true` animates the working cursor on whatever is running a turn: worker cards, grid tiles, and the main pane's header while the orchestrator or the thread you dived into works, plus the cursor where that thread's next text will appear. The TUI then redraws about eight times a second, but only while an icon is on screen. With `false` the same places show a still `_` and the TUI redraws only when something changes. See [tui.md](tui.md#what-is-working).
+`animate = true` animates the working cursor on whatever is running a turn: worker cards, grid tiles, and the main pane's header while the orchestrator or the thread you dived into works, plus the cursor where that thread's next text will appear. The TUI then redraws about eight times a second, but only while an icon is on screen. With `false` the same places show a still `_` and the TUI redraws only when something changes. The desktop and mobile apps' conversation cursor follows it too ([desktop.md](desktop.md#workflows-and-cli-coverage)). See [tui.md](tui.md#what-is-working).
 
 `card_order = "stable"`, the default, keeps the cards in place: the cards that need you go by their items (most urgent, then oldest, first), and within the other groups (working, failed, done, idle, parked) cards stay in the order their threads were created, a card that comes to need you goes to the top at once, and any other move waits a few seconds and until no card is selected, no popup is open and the mouse isn't over the cards. `"attention"` is the older order: within a group, the most recently active thread first, and every move right away. Cards have a fixed height with either. See [tui.md](tui.md#stack-view).
 
@@ -335,6 +339,7 @@ twr checks the thread's working tree before and after every ACP review run, and 
 |---|---|
 | `TWR_HOME` | put the config, the data directory and the socket under this directory |
 | `TWR_WORKSPACE` | the [workspace](workspaces.md) commands run in when `-w` doesn't say (default: `default`); a workspace's hub sets it for what it starts |
+| `TWR_GATEWAY_AUTOSTART` | `off` keeps a starting hub from starting the phone gateway ([mobile.md](mobile.md#pairing-a-phone)); `twr phone off` does the same, saved |
 | `TWR_RUNNER_TOKEN` | the runner's token when `twr runner` has no `--token-file` |
 | `TWR_CLAUDE_BIN`, `TWR_CODEX_BIN`, `TWR_GROK_BIN` | the agent binary to run instead of `claude`, `codex` or `grok` on `PATH` (on a remote box, the login shell's `PATH` and then the runner's: [runners.md](runners.md#the-login-shells-path)) |
 | `TWR_AGENT_PROBE` | `off` keeps the hub from checking its own box's agent CLIs: no `claude`, `codex` or `grok` runs for it, and `hub.info` reports the local box's agents as not reported (an empty list). Review loops then count every reviewer runtime as installed and logged in, not knowing (`loop.settings.get` says `probed: false`): no setting is refused or replaced for it, and a round whose CLI is missing fails as a failed run. Any other value, or none, leaves the check on. For tests and troubleshooting |

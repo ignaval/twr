@@ -226,6 +226,7 @@ const ANNOUNCED = [
   "failed",
   "needs your review",
   "seems hung",
+  "has no internet connection",
   "is stalled",
   "finished",
   "replied",
@@ -235,6 +236,7 @@ const ANNOUNCED = [
 export function announcements(threads: { name: string }[]): string[] {
   return [
     "twr has a question for you",
+    "twr has no internet connection",
     ...threads.flatMap((t) => ANNOUNCED.map((says) => `${t.name} ${says}`)),
   ];
 }

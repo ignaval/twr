@@ -43,7 +43,8 @@ with the environment it was launched with.
 
 ## Sidebar
 
-The sidebar lists every workspace of the hub, as the TUI's does: `default` first, each with
+The sidebar lists every workspace of the hub by its name, as the TUI's does: the default
+workspace first, each with
 `⚠` (requests waiting on you) and `●` (threads at work) counts, or `○` when its hub isn't
 running. Under each workspace are its **Orchestrator** and its threads. The current
 workspace shows its full thread cards (with the focus filter and parked toggle). Other
@@ -59,6 +60,16 @@ and `+N more` opens that workspace's grid. Each workspace's
 `+` starts a new thread in it. Its name collapses or expands it, and the app remembers
 that on this device. **New workspace** at the end of the list creates or removes
 workspaces. Needs you and the thread grid stay at the top.
+
+The app opens the workspace `TWR_WORKSPACE` names when it is set, else the one it showed
+last while it still exists (by its id: not another workspace renamed into it since), else the default workspace (`twr ws default`), and with no
+default workspace the first one listed, as a bare `twr` does. When the workspace it opens
+can't be (it was removed, say), the sidebar still lists the others, to pick one; and, when
+no workspace could be opened since the app started, to make a new one. Once one was open, a
+failed switch to another still lists them, but making one waits until a workspace is
+connected again. A renamed
+workspace keeps everything the app saved of it: the app knows workspaces by the id their
+hub reports, which a rename leaves.
 
 Under the workspaces, **Manage** lists **Machines & accounts** (the hub's boxes and your
 accounts; it needs `admin` on a paired device), **Activity** (jobs and usage), **Context &
@@ -99,15 +110,27 @@ the command and clearing the text that came back.
 
 The app's notices share one strip under the header and show one at a time, the most
 pressing first: the connection (connecting, or why it dropped, with **Reconnect**, and
-what this device saved meanwhile), offline, an app whose engine is newer than the
-running hub (**Stop hub…**), the first-use notice for small-model suggestions and
-summaries (it asks you to decide), an update (**Restart to update**, **Download**,
+what this device saved meanwhile), offline, a hub running another engine than the
+app's (**Stop hub…**, and **Stop all hubs…** when other workspaces' hubs do too), the
+first-use notice for small-model suggestions and summaries (it asks you to decide), an update (**Restart to update**, **Download**,
 **Dismiss**), a problem with this device's encrypted storage (such as no unlocked keyring
 on Linux), then assistance errors. **+N** shows the others under it; dismissing the one shown
 brings up the next.
 
+A hub keeps the engine it started with when the app is upgraded. The app compares each
+running workspace's hub with the engine it bundles: by version, and for the same version by
+build (the `build` of `hub.info`, the first 16 hex digits of the engine's SHA-256; `twr ws
+list --json` reports both for every running hub, so no extra connection is opened), so a
+package rebuilt from a later commit with the same version is noticed too. The notice says
+which: "this hub still runs 0.5.2", or "a different build of twr 0.6.0 (463a2ed0) than this
+hub runs (85ab7b43)", and names the other workspaces whose hubs differ. **Stop hub…** stops
+this workspace's hub, and **Stop all hubs…** opens `twr hub stop --all`; reconnect to start
+the app's engine. A hub too old to report its build is compared by version alone.
+
 Above the history, the orchestrator and each thread's conversation show the first line
-of your preceding message, on desktop and phone. At the bottom, this is your latest
+of your preceding message, on desktop and phone, in a row of its own as wide as the
+conversation's text column (it never covers the history; a line scrolled up to the
+history's top edge fades out under it). At the bottom, this is your latest
 message. While browsing, it is the last user message whose start lies above the history
 viewport's top edge, with a 1 CSS pixel tolerance. Reaching or passing its start while
 scrolling upward changes the shortcut to the previous user message. Scrolling downward
@@ -122,6 +145,17 @@ selection from the reading position; **Jump to latest** resumes bottom-follow. A
 earliest boundary, the shortcut says **No earlier messages from you** and does nothing.
 It stays focusable while loading and at that boundary so changing its target does not
 discard keyboard focus. Scrolling and background loads never transfer focus.
+
+While the orchestrator, or the thread whose conversation you have open, works, the
+conversation shows the TUI's working cursor ([What is working](tui.md#what-is-working)): a
+`_` in the accent color that breathes up to a block and back, at the end of a reply that
+is streaming in, or under the last message at the text column's left edge (beside **Show
+full message** while a long reply is collapsed). It appears as you send, before the hub has started the turn or the first
+text arrives, stays while the turn or its background tasks run, and goes when the turn ends
+or the thread waits on you for a permission or an answer. It shows only while the
+conversation is at its bottom and takes no room, so it never moves what you read. It is
+never copied with the text or read out. With reduced motion, or `[tui] animate = false`
+([configuration](configuration.md)), it stays a still `_`.
 
 Recent history and live updates appear first. Older turns, including all their pages,
 load in the background when the predecessor is not yet known, skipping automatic turns.
@@ -142,8 +176,14 @@ only once its options have been on screen for 600 ms: from when the card appears
 into view or the window is shown again, and from zero for a request raised again. Until then
 they show dimmed and a click or key does nothing, so the second click of a double click, or a
 key pressed as one card replaces another, can't answer the request that slid into place.
+A delete card, headed **Confirm deletion**, says it in short: the question (**Delete 5
+threads?**), a line per thread with what deleting it loses that nothing else keeps (**2
+unpushed commits**, **3 uncommitted files**; the threads that lose nothing share one line),
+and what goes for good (build output, deleted rather than moved to the trash) and for how
+long the trash keeps the rest. **Details** opens the hub's whole text, with every worktree
+path, size and branch. A card from a hub that does not give it in short shows the whole text.
 In a conversation, its requests take at most about a third of its height and scroll in their
-own area, so the composer stays in view; while a request goes on below that area's edge
+own area, above the history and never over it, so the composer stays in view; while a request goes on below that area's edge
 (its buttons, in a short window), the edge fades out, and Tab brings each button into view.
 After an answer is accepted the card shows **Sent** and its buttons stay disabled until it
 goes away. Answers need a live connection to the hub. Orchestrator messages use `say` with
@@ -250,6 +290,11 @@ shows greyed as the empty message box's placeholder: `Tab` or `→` puts it in t
 it has been on screen 300 ms, so a key pressed as it appears isn't taken for it), typing
 types over it, and it is sent only when you press Enter. Only visible routine-update groups receive summaries; permission/question
 updates remain visible and summaries are bound to their conversation and covered update.
+In the orchestrator's conversation, an update the hub wrote about one worker (a report, a
+request, a run of routine updates) is drawn in that worker's box, as the orchestrator's own
+`<thread>` sections are: framed in its color and titled with its name. The thread is the one
+the hub names by id (`about_thread`), never by name; an update about no thread, or about one
+this client doesn't list, stays unboxed.
 
 Settings › Agents › Orchestrator shows the orchestrator's runtime, model and effort as
 lists. On the runtime it runs, **Apply** changes the model and effort in place, as the
@@ -936,7 +981,7 @@ it was last moved, resized or closed (saved in the app's `desktop.json`). It is 
 shrunk to fit the display that shows most of it; if that display is gone, it keeps its size
 and opens in the default place.
 
-Settings › General › Layout & text has a **Compact layout** switch and the interface and code text sizes (Small, Default, Large, Extra large; a size an earlier version saved shows as Custom). Drag the sidebar's right edge or the inspector's header edge, or focus the separator and use Left/Right, Home or End. Widths are constrained to fit a tiled window and saved on this device. Mobile conversation text follows the system text-size setting; chrome and terminal sizes use a bounded scale so their controls remain usable.
+Settings › General › Layout & text has a **Compact layout** switch and the interface and code text sizes (Small, Default, Large, Extra large; a size an earlier version saved shows as Custom). Drag the sidebar's right edge or the inspector's header edge, or focus the separator and use Left/Right, Home or End. Widths are constrained to fit a tiled window and saved on this device. Ctrl/⌘ with + or = makes both text sizes a pixel larger, Ctrl/⌘ with - a pixel smaller and Ctrl/⌘+0 resets them (also the View menu's **Larger Text**, **Smaller Text** and **Actual Text Size**, which replace page zoom), within the same bounds and saved the same way. Mobile conversation text follows the system text-size setting; chrome and terminal sizes use a bounded scale so their controls remain usable.
 
 Recent conversations and message drafts are encrypted locally using the macOS keychain, a Linux secret service, iOS Keychain or Android Keystore. Linux sessions without an unlocked keyring keep live operation available and report that encrypted persistence is unavailable; no plaintext fallback is used. History is bounded, retained for up to seven days and can be cleared in Settings › Advanced. Configuration/editor drafts stay in memory because they may contain credentials.
 

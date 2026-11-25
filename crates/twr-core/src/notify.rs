@@ -46,6 +46,9 @@ pub enum NotifyEvent {
     Review,
     /// A turn silent while something waits to start the next one (a hung-turn card).
     Hung,
+    /// The hub's machine lost its internet connection (the hub's own card about it, once per
+    /// outage; a thread's stall meanwhile is [`NotifyEvent::Stalled`]).
+    Offline,
     /// A running turn silent for `stall_after_secs`.
     Stalled,
     /// A worker finished a turn (`report.ready`), when no failure or review covers it.
@@ -67,6 +70,7 @@ impl NotifyEvent {
         NotifyEvent::Error,
         NotifyEvent::Review,
         NotifyEvent::Hung,
+        NotifyEvent::Offline,
         NotifyEvent::Report,
         NotifyEvent::Reply,
     ];
@@ -80,6 +84,7 @@ impl NotifyEvent {
             NotifyEvent::Error => "failed",
             NotifyEvent::Review => "needs review",
             NotifyEvent::Hung => "seems hung",
+            NotifyEvent::Offline => "has no internet connection",
             NotifyEvent::Stalled => "is stalled",
             NotifyEvent::Report => "finished",
             NotifyEvent::Reply => "replied",
@@ -273,6 +278,11 @@ impl Policy {
                         AttentionReason::Error => NotifyEvent::Error,
                         AttentionReason::Review => NotifyEvent::Review,
                         AttentionReason::Stalled if is_hung_card(&p.ext) => NotifyEvent::Hung,
+                        AttentionReason::Stalled
+                            if ev.thread == HUB_THREAD && item.offline_since.is_some() =>
+                        {
+                            NotifyEvent::Offline
+                        }
                         AttentionReason::Stalled => NotifyEvent::Stalled,
                     }
                 };
@@ -660,6 +670,57 @@ mod tests {
             !still_due(&c, &f.registry, &f.attention),
             "answered: no longer due"
         );
+    }
+
+    /// The hub's notice that its machine has no internet connection notifies as `offline` (on
+    /// by default), once; a thread's stall while it is down stays a stall (off by default).
+    #[test]
+    fn the_hubs_offline_notice_notifies_as_offline_and_a_threads_stall_as_a_stall() {
+        let mut f = Feed::defaults();
+        let offline = json!({"twr": {"offline": {"since": "2026-11-23T14:02:00Z"}}})
+            .as_object()
+            .cloned();
+        let mut hub = ThreadScript::new(HUB_THREAD);
+        let mut ev = hub.event(EventBody::AttentionRaised(AttentionRaised {
+            attn_id: "n1".into(),
+            reason: AttentionReason::Stalled,
+            summary: "No internet connection since 14:02".into(),
+            options: vec!["dismiss".into()],
+            ext: offline.clone(),
+            ..Default::default()
+        }));
+        ev.source = Source::Hub;
+        let c = f.push(ev).unwrap();
+        assert_eq!(c.event, NotifyEvent::Offline);
+        assert_eq!(
+            c.line(),
+            "twr has no internet connection: No internet connection since 14:02"
+        );
+        assert!(f.attention.get("n1").unwrap().offline_since.is_some());
+        let mut api = ThreadScript::new("t1");
+        f.push(api.created("api"));
+        f.push(api.turn_started("go"));
+        let mut ev = api.event(EventBody::AttentionRaised(AttentionRaised {
+            attn_id: "t1:s1".into(),
+            reason: AttentionReason::Stalled,
+            summary: "No internet connection since 14:02: no activity for 10 min".into(),
+            options: vec!["dismiss".into()],
+            ext: offline.clone(),
+            ..Default::default()
+        }));
+        ev.source = Source::Hub;
+        assert_eq!(f.push(ev), None, "a stall: not notified by default");
+        assert!(f.attention.get("t1:s1").unwrap().offline_since.is_some());
+        // The same mark from anyone but the hub is no notice of the hub's.
+        let ev = hub.event(EventBody::AttentionRaised(AttentionRaised {
+            attn_id: "n2".into(),
+            reason: AttentionReason::Stalled,
+            summary: "offline?".into(),
+            ext: offline,
+            ..Default::default()
+        }));
+        assert_eq!(f.push(ev), None);
+        assert_eq!(f.attention.get("n2").unwrap().offline_since, None);
     }
 
     #[test]

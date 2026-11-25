@@ -1417,6 +1417,292 @@
     ]
   },
   {
+    "id": "cli:gateway",
+    "title": "twr gateway",
+    "description": "Run the phones' gateway in the foreground (advanced: `twr phone` starts it for you).",
+    "group": "CLI · gateway",
+    "fields": [
+      {
+        "key": "listen",
+        "label": "listen",
+        "type": "text",
+        "description": "Where to listen. Default: 127.0.0.1:47321 with --tls-cert or --development; else the saved settings' addresses, or 0.0.0.0:47321 and [::]:47321",
+        "advanced": false
+      },
+      {
+        "key": "tls-cert",
+        "label": "tls cert",
+        "type": "text",
+        "description": "Serve this certificate (certificate mode), with --tls-key. Without them the gateway serves its own key, which phones pin (pinned mode)",
+        "advanced": false
+      },
+      {
+        "key": "tls-key",
+        "label": "tls key",
+        "type": "text",
+        "description": "The private key of --tls-cert's certificate, in PEM",
+        "advanced": false
+      },
+      {
+        "key": "address",
+        "label": "address",
+        "type": "text",
+        "description": "Pinned mode: the address invitations offer first, a DNS name or a forwarded host:port; saved for later runs. An empty one offers none",
+        "advanced": false
+      },
+      {
+        "key": "development",
+        "label": "development",
+        "type": "boolean",
+        "description": "Debug builds only: plaintext loopback for adb reverse and iOS Simulator",
+        "advanced": false
+      },
+      {
+        "key": "pair",
+        "label": "pair",
+        "type": "boolean",
+        "description": "Print a new one-use pairing code, valid for five minutes",
+        "advanced": false
+      },
+      {
+        "key": "pair-only",
+        "label": "pair only",
+        "type": "boolean",
+        "description": "Create a code for an already running gateway, then exit",
+        "advanced": false
+      },
+      {
+        "key": "read-only",
+        "label": "read only",
+        "type": "boolean",
+        "description": "Grant read access only. Cannot be combined with terminal or admin access",
+        "advanced": false
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Emit the short-lived invitation as JSON for native launchers",
+        "advanced": true
+      },
+      {
+        "key": "cancel-invitation",
+        "label": "cancel invitation",
+        "type": "boolean",
+        "description": "Cancel only the matching one-use invitation. Reads {code} from stdin",
+        "advanced": false
+      },
+      {
+        "key": "log-file",
+        "label": "log file",
+        "type": "text",
+        "description": "Desktop launcher: bounded, private operational log",
+        "advanced": false
+      },
+      {
+        "key": "allow-terminal",
+        "label": "allow terminal",
+        "type": "boolean",
+        "description": "Grant remote shells, attach, jobs and interactive CLI flows",
+        "advanced": false
+      },
+      {
+        "key": "allow-admin",
+        "label": "allow admin",
+        "type": "boolean",
+        "description": "Grant accounts, boxes, configuration and modes. Configuration can name commands the hub runs, so admin includes command execution and needs --allow-terminal",
+        "advanced": false
+      },
+      {
+        "key": "revoke",
+        "label": "revoke",
+        "type": "text",
+        "description": "",
+        "advanced": false
+      },
+      {
+        "key": "list-devices",
+        "label": "list devices",
+        "type": "boolean",
+        "description": "",
+        "advanced": false
+      },
+      {
+        "key": "stop-gateway",
+        "label": "stop gateway",
+        "type": "boolean",
+        "description": "Stop only the verified running gateway instance, leaving the hub alone",
+        "advanced": false
+      },
+      {
+        "key": "expected-instance",
+        "label": "expected instance",
+        "type": "text",
+        "description": "",
+        "advanced": false
+      },
+      {
+        "key": "gateway-info",
+        "label": "gateway info",
+        "type": "boolean",
+        "description": "Print this installation's verified gateway identity and process metadata, then exit",
+        "advanced": false
+      },
+      {
+        "key": "binary-dir",
+        "label": "binary dir",
+        "type": "text",
+        "description": "",
+        "advanced": false
+      },
+      {
+        "key": "push-config",
+        "label": "push config",
+        "type": "text",
+        "description": "",
+        "advanced": false
+      },
+      {
+        "key": "push-test-log",
+        "label": "push test log",
+        "type": "text",
+        "description": "",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "gateway"
+    ],
+    "cliFields": [
+      {
+        "key": "listen",
+        "flag": "--listen",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "tls-cert",
+        "flag": "--tls-cert",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "tls-key",
+        "flag": "--tls-key",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "address",
+        "flag": "--address",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "development",
+        "flag": "--development",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "pair",
+        "flag": "--pair",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "pair-only",
+        "flag": "--pair-only",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "read-only",
+        "flag": "--read-only",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "cancel-invitation",
+        "flag": "--cancel-invitation",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "log-file",
+        "flag": "--log-file",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "allow-terminal",
+        "flag": "--allow-terminal",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "allow-admin",
+        "flag": "--allow-admin",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "revoke",
+        "flag": "--revoke",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "list-devices",
+        "flag": "--list-devices",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "stop-gateway",
+        "flag": "--stop-gateway",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "expected-instance",
+        "flag": "--expected-instance",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "gateway-info",
+        "flag": "--gateway-info",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "binary-dir",
+        "flag": "--binary-dir",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "push-config",
+        "flag": "--push-config",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "push-test-log",
+        "flag": "--push-test-log",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
     "id": "cli:hub stop",
     "title": "twr hub stop",
     "description": "Stop the running hub (`hub.shutdown`) and wait until it has exited. It stops its local runtimes first, so their turns end; threads on remote boxes keep running under their runners. Nothing to do when no hub is running",
@@ -3081,6 +3367,295 @@
       {
         "key": "force",
         "flag": "--force",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:phone",
+    "title": "twr phone",
+    "description": "Pair a phone with this machine's hubs: shows a QR code and a one-use code for the twr app, and waits until the phone pairs (Ctrl-C cancels the code).",
+    "group": "CLI · phone",
+    "fields": [
+      {
+        "key": "read-only",
+        "label": "read only",
+        "type": "boolean",
+        "description": "Grant read access only",
+        "advanced": false
+      },
+      {
+        "key": "terminal",
+        "label": "terminal",
+        "type": "boolean",
+        "description": "Grant remote shells, attach and jobs too",
+        "advanced": false
+      },
+      {
+        "key": "admin",
+        "label": "admin",
+        "type": "boolean",
+        "description": "Grant accounts, boxes, configuration and modes too, and terminal access, which they include (configuration can name commands the hub runs)",
+        "advanced": false
+      },
+      {
+        "key": "address",
+        "label": "address",
+        "type": "text",
+        "description": "The address invitations offer first: a DNS name, or a forwarded host:port. Saved for later invitations; an empty one offers none",
+        "advanced": false
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the invitation as a JSON line, then how it ended as another; no terminal needed",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "phone"
+    ],
+    "cliFields": [
+      {
+        "key": "read-only",
+        "flag": "--read-only",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "terminal",
+        "flag": "--terminal",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "admin",
+        "flag": "--admin",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "address",
+        "flag": "--address",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:phone devices",
+    "title": "twr phone devices",
+    "description": "List the paired phones",
+    "group": "CLI · phone",
+    "fields": [
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "One JSON array",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "phone",
+      "devices"
+    ],
+    "cliFields": [
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:phone off",
+    "title": "twr phone off",
+    "description": "Stop the gateway, and keep a hub that starts from starting it. `twr phone` turns it back on",
+    "group": "CLI · phone",
+    "fields": [],
+    "cli": [
+      "phone",
+      "off"
+    ],
+    "cliFields": []
+  },
+  {
+    "id": "cli:phone rekey",
+    "title": "twr phone rekey",
+    "description": "Make the gateway a new key (and a new iroh key). Every paired phone pinned the old one: all of them are revoked and must pair again",
+    "group": "CLI · phone",
+    "fields": [],
+    "cli": [
+      "phone",
+      "rekey"
+    ],
+    "cliFields": []
+  },
+  {
+    "id": "cli:phone revoke",
+    "title": "twr phone revoke",
+    "description": "Revoke a paired phone (its id, or the start of it, from `twr phone devices`): it is disconnected at once and must pair again",
+    "group": "CLI · phone",
+    "fields": [
+      {
+        "key": "device",
+        "label": "device",
+        "type": "text",
+        "required": true,
+        "description": ""
+      }
+    ],
+    "cli": [
+      "phone",
+      "revoke"
+    ],
+    "cliFields": [
+      {
+        "key": "device",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:relay check-config",
+    "title": "twr relay check-config",
+    "description": "Check a configuration file as `serve` would read it, without starting anything",
+    "group": "CLI · relay",
+    "fields": [
+      {
+        "key": "path",
+        "label": "path",
+        "type": "text",
+        "required": true,
+        "description": ""
+      }
+    ],
+    "cli": [
+      "relay",
+      "check-config"
+    ],
+    "cliFields": [
+      {
+        "key": "path",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:relay probe",
+    "title": "twr relay probe",
+    "description": "Check a running relay end to end: info, a test hub with a phone through it, the record store, iroh admission and iroh's relay. Exits 1 if any check fails",
+    "group": "CLI · relay",
+    "fields": [
+      {
+        "key": "url",
+        "label": "url",
+        "type": "text",
+        "required": true,
+        "description": "`relay://host[:port][#pin]`"
+      },
+      {
+        "key": "connect",
+        "label": "connect",
+        "type": "text",
+        "description": "Connect to this address instead of resolving the URL's host",
+        "advanced": false
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print one JSON object",
+        "advanced": true
+      },
+      {
+        "key": "timeout",
+        "label": "timeout",
+        "type": "text",
+        "description": "Seconds per check [default: 15]",
+        "advanced": false
+      },
+      {
+        "key": "state",
+        "label": "state",
+        "type": "text",
+        "description": "Keep the probe's keys in this directory between runs, as monitoring should: the relay then sees one hub and one admitted pair, within its per-address limits",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "relay",
+      "probe"
+    ],
+    "cliFields": [
+      {
+        "key": "url",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "connect",
+        "flag": "--connect",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "timeout",
+        "flag": "--timeout",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "state",
+        "flag": "--state",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:relay url",
+    "title": "twr relay url",
+    "description": "Print the relay URL hubs use for this relay's configuration, with its pin when the relay's key is self-signed",
+    "group": "CLI · relay",
+    "fields": [
+      {
+        "key": "config",
+        "label": "config",
+        "type": "text",
+        "description": "",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "relay",
+      "url"
+    ],
+    "cliFields": [
+      {
+        "key": "config",
+        "flag": "--config",
         "many": false,
         "separator": false
       }
@@ -4890,13 +5465,40 @@
   {
     "id": "cli:ws",
     "title": "twr ws",
-    "description": "List, create or remove workspaces: separate hubs on this machine, each with its own orchestrator, threads, worktrees and trash, sharing the config file. `twr -w <name> <command>` (or `TWR_WORKSPACE=<name>`) runs a command in one; `default` is the usual one. Without a subcommand, lists them",
+    "description": "List, create, rename or remove workspaces, or choose the default one: separate hubs on this machine, each with its own orchestrator, threads, worktrees and trash, sharing the config file. `twr -w <name> <command>` (or `TWR_WORKSPACE=<name>`) runs a command in one; without either, commands run in the default workspace. Without a subcommand, lists them",
     "group": "CLI · ws",
     "fields": [],
     "cli": [
       "ws"
     ],
     "cliFields": []
+  },
+  {
+    "id": "cli:ws default",
+    "title": "twr ws default",
+    "description": "Show the default workspace, which commands without `-w` (or `TWR_WORKSPACE`) and a bare `twr` open; with a name, make that workspace the default",
+    "group": "CLI · ws",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": false,
+        "description": "The workspace to make the default"
+      }
+    ],
+    "cli": [
+      "ws",
+      "default"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
   },
   {
     "id": "cli:ws list",
@@ -4941,7 +5543,7 @@
   {
     "id": "cli:ws new",
     "title": "twr ws new",
-    "description": "Create a workspace (1-32 of [a-z0-9-], starting and ending with a letter or digit). Its hub starts on first use: `twr -w <name>`",
+    "description": "Create a workspace (1-32 of [a-z0-9-], starting and ending with a letter or digit). Its hub starts on first use: `twr -w <name>`. `default` makes the workspace in twr's own data directory again once it was removed",
     "group": "CLI · ws",
     "fields": [
       {
@@ -4966,9 +5568,49 @@
     ]
   },
   {
+    "id": "cli:ws rename",
+    "title": "twr ws rename",
+    "description": "Rename a workspace, `default` too. Nothing moves: its hub may keep running, and its threads, worktrees, sessions and branches stay as they are. Its original name keeps selecting it (`-w`), so no other workspace can take that name",
+    "group": "CLI · ws",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": "The workspace, by its name or its original name"
+      },
+      {
+        "key": "new_name",
+        "label": "new name",
+        "type": "text",
+        "required": true,
+        "description": "Its new name"
+      }
+    ],
+    "cli": [
+      "ws",
+      "rename"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "new_name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
     "id": "cli:ws rm",
     "title": "twr ws rm",
-    "description": "Remove a workspace's data for good: its log, orchestrator conversation and memory, and history. Refused while its hub runs, while it has threads (delete them first) or while its trash holds deleted threads (`twr -w <name> trash empty --all`). Lists what goes and asks y/N on a terminal (without one, only with --yes). Branches stay in their repositories",
+    "description": "Remove a workspace for good, `default` too: its log, orchestrator conversation and memory, and its input history. Refused while its hub runs, while it has threads (delete them first) or while its trash holds deleted threads (`twr -w <name> trash empty --all`). Lists what goes and asks y/N on a terminal (without one, only with --yes). Branches stay in their repositories; the config file, boxes, accounts and the other workspaces stay too",
     "group": "CLI · ws",
     "fields": [
       {

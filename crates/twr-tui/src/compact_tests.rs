@@ -93,6 +93,7 @@ pub(crate) fn notifier() -> Notifier {
             NotifyEvent::Error,
             NotifyEvent::Review,
             NotifyEvent::Hung,
+            NotifyEvent::Offline,
             NotifyEvent::Stalled,
             NotifyEvent::Report,
             NotifyEvent::Reply,

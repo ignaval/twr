@@ -418,30 +418,29 @@ async fn local(
     let mut running: HashMap<String, AbortOnDrop> = HashMap::new();
     loop {
         let names = match &workspaces {
-            Workspaces::Current => vec![paths.workspace_name().to_string()],
+            Workspaces::Current => vec![paths.workspace_id().to_string()],
             Workspaces::One(ws) => vec![ws.clone()],
-            Workspaces::All => {
-                let mut names = vec![DEFAULT_WORKSPACE.to_string()];
-                match root.named_workspaces() {
-                    Ok(n) => {
-                        names.extend(n);
-                        // A workspace removed since (`twr ws rm`): its task ends, and the
-                        // speaker hears it is gone.
-                        let gone: Vec<String> = running
-                            .keys()
-                            .filter(|w| !names.contains(w))
-                            .cloned()
-                            .collect();
-                        for ws in gone {
-                            running.remove(&ws);
-                            let why = "the workspace is gone".to_string();
-                            let _ = tx.send(LinkEvent::Detached { ws, why }).await;
-                        }
+            Workspaces::All => match root.workspace_ids() {
+                Ok(names) => {
+                    // A workspace removed since (`twr ws rm`): its task ends, and the
+                    // speaker hears it is gone.
+                    let gone: Vec<String> = running
+                        .keys()
+                        .filter(|w| !names.contains(w))
+                        .cloned()
+                        .collect();
+                    for ws in gone {
+                        running.remove(&ws);
+                        let why = "the workspace is gone".to_string();
+                        let _ = tx.send(LinkEvent::Detached { ws, why }).await;
                     }
-                    Err(e) => tracing::debug!("listing workspaces: {e}"),
+                    names
                 }
-                names
-            }
+                Err(e) => {
+                    tracing::debug!("listing workspaces: {e}");
+                    running.keys().cloned().collect()
+                }
+            },
         };
         for ws in names {
             running.entry(ws.clone()).or_insert_with(|| {

@@ -39,6 +39,10 @@
 //!   thread is not eligible), and the `error` item is raised when the stop is recorded or at
 //!   the next start, saying the turn was not retried.
 //!
+//! A due retry of a thread on the hub's own box waits until a check of the hub's internet
+//! connection run after the failure connected (`hub::net`, [`Core::net_holds_retry`]): at once
+//! when it is up, when it is back otherwise. Nothing else of the thread's queue runs meanwhile.
+//!
 //! A failed worker turn gets this `error` item instead of the `review` its `gave_up` grade
 //! would raise (one item per failure); its grade and report are logged as for any turn.
 //!
@@ -684,6 +688,11 @@ impl Core {
         let Some(failed) = self.due_retry(thread)? else {
             return Ok(None);
         };
+        // Not before a check of the hub's internet connection after the failure connected: a
+        // retry while it is down would fail the same way (`hub::net`).
+        if self.net_holds_retry(hub, thread, failed)? {
+            return Ok(None);
+        }
         // Resolving the failed turn's error items and starting its retry are one batch: the
         // item never closes without the retry that replaces it.
         let mut batch = Batch::default();

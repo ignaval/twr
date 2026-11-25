@@ -95,23 +95,69 @@ async fn probe(socket: &Path, deadline: tokio::time::Instant) -> Result<Probe> {
 /// which every `twr` calls too). Elsewhere it does nothing.
 pub use twr_link::forget_inherited_crash_handler;
 
-fn spawn_hub(paths: &Paths, socket: &Path, binary: &Path) -> Result<()> {
+/// A lock on a data directory's `twr.lock`, let go unlocked when dropped (not only closed: a
+/// process started meanwhile shares the open file until it execs), on every path.
+struct HeldLock(std::fs::File);
+
+impl Drop for HeldLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// Starts the hub of `paths` on `socket`, detached. `false`: none was started, as `default`'s
+/// lock is held (by a hub that is starting, a removal, or a command that looks at it a
+/// moment): [`ensure_hub`] tries again.
+fn spawn_hub(paths: &Paths, socket: &Path, binary: &Path) -> Result<bool> {
     use std::os::unix::process::CommandExt;
     anyhow::ensure!(
         binary.is_absolute() && binary.file_name().is_some_and(|s| s == "twr"),
         "A stable absolute twr executable is required"
     );
-    if paths.workspace.is_some() {
-        anyhow::ensure!(
-            paths.data_dir.is_dir(),
-            "Workspace does not exist; create it before connecting"
-        );
+    // A workspace that was removed (the root slot's too) is not made again here: only `twr ws
+    // new` makes one, and the hub checks again under its lock.
+    anyhow::ensure!(
+        paths.exists(),
+        "Workspace does not exist; create it before connecting"
+    );
+    match paths.workspace {
+        None => twr_core::paths::ensure_private_dir(&paths.data_dir)?,
+        Some(_) => twr_core::paths::check_private_dir(&paths.data_dir)?,
     }
-    twr_core::paths::ensure_private_dir(&paths.data_dir)?;
+    // `default`'s directory stays when it is removed: its log is opened under its lock (as
+    // `twr` starts a hub), which `twr ws rm` holds as it marks it removed, and only while it
+    // isn't.
+    let lock = match paths.workspace {
+        None => {
+            let path = paths.data_dir.join(twr_hub::LOCK_FILE);
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+                .with_context(|| format!("opening {}", path.display()))?;
+            match twr_hub::lock_opened(file, &path)? {
+                Some(lock) => {
+                    let lock = HeldLock(lock);
+                    anyhow::ensure!(
+                        paths.exists(),
+                        "Workspace does not exist; create it before connecting"
+                    );
+                    Some(lock)
+                }
+                None => return Ok(false),
+            }
+        }
+        Some(_) => None,
+    };
     let log = twr_core::paths::open_private_append(&paths.hub_log())?;
+    // The hub takes the lock itself.
+    drop(lock);
     let mut command = std::process::Command::new(binary);
     command
-        .args(["--workspace", paths.workspace_name(), "--socket"])
+        .args(["--workspace", paths.workspace_id(), "--socket"])
+        // The hub serves that id or none ([`twr_core::paths::WORKSPACE_ID_ENV`]).
+        .env(twr_core::paths::WORKSPACE_ID_ENV, paths.workspace_id())
         .arg(socket)
         .arg("hub")
         .stdin(Stdio::null())
@@ -138,7 +184,7 @@ fn spawn_hub(paths: &Paths, socket: &Path, binary: &Path) -> Result<()> {
     std::thread::spawn(move || {
         let _ = child.wait();
     });
-    Ok(())
+    Ok(true)
 }
 
 pub async fn ensure_hub(paths: &Paths, socket: &Path, binary: &Path) -> Result<Value> {
@@ -147,9 +193,9 @@ pub async fn ensure_hub(paths: &Paths, socket: &Path, binary: &Path) -> Result<V
     loop {
         match probe(socket, deadline).await? {
             Probe::Ready(info) => return Ok(info),
+            // Tried again while `default`'s lock is held by something else than a hub.
             Probe::Absent if !started => {
-                spawn_hub(paths, socket, binary)?;
-                started = true;
+                started = spawn_hub(paths, socket, binary)?;
             }
             _ => {}
         }

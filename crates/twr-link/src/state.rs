@@ -212,9 +212,20 @@ pub struct Owner {
 
 /// Atomic replacement and directory fsync: a successful acknowledgement survives a crash.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     let dir = path.parent().context("file has no parent")?;
     ensure_private_dir(dir)?;
+    write_in(dir, path, bytes)
+}
+/// [`atomic_write`] into a directory that must exist already (a workspace's data directory,
+/// which only `twr ws new` makes): one that does not is an error, never made, so a workspace
+/// `twr ws rm` removed meanwhile is not made again.
+pub fn atomic_write_existing(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path.parent().context("file has no parent")?;
+    twr_core::paths::check_private_dir(dir)?;
+    write_in(dir, path, bytes)
+}
+fn write_in(dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let mut temp = tempfile::NamedTempFile::new_in(dir)?;
     temp.as_file()
         .set_permissions(std::fs::Permissions::from_mode(0o600))?;

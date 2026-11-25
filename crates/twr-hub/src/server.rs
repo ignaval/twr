@@ -12,7 +12,7 @@
 //! | `box.restart`       | `{box}` (users only)                                | `{box, epoch}`: SSH box `box`'s supervisor ends its session and connects again with the relay's `--restart` (`crate::ssh_box`); `epoch`: the connection replaced |
 //! | `box.token`         | `{box}` (users only)                                | `{box, changed, accepting}`: token box `box` takes its token from `config.toml` / `boxes.toml` again, or none when they no longer give it one; a change drops its runner connection (`hub::boxes`). Never the token |
 //! | `box.agents`        | `{box, refresh?}` (`refresh`: users only)           | `{box, online, agents}`: the box's agent CLIs (`local`: the hub's own), probed again first with `refresh` (`hub::box_agents`); the orchestrator and agents see `runtime, found, login` of each |
-//! | `hub.shutdown`      | -                                                   | `{ok: true}` (then the hub stops) |
+//! | `hub.shutdown`      | `{if_idle?}`                                        | `{ok: true, if_idle}` (then the hub stops); with `if_idle` (the TUI's Delete), only while nothing would be lost, else `conflict` saying what |
 //! | `config.show`       | -                                                   | the configuration the hub loaded, from an allowlist (`hub::config_view`): no token, `env` value, preset command line, `ssh` destination or TLS file; `env` tables as `env_names` (not for agents) |
 //! | `config.set`        | `{key, value}` (`key` dotted, `value` a boolean, number or string; a device needs `admin`; not for agents) | `{status: "applied", key, value, before, effect}`, or for the orchestrator and a key that goes on the confirm card `{status: "needs_confirmation", key, value, before, effect, message}`: one key of `config.toml` set, its comments and the rest of the file kept, and `config.changed` recorded (`hub::config_set`). The orchestrator's only in a turn of the user's latest message (`relay_forbidden` otherwise); boxes, `hub.tls`, `env` entries, command lines and secret-looking values are refused for everyone (`bad_request`) |
 //! | `thread.spawn` | `{operation_id, request: <thread.new params>, prompt?}` | durable operation (pending/complete/error) |
@@ -722,6 +722,7 @@ pub const METHODS: &[&str] = &[
     "device.pair_begin",
     "device.pair_complete",
     "device.pair_cancel",
+    "device.pair_proof",
     "device.list",
     "device.revoke",
     "say",
@@ -1135,7 +1136,10 @@ async fn connection(
             if !device.allows_params(&req.method, &req.params)
                 || matches!(
                     req.method.as_str(),
-                    "device.pair_begin" | "device.pair_complete" | "device.pair_cancel"
+                    "device.pair_begin"
+                        | "device.pair_complete"
+                        | "device.pair_cancel"
+                        | "device.pair_proof"
                 )
             {
                 let _ = send(
@@ -1466,6 +1470,17 @@ async fn connection(
             // What the caller sees of the box depends on who it is (`hub::box_agents`).
             "box.agents" => {
                 let result = box_agents(&hub, &conn, &caller, req.params).await;
+                let resp = match result {
+                    Ok(v) => Response::ok(id, v),
+                    Err(e) => Response::err(id, e),
+                };
+                if send(&writer, &resp).await.is_err() {
+                    break;
+                }
+            }
+            // Its Argon2id runs off the runtime's threads ([`pair_begin`]).
+            "device.pair_begin" => {
+                let result = pair_begin(&hub, req.params).await;
                 let resp = match result {
                     Ok(v) => Response::ok(id, v),
                     Err(e) => Response::err(id, e),
@@ -2723,7 +2738,7 @@ async fn hello(hub: &Hub, conn: &mut Conn, p: Value) -> Result<Value, RpcError> 
         conn.client = format!("device:{}", device.id);
         conn.device = Some(device);
         return Ok(
-            json!({"client":conn.client,"identity":format!("user:{}",conn.client),"workspace":hub.workspace()}),
+            json!({"client":conn.client,"identity":format!("user:{}",conn.client),"workspace":hub.workspace(),"workspace_name":hub.workspace_name()}),
         );
     }
     if conn.device.is_some() {
@@ -2788,7 +2803,7 @@ async fn hello(hub: &Hub, conn: &mut Conn, p: Value) -> Result<Value, RpcError> 
             conn.client = p.client;
             conn.token = Some(token);
             Ok(
-                json!({ "client": conn.client, "identity": "orchestrator", "workspace": hub.workspace() }),
+                json!({ "client": conn.client, "identity": "orchestrator", "workspace": hub.workspace(), "workspace_name": hub.workspace_name() }),
             )
         }
         // Once a connection presented a token it stays the orchestrator's (or nobody's, when
@@ -2812,7 +2827,12 @@ async fn hello(hub: &Hub, conn: &mut Conn, p: Value) -> Result<Value, RpcError> 
             conn.client = p.client;
             conn.token = None;
             let identity = conn.identity(&Caller::user(conn.client.clone()));
-            let mut out = json!({ "client": conn.client, "identity": identity, "workspace": hub.workspace() });
+            let mut out = json!({
+                "client": conn.client,
+                "identity": identity,
+                "workspace": hub.workspace(),
+                "workspace_name": hub.workspace_name(),
+            });
             if let Some(why) = conn.why() {
                 out["why"] = json!(why);
             }
@@ -3046,6 +3066,26 @@ fn search_call(hub: &Hub, method: &str, p: Value) -> Result<Value, RpcError> {
     }
 }
 
+/// `device.pair_begin`: a new invitation (`twr_core::devices::Auth::begin`), whose proof key
+/// Argon2id derives, off the runtime's threads.
+async fn pair_begin(hub: &Hub, p: Value) -> Result<Value, RpcError> {
+    let auth = hub
+        .device_auth()
+        .map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))?;
+    let scopes: Vec<String> = p
+        .get("scopes")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))?
+        .unwrap_or_else(|| vec!["read".into(), "operate".into()]);
+    let code = tokio::task::spawn_blocking(move || auth.begin(scopes))
+        .await
+        .map_err(|e| RpcError::new(codes::INTERNAL, e.to_string()))?
+        .map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))?;
+    Ok(json!({"code":code,"expires_in":twr_core::devices::PAIRING_SECONDS}))
+}
+
 fn call(
     hub: &Hub,
     conn: &mut Conn,
@@ -3055,21 +3095,32 @@ fn call(
 ) -> Result<Value, RpcError> {
     let client = conn.client.clone();
     match method {
-        "device.pair_begin" => {
-            let auth = hub
+        // The gateway's typed-pairing proof (docs/design/phone-pairing.md): for the pin it
+        // serves, the phone's nonce and its own id, from the open invitation's proof key.
+        "device.pair_proof" => {
+            use twr_core::phone_pairing::{b64url_decode, b64url_encode, decode_pin, NONCE_LEN};
+            let bad = |what: &str| RpcError::new(codes::BAD_REQUEST, what.to_string());
+            let nonce = p["nonce"]
+                .as_str()
+                .and_then(|n| b64url_decode(n).ok())
+                .filter(|n| n.len() == NONCE_LEN)
+                .ok_or_else(|| bad("a nonce is 32 bytes, base64url"))?;
+            let pin = p["pin"]
+                .as_str()
+                .and_then(|pin| decode_pin(pin).ok())
+                .ok_or_else(|| bad("a pin is 32 bytes, base64url"))?;
+            let gateway_id = p["gateway_id"]
+                .as_str()
+                .filter(|id| {
+                    id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+                })
+                .ok_or_else(|| bad("a gateway id is a UUID"))?;
+            let proof = hub
                 .device_auth()
-                .map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))?;
-            let scopes: Vec<String> = p
-                .get("scopes")
-                .cloned()
-                .map(serde_json::from_value)
-                .transpose()
+                .and_then(|auth| auth.proof(&pin, &nonce, gateway_id))
                 .map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))?
-                .unwrap_or_else(|| vec!["read".into(), "operate".into()]);
-            let code = auth
-                .begin(scopes)
-                .map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))?;
-            Ok(json!({"code":code,"expires_in":300}))
+                .ok_or_else(|| RpcError::new(codes::NOT_FOUND, "no pairing invitation is open"))?;
+            Ok(json!({"proof":b64url_encode(&proof)}))
         }
         "device.pair_cancel" => {
             let cancelled = hub
@@ -3111,7 +3162,23 @@ fn call(
             }
             Ok(info)
         }
-        "hub.shutdown" => Ok(json!({ "ok": true })),
+        "hub.shutdown" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct ShutdownParams {
+                #[serde(default)]
+                if_idle: bool,
+            }
+            let p: ShutdownParams = if p.is_null() {
+                ShutdownParams::default()
+            } else {
+                params(p)?
+            };
+            if p.if_idle {
+                hub.shutdown_if_idle()?;
+            }
+            Ok(json!({ "ok": true, "if_idle": p.if_idle }))
+        }
         "config.show" => Ok(hub.config_show()),
         "thread.spawn" => {
             #[derive(Default, Deserialize)]
@@ -3853,6 +3920,94 @@ mod tests {
         auth.revoke(&device.id).unwrap();
         assert_eq!(call(5, "hub.info", Value::Null).await, None);
         served.await.unwrap();
+    }
+
+    /// `device.pair_proof` is the user's alone, as `device.pair_begin` is: a paired device,
+    /// even an admin one, is refused it, and so are a thread's agent and the orchestrator. For
+    /// the user it gives the open invitation's proof (404 without one, 400 for a bad nonce).
+    #[tokio::test]
+    async fn pair_proofs_are_the_users_alone() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use twr_core::phone_pairing::{b64url_decode, b64url_encode, pin_bytes, proof_key};
+        for method in ["device.pair_proof", "device.pair_begin"] {
+            assert!(METHODS.contains(&method));
+            assert!(!AGENT_METHODS.contains(&method), "{method}");
+            assert!(!ORCHESTRATOR_METHODS.contains(&method), "{method}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = HubOptions::new(dir.path().join("twr.db"), Config::default());
+        options.config_file = Some(dir.path().join("config.toml"));
+        let hub = Hub::open(options).await.unwrap();
+        let auth = hub.device_auth().unwrap();
+        let all = ["read", "operate", "terminal", "admin"]
+            .map(String::from)
+            .to_vec();
+        let code = auth.begin(all).unwrap();
+        let (_, token) = auth.pair(&code, "Admin phone").unwrap();
+        let open = |hub: &Hub| {
+            let (a, b) = UnixStream::pair().unwrap();
+            tokio::spawn(connection(
+                hub.clone(),
+                a,
+                "cli".into(),
+                Arc::new(SubCount::default()),
+            ));
+            let (r, w) = b.into_split();
+            (BufReader::new(r).lines(), w)
+        };
+        let (pin, nonce) = (pin_bytes(b"spki"), [5u8; 32]);
+        let gateway = "8b0f5c7e-2a44-4b8e-9d21-6a4e1c3f7b90";
+        let params = |nonce: &[u8]| json!({"nonce": b64url_encode(nonce), "pin": b64url_encode(&pin), "gateway_id": gateway});
+        let (mut lines, mut w) = open(&hub);
+        let mut call = async |id: u64, method: &str, params: Value| -> Value {
+            let req = json!({"id": id, "method": method, "params": params});
+            w.write_all(format!("{req}\n").as_bytes()).await.unwrap();
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap()
+        };
+        let r = call(
+            1,
+            "hello",
+            json!({"client": "cli", "protocol": PROTOCOL_VERSION}),
+        )
+        .await;
+        assert!(r["result"].is_object(), "{r}");
+        let r = call(2, "device.pair_proof", params(&nonce)).await;
+        assert_eq!(r["error"]["code"], codes::NOT_FOUND, "{r}");
+        let r = call(3, "device.pair_begin", json!({"scopes": ["read"]})).await;
+        let code = r["result"]["code"].as_str().unwrap().to_owned();
+        let r = call(4, "device.pair_proof", params(&nonce)).await;
+        let proof = b64url_decode(r["result"]["proof"].as_str().unwrap()).unwrap();
+        let key = proof_key(&code).unwrap();
+        assert!(twr_core::phone_pairing::verify_pin_proof(
+            &key, &pin, &nonce, gateway, &proof
+        ));
+        let r = call(5, "device.pair_proof", params(&nonce[..16])).await;
+        assert_eq!(r["error"]["code"], codes::BAD_REQUEST, "{r}");
+        let mut bad_id = params(&nonce);
+        bad_id["gateway_id"] = json!("x");
+        let r = call(6, "device.pair_proof", bad_id).await;
+        assert_eq!(r["error"]["code"], codes::BAD_REQUEST, "{r}");
+        // A device, admin included, never asks for one.
+        let (mut lines, mut w) = open(&hub);
+        let mut call = async |id: u64, method: &str, params: Value| -> Value {
+            let req = json!({"id": id, "method": method, "params": params});
+            w.write_all(format!("{req}\n").as_bytes()).await.unwrap();
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap()
+        };
+        let hi =
+            json!({"client": "mobile-test", "protocol": PROTOCOL_VERSION, "device_token": token});
+        let r = call(1, "hello", hi).await;
+        assert!(
+            r["result"]["identity"]
+                .as_str()
+                .unwrap()
+                .starts_with("user:device:"),
+            "{r}"
+        );
+        for (id, method) in [(2, "device.pair_proof"), (3, "device.pair_begin")] {
+            let r = call(id, method, params(&nonce)).await;
+            assert_eq!(r["error"]["code"], codes::UNAUTHORIZED, "{method}: {r}");
+        }
     }
 
     /// A peer whose credentials cannot be read, or name no pid the hub can see, is no user: it

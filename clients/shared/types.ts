@@ -56,6 +56,31 @@ export interface Attention {
   loop_setup?: boolean;
   /** A stuck loop's item: only the user answers it (resume, stop); never dismissed. */
   loop_stuck?: boolean;
+  /** The hub raised it because its machine has no internet connection (twr-core
+   * `AttentionItem::offline_since`, RFC 3339): its notice on the hub's thread, or a thread's
+   * stall while the connection was down. */
+  offline_since?: string;
+  /** A delete card in short (twr-core `DeleteBrief`): shown before its whole summary. */
+  delete?: DeleteBrief;
+}
+/** A delete card in short (twr-core `DeleteBrief`, `AttentionItem::delete`). */
+export interface DeleteBrief {
+  /** The question: "Delete 5 threads?". */
+  title: string;
+  /** Why this card replaces another one. */
+  note?: string;
+  threads: {
+    name: string;
+    project?: string;
+    /** What deleting it loses: "2 unpushed commits, 3 uncommitted files". */
+    risk: string;
+    /** It cannot be deleted as things are (the summary says why). */
+    refused?: boolean;
+    /** It loses nothing not kept elsewhere or in the trash. */
+    clean?: boolean;
+  }[];
+  /** What goes for good, and how long the trash keeps the rest. */
+  total?: string;
 }
 export interface ViewState {
   threads: Thread[];
@@ -130,7 +155,10 @@ export interface InboxSource {
   updatedAt?: number;
   hubId: string;
   hubName: string;
+  /** The workspace's id, which its hub reports as `workspace` (a rename leaves it). */
   workspace: string;
+  /** Its name as shown, when known (`twr ws list`); its id otherwise. */
+  workspaceName?: string;
   attention: Attention[];
   threads: Thread[];
   cached?: boolean;
@@ -142,9 +170,22 @@ export interface FilePickRequest {
   title?: string;
   filters?: { name: string; extensions: string[] }[];
 }
+/** A running workspace hub whose engine differs from the app's (`shared/engineHubs`). */
+export interface EngineHub {
+  /** The workspace's id, which keys it (`twr ws list --json`'s `id`). */
+  workspace: string;
+  /** Its name as shown, when it is not its id (a renamed workspace). */
+  name?: string;
+  /** `"version"`: another twr version; `"build"`: the same version, another build. */
+  difference: "version" | "build";
+  version: string;
+  build?: string;
+}
 export interface DesktopAPI {
   sendMessage?(message: import("./offline").DurableMessage): Promise<Json>;
   inboxSources?(): Promise<InboxSource[]>;
+  /** Every running workspace hub whose engine differs from the app's bundled one. */
+  engineHubs?(): Promise<EngineHub[]>;
   secureRead?(key: string): Promise<string | null>;
   secureWrite?(key: string, value: string): Promise<void>;
   secureDelete?(key: string): Promise<void>;
@@ -177,6 +218,8 @@ export interface DesktopAPI {
   copyText(text: string): Promise<void>;
   bootstrap(): Promise<{
     workspace: string;
+    /** `workspace` is a name a person gave (the desktop app's `TWR_WORKSPACE`), not an id. */
+    typed?: boolean;
     hostId?: string;
     scopes?: string[];
     allowed_methods?: string[];
@@ -186,7 +229,12 @@ export interface DesktopAPI {
     theme: Record<string, string> | null;
     terminals: TerminalSession[];
   }>;
-  connect(workspace: string): Promise<Json>;
+  /**
+   * Connects workspace `workspace`: a name or an id (`/ws`, a name typed), or with `byId` an id
+   * the app holds (from a listing, the bootstrap, a push, an inbox source), reached by that id
+   * alone: once it is gone, never another workspace renamed into it.
+   */
+  connect(workspace: string, options?: { byId?: boolean }): Promise<Json>;
   rpc(method: string, params?: Json): Promise<Json>;
   cli(
     args: string[],
@@ -229,7 +277,10 @@ export interface DesktopAPI {
 }
 /** One request waiting on the user, in a summary for the host app. */
 export interface AttentionSummaryItem {
+  /** Its workspace's id. */
   workspace: string;
+  /** Its workspace's name as shown, when it is not its id (a renamed workspace). */
+  workspaceName?: string;
   thread: string;
   /** The thread's name. */
   title: string;
@@ -243,9 +294,11 @@ export interface AttentionSummaryItem {
   /**
    * The hub's own cards, which only the user answers: `confirm`, what the orchestrator
    * proposed from your message; `delete`, a deletion of threads; `loop_setup`, the settings
-   * a loop starts on; `loop_stuck`, a loop that waits for you to resume or stop it.
+   * a loop starts on; `loop_stuck`, a loop that waits for you to resume or stop it;
+   * `offline`, the hub's machine has no internet connection (its notice, or a thread's stall
+   * while it is down).
    */
-  card?: "confirm" | "delete" | "loop_setup" | "loop_stuck";
+  card?: "confirm" | "delete" | "loop_setup" | "loop_stuck" | "offline";
   /** Still being raised: not notified until it is complete. */
   incomplete?: boolean;
 }

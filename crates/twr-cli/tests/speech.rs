@@ -22,6 +22,7 @@ fn command(home: &Path, args: &[&str]) -> Command {
     c.args(args)
         .env("TWR_HOME", home)
         .env_remove("TWR_WORKSPACE")
+        .env_remove("TWR_WORKSPACE_ID")
         .env_remove("RUST_LOG")
         .env_remove("TWR_SSH")
         .env_remove("TWR_MOSH")

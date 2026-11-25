@@ -6,9 +6,11 @@
 //! its branch, kept `[trash] keep_days` (then purged; `twr trash empty` sooner, `twr trash
 //! restore` puts the thread back). So a loss the card misses can still be recovered. The
 //! request raises a delete card: a question the hub raises on [`HUB_THREAD`] (`ext.twr.`[`DELETE_KEY`] = `{threads:
-//! [{thread, name, lifecycle}], losses: [{thread, pending, loss}], asked_by, replaces?}`, options
-//! [`DELETE`] and [`CANCEL`]) whose summary says what goes with each thread, and which records
-//! it (`losses`, a [`Loss`] each, so a replay knows what the card said):
+//! [{thread, name, lifecycle}], losses: [{thread, pending, loss}], asked_by, replaces?, brief}`,
+//! options [`DELETE`] and [`CANCEL`]) whose summary says what goes with each thread, and which
+//! records it (`losses`, a [`Loss`] each, so a replay knows what the card said). `brief`
+//! ([`DeleteBrief`], [`card_brief`]) says it in short for clients that show the summary behind
+//! it: a line each with what [`Loss::short`] says, and what goes for good. The summary says:
 //!
 //! - the runtime (stopped);
 //! - the hub-managed worktree (with its size on disk) and what it holds, all moved to the
@@ -504,6 +506,29 @@ impl Loss {
         }
     }
 
+    /// What deleting the thread loses, in a few words, for the card's short form
+    /// ([`card_brief`]): [`Loss::short`], and that it cannot be undone (nothing of it goes to
+    /// the trash) or cannot be done now.
+    /// Also whether that is nothing: all of it is kept elsewhere or in the trash.
+    fn risk(&self, name: &str, pending: u64) -> (String, bool) {
+        let short = self.short(pending);
+        let mut clean = short == "nothing unique";
+        let mut out = if clean {
+            "no uncommitted or unpushed work".to_string()
+        } else {
+            short
+        };
+        if !self.trashes() {
+            out.push_str("; cannot be undone");
+            clean = false;
+        }
+        if !self.refusals(name).is_empty() {
+            out.push_str("; cannot be deleted now");
+            clean = false;
+        }
+        (out, clean)
+    }
+
     /// Why deleting the thread `name` is refused as things are: each linked worktree in its
     /// worktree whose record stays behind ([`twr_core::git::LinkedWorktree::refusal`]), and a
     /// file system mounted in it, or where they are mounted unknown
@@ -928,6 +953,82 @@ fn card_summary(targets: &[Target], header: Option<&str>, keep_days: u64) -> Str
     }
 }
 
+/// The card for `targets` in short ([`DeleteBrief`]): its question, `header` (why it replaces
+/// another card), a line each and what goes for good; the summary ([`card_summary`]) says all
+/// of it.
+fn card_brief(targets: &[Target], header: Option<&str>, keep_days: u64) -> DeleteBrief {
+    let title = match targets {
+        [one] => format!(
+            "Delete thread {}{}?",
+            one.view.name,
+            in_project(one.view.project.as_deref())
+        ),
+        _ => format!("Delete {} threads?", targets.len()),
+    };
+    let threads = targets
+        .iter()
+        .map(|t| {
+            let (risk, clean) = t.loss.risk(&t.view.name, t.pending);
+            DeleteBriefThread {
+                name: t.view.name.clone(),
+                project: t.view.project.clone(),
+                risk,
+                refused: !t.loss.refusals(&t.view.name).is_empty(),
+                clean,
+            }
+        })
+        .collect();
+    let present = |t: &&Target| !t.loss.worktree_missing;
+    let inventories = || {
+        targets
+            .iter()
+            .filter(present)
+            .filter_map(|t| t.loss.inventory.as_ref())
+    };
+    let deleted: u64 = inventories().map(|i| i.build_output_bytes).sum();
+    let trashed: u64 = targets
+        .iter()
+        .filter(|t| t.loss.trashes())
+        .filter_map(|t| t.loss.inventory.as_ref())
+        .map(|i| i.bytes)
+        .sum();
+    let days = format!("{keep_days} day{}", if keep_days == 1 { "" } else { "s" });
+    let size = |bytes: u64| {
+        if bytes > 0 {
+            format!(" ({})", human_bytes(bytes))
+        } else {
+            String::new()
+        }
+    };
+    let total = match (deleted > 0, targets.iter().any(|t| t.loss.trashes())) {
+        (true, true) => Some(format!(
+            "Deletes {} of build output outright; the rest{} goes to the trash for {days}.",
+            human_bytes(deleted),
+            size(trashed)
+        )),
+        (true, false) => Some(format!(
+            "Deletes {} of build output outright.",
+            human_bytes(deleted)
+        )),
+        (false, true) => Some(format!(
+            "{}{} go to the trash for {days}.",
+            if targets.len() == 1 {
+                "Its worktree and branch"
+            } else {
+                "Their worktrees and branches"
+            },
+            size(trashed)
+        )),
+        (false, false) => None,
+    };
+    DeleteBrief {
+        title,
+        note: header.map(str::to_string),
+        threads,
+        total,
+    }
+}
+
 /// What each thread of `targets` has to lose that `card` did not say: `name: what, ...` per
 /// thread with something new (a card that did not record what it said for a thread: all of it
 /// is new).
@@ -1276,6 +1377,7 @@ impl Core {
             "threads": threads,
             "losses": losses,
             "asked_by": asked_by,
+            DELETE_BRIEF_KEY: card_brief(targets, header, hub.config.trash.keep_days),
         });
         let mut batch = Batch::default();
         if let Some(old) = replaces {
@@ -2967,6 +3069,111 @@ mod tests {
             s.ends_with("That holds 3.0 GB on disk until then (`twr trash empty` frees it)."),
             "{s}"
         );
+    }
+
+    /// The card in short: its question, a line each with what nothing else keeps, and what
+    /// goes for good; recorded with the card, and read back by clients' fold.
+    #[test]
+    fn a_card_in_short_has_a_line_each() {
+        let view = |name: &str, project: Option<&str>| ThreadView {
+            name: name.into(),
+            project: project.map(str::to_string),
+            ..Default::default()
+        };
+        let mut api = WorktreeInventory {
+            dirty: Listed::new((0..3).map(|i| format!("f{i}"))),
+            bytes: 32 << 20,
+            build_output: Listed::new(["target/".to_string()]),
+            build_output_bytes: 397 << 20,
+            ..Default::default()
+        };
+        let targets = [
+            Target {
+                id: "t1".into(),
+                view: view("api", Some("twr")),
+                loss: Loss {
+                    worktree: Some("/w/api".into()),
+                    inventory: Some(api.clone()),
+                    branch: Some("twr/api".into()),
+                    branch_only_commits: Some(0),
+                    commits: Some(Listed::default()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Target {
+                id: "t2".into(),
+                view: view("old", Some("twr")),
+                loss: Loss {
+                    worktree: Some("/w/old".into()),
+                    worktree_missing: true,
+                    inventory: Some(WorktreeInventory {
+                        gone: true,
+                        ..Default::default()
+                    }),
+                    branch: Some("twr/old".into()),
+                    branch_only_commits: Some(2),
+                    commits: Some(Listed::new(["a".to_string(), "b".to_string()])),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Target {
+                id: "t3".into(),
+                view: view("notes", None),
+                loss: Loss {
+                    directory: Some("/n".into()),
+                    commits: Some(Listed::default()),
+                    ..Default::default()
+                },
+                pending: 1,
+                ..Default::default()
+            },
+        ];
+        let brief = card_brief(&targets, Some("This card replaces x."), 7);
+        let line = |name: &str, project: Option<&str>, risk: &str| DeleteBriefThread {
+            name: name.into(),
+            project: project.map(str::to_string),
+            risk: risk.into(),
+            refused: false,
+            clean: false,
+        };
+        assert_eq!(
+            brief,
+            DeleteBrief {
+                title: "Delete 3 threads?".into(),
+                note: Some("This card replaces x.".into()),
+                threads: vec![
+                    line("api", Some("twr"), "3 uncommitted files"),
+                    line("old", Some("twr"), "2 unpushed commits"),
+                    line("notes", None, "1 queued prompt (dropped); cannot be undone"),
+                ],
+                total: Some(
+                    "Deletes 397 MB of build output outright; the rest (32 MB) goes to the \
+                     trash for 7 days."
+                        .into()
+                ),
+            }
+        );
+        // One clean thread, nothing deleted outright.
+        api.dirty = Listed::default();
+        api.build_output = Listed::default();
+        api.build_output_bytes = 0;
+        let mut clean = targets[0].clone_for_test();
+        clean.loss.inventory = Some(api);
+        let one = card_brief(&[clean], None, 1);
+        assert_eq!(one.title, "Delete thread api (project twr)?");
+        assert_eq!(one.threads[0].risk, "no uncommitted or unpushed work");
+        assert!(one.threads[0].clean);
+        assert_eq!(
+            one.total.as_deref(),
+            Some("Its worktree and branch (32 MB) go to the trash for 1 day.")
+        );
+        // What clients get: the brief from the raise's `ext`.
+        let ext = json!({ "twr": { DELETE_KEY: { DELETE_BRIEF_KEY: &one } } });
+        let ext = ext.as_object().cloned();
+        assert_eq!(delete_brief(HUB_THREAD, &ext), Some(one));
+        assert_eq!(delete_brief("t1", &ext), None);
     }
 
     /// Reservations: one repository of a box at a time, every one of it for a deletion that

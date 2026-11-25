@@ -1,7 +1,55 @@
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import {
+  type RefObject,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Markdown } from "./ui";
 import { ThreadMessage } from "./ThreadMessage";
 import type { Thread } from "./types";
+import { cursorHost } from "./working";
+
+/** The attribute that puts the working cursor after an element's text (style.css). */
+export const CURSOR_ATTRIBUTE = "data-working-cursor";
+
+/** While `working`, the working cursor follows the last text in `ref`'s element, wherever
+ * the Markdown puts it (a paragraph, a list item, a code block): the element holding it
+ * gets {@link CURSOR_ATTRIBUTE}, and keeps it as the text grows. A pseudo-element draws
+ * it, so it is never copied or read out. */
+function useWorkingCursor(
+  ref: RefObject<HTMLElement | null>,
+  working: boolean,
+) {
+  useLayoutEffect(() => {
+    const root = ref.current;
+    if (!working || !root) return;
+    let host: Element | undefined;
+    const place = () => {
+      const next = cursorHost(root);
+      if (next === host) return;
+      host?.removeAttribute(CURSOR_ATTRIBUTE);
+      next.setAttribute(CURSOR_ATTRIBUTE, "");
+      host = next;
+    };
+    place();
+    const observer =
+      typeof MutationObserver === "function"
+        ? new MutationObserver(place)
+        : undefined;
+    observer?.observe(root, {
+      childList: true,
+      characterData: true,
+      subtree: true,
+    });
+    return () => {
+      observer?.disconnect();
+      host?.removeAttribute(CURSOR_ATTRIBUTE);
+    };
+  }, [ref, working]);
+}
 
 /** How often a still-streaming reply is parsed as Markdown again: each parse covers the
  * whole reply, so longer replies are parsed less often (250 ms, up to once a second). */
@@ -40,6 +88,7 @@ export function MessageBody({
   mono = false,
   clamp = true,
   streaming = false,
+  working = false,
   threadTags = false,
   threads,
   turnStartedAt,
@@ -50,6 +99,8 @@ export function MessageBody({
   mono?: boolean;
   clamp?: boolean;
   streaming?: boolean;
+  /** Show the working cursor at the end of the text: the turn writing it still runs. */
+  working?: boolean;
   /** Only orchestrator assistant replies use the thread section protocol. */
   threadTags?: boolean;
   threads?: Thread[];
@@ -65,6 +116,7 @@ export function MessageBody({
     onExpandedChange?.(value);
   };
   const id = useId();
+  const body = useRef<HTMLDivElement>(null);
   const parsed = useStreamingText(text, streaming && !mono);
   const { long, preview } = useMemo(() => {
     if (!clamp) return { long: false, preview: parsed };
@@ -88,9 +140,15 @@ export function MessageBody({
   }, [parsed, clamp]);
   const collapsed = long && !expanded;
   const content = collapsed ? preview : parsed;
+  // A collapsed reply hides its end: the cursor waits beside "Show full message" instead.
+  useWorkingCursor(body, working && !collapsed);
   return (
     <>
-      <div className={`message-body ${collapsed ? "clamped" : ""}`} id={id}>
+      <div
+        className={`message-body ${collapsed ? "clamped" : ""}`}
+        id={id}
+        ref={body}
+      >
         {mono ? (
           <pre>{content}</pre>
         ) : threadTags ? (
@@ -113,6 +171,9 @@ export function MessageBody({
         >
           {expanded ? "Show less" : "Show full message"}
         </button>
+      )}
+      {working && collapsed && (
+        <span className="working-cursor message-working" aria-hidden="true" />
       )}
     </>
   );

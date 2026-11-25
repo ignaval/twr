@@ -7,6 +7,7 @@ import type {
   Thread,
 } from "./types";
 import { endedWords, requestLine, type LastLoop } from "./loops";
+import { isOffline } from "./connectivity";
 
 /** The most items a summary lists; `count` still counts every one. */
 export const SUMMARY_MAX_ITEMS = 200;
@@ -30,16 +31,24 @@ const HUB_THREAD = "hub";
  * `proposal` (twr-core `is_confirm_card`), a delete card when it offers Delete (its options
  * are `Delete`/`Cancel`; a confirm card's are `Confirm`/`Cancel`); a loop's setup card or a
  * stuck loop's item, which the hub marks on the loop's thread (`AttentionItem::loop_setup`,
- * `loop_stuck`). Every one of them needs the user, whatever its reason.
+ * `loop_stuck`). Every one of them needs the user, whatever its reason. And an item the hub
+ * raised because its machine has no internet connection (`AttentionItem::offline_since`):
+ * `offline`.
  */
 export function cardOf(
   item: Pick<
     Attention,
-    "thread" | "proposal" | "options" | "loop_setup" | "loop_stuck"
+    | "thread"
+    | "proposal"
+    | "options"
+    | "loop_setup"
+    | "loop_stuck"
+    | "offline_since"
   >,
 ): AttentionSummaryItem["card"] {
   if (item.loop_setup === true) return "loop_setup";
   if (item.loop_stuck === true) return "loop_stuck";
+  if (isOffline(item)) return "offline";
   if (item.thread !== HUB_THREAD || item.proposal !== true) return undefined;
   return Array.isArray(item.options) && item.options.includes("Delete")
     ? "delete"
@@ -58,6 +67,7 @@ const order = (a: string, b: string) =>
  */
 export function attentionSummary({
   current,
+  currentName,
   hubId,
   live,
   liveStream,
@@ -66,6 +76,8 @@ export function attentionSummary({
   loopRounds,
 }: {
   current: string;
+  /** The shown workspace's name, when it is not its id. */
+  currentName?: string;
   hubId: string;
   /** The shown workspace's view; none while it connects, when its last read stands in. */
   live?: { threads: Thread[]; attention: Attention[] };
@@ -78,6 +90,8 @@ export function attentionSummary({
 }): AttentionSummary {
   const lists: {
     name: string;
+    /** Its name as shown, when it is not its id. */
+    label?: string;
     stream?: string;
     threads: Thread[];
     attention: Attention[];
@@ -85,12 +99,19 @@ export function attentionSummary({
   const seen = new Set<string>();
   const read = (source: InboxSource) => ({
     name: source.workspace,
+    label: source.workspaceName,
     stream: currentSource(source) ? `read:${hubId}` : undefined,
     threads: Array.isArray(source.threads) ? source.threads : [],
     attention: Array.isArray(source.attention) ? source.attention : [],
   });
   const own = sources.filter((source) => source.hubId === hubId);
-  if (live) lists.push({ name: current, stream: liveStream, ...live });
+  if (live)
+    lists.push({
+      name: current,
+      label: currentName,
+      stream: liveStream,
+      ...live,
+    });
   else {
     const source = own.find((s) => s.workspace === current);
     if (source) lists.push({ ...read(source), stream: undefined });
@@ -127,6 +148,9 @@ export function attentionSummary({
       const card = cardOf(item);
       items.push({
         workspace: list.name,
+        ...(list.label && list.label !== list.name
+          ? { workspaceName: list.label.slice(0, 64) }
+          : {}),
         thread: item.thread,
         // The hub's own questions are on its thread `hub`; they are twr's, as in its [notify].
         title: (

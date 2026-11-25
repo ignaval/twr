@@ -5,22 +5,51 @@ import { requestId } from "./remote-crypto";
 import { createUploadFile, createCancelUpload } from "./uploads";
 import { aggregateInboxSources } from "./inbox-cache";
 import type { DesktopAPI, DesktopEvent, Json } from "./types";
+import type { NetworkType } from "./phone-pairing";
 
 export interface Hub {
   id: string;
   name: string;
+  /** Certificate mode: the hub's HTTPS origin. Pinned: the last route's, for display. */
   url: string;
   scopes: string[];
   gateway_id?: string;
+  /** Set for hubs paired by pin; absent for certificate-mode hubs. */
+  pin?: string;
+  /** Pinned hubs: the known routes, e.g. "tls:192.168.1.20:47321". */
+  routes?: string[];
+  /** Pinned hubs: the route last connected. */
+  route?: string;
 }
+/**
+ * One of three pairings (docs/design/phone-pairing.md › Client API):
+ * `pin` set, a scanned version 2 invitation; `address` set, typed pairing with the
+ * proof flow; otherwise `url`, certificate mode.
+ */
 export interface PairRequest {
-  url: string;
   code: string;
   name: string;
   hubName: string;
+  /** Certificate mode (version 1). */
+  url?: string;
+  /** A scanned version 2 invitation. */
+  pin?: string;
+  gatewayId?: string;
+  routes?: string[];
+  iroh?: string;
+  /** Typed pairing: "host" or "host:port" (default 47321). */
+  address?: string;
 }
+export type { NetworkType } from "./phone-pairing";
 /** Native code owns credentials, TLS and exactly one active socket. */
 export interface NativeTransport {
+  /** Merges routes the gateway's hello reports into the saved hub (16 at most, 30 days). */
+  updateRoutes(request: { id: string; routes: string[] }): Promise<void>;
+  /** The device's default network changed. */
+  addListener(
+    event: "network",
+    listener: (value: { type: NetworkType }) => void,
+  ): Promise<{ remove(): Promise<void> }>;
   /** `notice`: saved hubs were dropped (Android: undecryptable after a device transfer). */
   listHubs(): Promise<{ hubs: Hub[]; notice?: string }>;
   pair(request: PairRequest): Promise<Hub>;
@@ -64,15 +93,22 @@ export class RemoteHost {
     } catch {}
     return undefined;
   }
+  /** The gateway session's workspace, an id: held as `connectedId`. */
+  private holdBootstrapId(workspace: unknown) {
+    if (typeof workspace === "string" && workspace)
+      this.connectedId = workspace;
+  }
   private async bootstrap() {
     if (!this.nativeConnected) {
       const cached = await this.cachedBootstrap();
+      this.holdBootstrapId(cached?.workspace);
       if (cached) return { ...cached, terminals: [] };
       throw new Error(
         "No saved history is available. Connect to this hub once first.",
       );
     }
     const value = await this.request("bootstrap", {}, 30_000);
+    this.holdBootstrapId(value?.workspace);
     try {
       if (!isOfflineHostForgotten(this.hub.id))
         await this.services.secureWrite?.(
@@ -100,6 +136,10 @@ export class RemoteHost {
   private framing = false;
   private bridgeReady = false;
   private confirmedWorkspace = false;
+  // The id of the workspace the gateway last said this app is on (its bootstrap, live or
+  // cached, and each connect): connecting with it asks for that workspace by id alone, never
+  // another named so since (one renamed into a removed one's id).
+  private connectedId: string | undefined;
   private connectionTail: Promise<unknown> = Promise.resolve();
   private foreground = true;
   private looking = true;
@@ -186,7 +226,12 @@ export class RemoteHost {
       this.retryTimer
     )
       return;
-    const delay = Math.min(30_000, 1000 * 2 ** Math.min(this.retryCount++, 5));
+    let delay = 0;
+    if (this.immediateRetry) {
+      // The network changed: try the new one now, and back off from scratch after.
+      this.immediateRetry = false;
+      this.retryCount = 0;
+    } else delay = Math.min(30_000, 1000 * 2 ** Math.min(this.retryCount++, 5));
     this.retryTimer = setTimeout(() => {
       this.retryTimer = undefined;
       void this.resume()
@@ -195,6 +240,45 @@ export class RemoteHost {
         })
         .catch(() => this.scheduleReconnect());
     }, delay);
+  }
+  /** The next scheduled reconnect starts at once, with the backoff reset. */
+  private immediateRetry = false;
+  /**
+   * The device's default network changed (docs/design/phone-pairing.md › Racing routes):
+   * reconnect at once if connected or trying to be, without waiting for a heartbeat
+   * timeout or the backoff. Durable requests stay pending with their IDs and are sent
+   * again after the reconnect, as after any other transport failure.
+   */
+  private networkChanged(type: NetworkType) {
+    if (
+      this.stopped ||
+      this.authenticationRevoked ||
+      !this.foreground ||
+      this.parked ||
+      // Offline, or not a network event at all (a listener given every event).
+      !["wifi", "cellular", "other"].includes(type) ||
+      // The app's first workspace is still being chosen; that connection decides.
+      !this.confirmedWorkspace
+    )
+      return;
+    this.immediateRetry = true;
+    if (this.nativeConnected) {
+      this.transportFailed("The network changed; reconnecting…");
+      return;
+    }
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = undefined;
+      this.scheduleReconnect();
+      return;
+    }
+    if (this.reconnecting) {
+      // An attempt on the old network may wait for its timeout: end it. Its failure
+      // schedules the immediate retry.
+      this.closing = this.transport.disconnect().catch(() => {});
+      return;
+    }
+    this.scheduleReconnect();
   }
   private workspace = "default";
   private reconnecting?: Promise<void>;
@@ -252,8 +336,30 @@ export class RemoteHost {
       clearTimeout(timer!);
     }
   }
+  /** A pinned hub's gateway lists its current routes in the hello; the saved hub merges
+   * them (native code applies the limits). Older native builds lack `updateRoutes`. */
+  private reportedRoutes(routes: unknown) {
+    if (
+      !this.hub.pin ||
+      !Array.isArray(routes) ||
+      !routes.length ||
+      routes.some((route) => typeof route !== "string")
+    )
+      return;
+    try {
+      void Promise.resolve(
+        this.transport.updateRoutes?.({
+          id: this.hub.id,
+          routes: routes.slice(0, 16) as string[],
+        }),
+      ).catch(() => {});
+    } catch {
+      /* Saving routes must never break the connection. */
+    }
+  }
   private listeners = new Set<(event: DesktopEvent) => void>();
   private listener?: { remove(): Promise<void> };
+  private networkListener?: { remove(): Promise<void> };
   constructor(
     private hub: Hub,
     private showHubs: () => void,
@@ -317,6 +423,7 @@ export class RemoteHost {
           if (message.type === "authenticated") {
             this.nativeConnected = true;
             this.framing = message.framing === true;
+            this.reportedRoutes(message.routes);
           }
           if (message.type === "transport-closed") {
             this.assembler.clear();
@@ -335,6 +442,14 @@ export class RemoteHost {
       },
     );
     try {
+      this.networkListener = await this.transport.addListener(
+        "network",
+        (value) => this.networkChanged(value?.type),
+      );
+    } catch {
+      /* A transport without network events reconnects on its timeouts. */
+    }
+    try {
       await this.openSocket();
       this.nativeConnected = true;
       this.startHeartbeat();
@@ -346,11 +461,13 @@ export class RemoteHost {
       const cached = await this.cachedBootstrap();
       if (!cached) {
         await this.listener.remove();
+        await this.networkListener?.remove().catch(() => {});
         throw e;
       }
       this.nativeConnected = false;
       this.bridgeReady = false;
       this.workspace = cached.workspace || "default";
+      this.holdBootstrapId(cached.workspace);
       this.readMethods = new Set(cached.read_methods || []);
       this.confirmedWorkspace = true;
       this.closing = this.transport.disconnect().catch(() => {});
@@ -380,6 +497,7 @@ export class RemoteHost {
     this.nativeConnected = false;
     this.rejectPending();
     await this.listener?.remove();
+    await this.networkListener?.remove().catch(() => {});
     await this.closing;
     await this.transport.disconnect();
   }
@@ -393,12 +511,24 @@ export class RemoteHost {
     this.connectionTail = operation;
     return operation;
   }
-  private async connectWorkspace(workspace: string) {
+  /** Connects workspace `workspace`: with `byId` (an id the app holds), by that id alone. */
+  private async connectWorkspace(workspace: string, held = false) {
     if (!this.nativeConnected) {
       await this.openSocket();
       this.nativeConnected = true;
     }
-    const result = await this.request("connect", { workspace }, 75000);
+    const byId = held || workspace === this.connectedId;
+    const result = await this.request(
+      "connect",
+      byId ? { workspace, by_id: true } : { workspace },
+      75000,
+    );
+    // By the id the gateway connected it by (what its hub and the push name it by), whichever
+    // of its names was asked for.
+    if (typeof result?.workspace === "string" && result.workspace) {
+      workspace = result.workspace;
+      this.connectedId = workspace;
+    }
     this.workspace = workspace;
     this.confirmedWorkspace = true;
     this.bridgeReady = true;
@@ -610,8 +740,10 @@ export class RemoteHost {
         platform: this.services.platform,
         hostId: this.hub.id,
       }),
-      connect: (workspace) =>
-        this.queueConnection(() => this.connectWorkspace(workspace)),
+      connect: (workspace, options) =>
+        this.queueConnection(() =>
+          this.connectWorkspace(workspace, options?.byId === true),
+        ),
       rpc: (method, params = {}) => request("rpc", { method, params }),
       cli: (args) => request("cli", { args }),
       catalog: () => request("catalog"),

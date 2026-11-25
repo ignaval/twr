@@ -25,8 +25,12 @@ use crate::select::{Anchor, Target};
 /// A workspace in the tab strip and the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tab {
-    /// Its name.
+    /// Its id ([`twr_core::workspaces`]): what the TUI knows it by, which a rename leaves.
     pub name: String,
+    /// Its name, as shown.
+    pub label: String,
+    /// Commands without `-w` (and a bare `twr`) select it.
+    pub default: bool,
     /// What its hub said when last asked (the current workspace's comes from the state
     /// itself, [`AppState::tab_hub`]).
     pub hub: TabHub,
@@ -36,12 +40,24 @@ pub struct Tab {
 }
 
 impl Tab {
-    /// Workspace `name`, its hub not asked yet.
-    pub fn new(name: impl Into<String>) -> Tab {
+    /// Workspace `id`, shown as its id, its hub not asked yet.
+    pub fn new(id: impl Into<String>) -> Tab {
+        let name = id.into();
         Tab {
-            name: name.into(),
+            label: name.clone(),
+            default: false,
+            name,
             hub: TabHub::Unknown,
             glance: None,
+        }
+    }
+
+    /// The workspace `e` lists, its hub not asked yet.
+    pub fn of(e: &crate::WsEntry) -> Tab {
+        Tab {
+            label: e.name.clone(),
+            default: e.default,
+            ..Tab::new(e.id.clone())
         }
     }
 }
@@ -359,17 +375,20 @@ pub struct Restoring {
 }
 
 /// How a `twr attach` command shown in the TUI (`/attach`) reaches the hub it shows: through
-/// the socket it was opened on (`explicit`, `--socket`), else in its workspace (`-w`, for a
-/// named one, and for `default` when the shell selects another, `inherited`
-/// `TWR_WORKSPACE`): ` --socket '<path>'`, ` -w <name>` or nothing.
+/// the socket it was opened on (`explicit`, `--socket`), else in its workspace (`workspace`, an
+/// id; `None`: `default`) unless `twr` without `-w` selects it there already (`bare`,
+/// [`twr_core::paths::bare_selection`]): ` --socket '<path>'`, ` -w <id>` or nothing.
 pub fn attach_via(
     explicit: Option<&std::path::Path>,
     workspace: Option<&str>,
-    inherited: Option<&std::ffi::OsStr>,
+    bare: Option<&str>,
 ) -> String {
     match explicit {
         Some(socket) => format!(" --socket {}", shell_quote(&socket.to_string_lossy())),
-        None => twr_core::paths::workspace_selection(workspace, inherited),
+        None => twr_core::paths::workspace_selection(
+            workspace.unwrap_or(twr_core::paths::DEFAULT_WORKSPACE),
+            bare,
+        ),
     }
 }
 
@@ -419,7 +438,8 @@ pub fn waiting_alerts(
         if !before.is_some_and(|b| waiting > b) {
             continue;
         }
-        match notifier.workspace_waiting(&tab.name, waiting, now) {
+        // Named as shown (a rename shows here too).
+        match notifier.workspace_waiting(&tab.label, waiting, now) {
             WorkspaceAlert::Send(bytes) => out.push(bytes),
             WorkspaceAlert::Seen => {}
             WorkspaceAlert::Later => {
@@ -515,10 +535,23 @@ impl AppState {
     /// workspace sidebar names it.
     pub fn instance_label(&self) -> Option<&str> {
         if self.tabs_shown() || self.ws_docked() {
-            None
-        } else {
-            self.instance_name.as_deref()
+            return None;
         }
+        // Its name as listed now (a rename shows at once), else as its hub said it.
+        let current = self.workspace.as_deref();
+        self.tabs
+            .iter()
+            .find(|t| current == Some(t.name.as_str()))
+            .map(|t| t.label.as_str())
+            .or(self.instance_name.as_deref())
+    }
+
+    /// Workspace `id`'s name as listed (its id while the list does not have it).
+    pub fn ws_label(&self, id: &str) -> String {
+        self.tabs
+            .iter()
+            .find(|t| t.name == id)
+            .map_or_else(|| id.to_string(), |t| t.label.clone())
     }
 
     /// Ctrl-B, Ctrl-T, `/sidebar` and `/spaces` without `on` or `off`, a tap on the sidebar's
@@ -659,7 +692,8 @@ impl AppState {
         match row {
             WsRow::Workspace(name) => {
                 if self.workspace.as_deref() == Some(name.as_str()) {
-                    self.view.status = Some(format!("already in workspace {name}"));
+                    let label = self.ws_label(&name);
+                    self.view.status = Some(format!("already in workspace {label}"));
                     return Vec::new();
                 }
                 self.switch_workspace(&name)
@@ -681,24 +715,52 @@ impl AppState {
         };
     }
 
-    /// Why `name` can't be a new workspace (`twr ws new`'s rule, `default`, one that exists),
-    /// or `None` when it can.
+    /// Why `name` can't be a new workspace (`twr ws new`'s rule, one's name or original
+    /// name), or `None` when it can.
     pub fn new_ws_error(&self, name: &str) -> Option<String> {
         if name.is_empty() {
             return Some("type the new workspace's name".into());
         }
-        if name == twr_core::paths::DEFAULT_WORKSPACE {
-            return Some("the default workspace always exists".into());
-        }
+        self.ws_name_error(None, name)
+    }
+
+    /// Why `name` can't be the name of workspace `own` (an id; `None`: a new one): not a
+    /// valid name, another's name, or another's original name (which still selects it;
+    /// `default` is the root slot's), as [`twr_core::workspaces::name_conflict`] says it.
+    pub fn ws_name_error(&self, own: Option<&str>, name: &str) -> Option<String> {
         if let Some(why) = workspace_name_error(name) {
             return Some(why);
         }
-        if self.tabs.iter().any(|t| t.name == name) {
-            return Some(format!(
-                "workspace {name} already exists (/ws {name} switches)"
-            ));
+        for t in self.tabs.iter().filter(|t| Some(t.name.as_str()) != own) {
+            if t.label == name {
+                return Some(match own {
+                    None => format!("workspace {name} already exists (/ws {name} switches)"),
+                    Some(_) => format!("there is a workspace {name} already"),
+                });
+            }
+            if t.name == name {
+                return Some(format!(
+                    "{name} is the original name of workspace {}, which it still answers to",
+                    t.label
+                ));
+            }
+        }
+        if name == twr_core::paths::DEFAULT_WORKSPACE
+            && own.is_some_and(|o| o != twr_core::paths::DEFAULT_WORKSPACE)
+        {
+            return Some("only the workspace in twr's root can be named default".into());
         }
         None
+    }
+
+    /// The id of the workspace `selector` names: the one so named, else the one with that
+    /// id ([`twr_core::workspaces`]); `None` when none of the tabs is.
+    pub fn ws_resolve(&self, selector: &str) -> Option<String> {
+        self.tabs
+            .iter()
+            .find(|t| t.label == selector)
+            .or_else(|| self.tabs.iter().find(|t| t.name == selector))
+            .map(|t| t.name.clone())
     }
 
     /// `+ New workspace`, `/ws new [name]`: asks for the new workspace's name (with `name`,
@@ -735,6 +797,7 @@ impl AppState {
             return Vec::new();
         }
         if let Some(to) = &self.switching {
+            let to = self.ws_label(to);
             self.view.status = Some(format!("already opening workspace {to}"));
             return Vec::new();
         }
@@ -1035,12 +1098,31 @@ impl AppState {
         self.tabs = tabs;
     }
 
-    /// The tabs after a poll: the workspaces `names` lists (`None`: it could not list them,
-    /// and they stay as they are), in its order, each as `polled` found its hub, or as it was
-    /// when it was not asked this time. A hub that did not answer keeps what it last said of
-    /// its orchestrator ([`Tab::glance`]).
+    /// The tabs after a poll: the workspaces `names` lists (by id, each shown as it was), as
+    /// [`AppState::merge_listing`] has them.
     pub fn merge_poll(&mut self, names: Option<Vec<String>>, polled: Vec<Polled>) {
-        let Some(names) = names else {
+        let entries = names.map(|names| {
+            names
+                .into_iter()
+                .map(|id| {
+                    let was = self.tabs.iter().find(|t| t.name == id);
+                    crate::WsEntry {
+                        name: was.map_or_else(|| id.clone(), |t| t.label.clone()),
+                        default: was.is_some_and(|t| t.default),
+                        id,
+                    }
+                })
+                .collect()
+        });
+        self.merge_listing(entries, polled);
+    }
+
+    /// The tabs after a poll: the workspaces `entries` lists (`None`: it could not list them,
+    /// and they stay as they are), in its order, named as it says, each as `polled` found its
+    /// hub, or as it was when it was not asked this time. A hub that did not answer keeps what
+    /// it last said of its orchestrator ([`Tab::glance`]).
+    pub fn merge_listing(&mut self, entries: Option<Vec<crate::WsEntry>>, polled: Vec<Polled>) {
+        let Some(entries) = entries else {
             for p in polled {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.name == p.name) {
                     tab.hub = p.hub;
@@ -1055,17 +1137,22 @@ impl AppState {
             .collect();
         let mut polled: HashMap<String, Polled> =
             polled.into_iter().map(|p| (p.name.clone(), p)).collect();
-        let tabs = names
+        let tabs = entries
             .into_iter()
-            .map(|name| {
-                let was = before.remove(&name);
-                match polled.remove(&name) {
+            .map(|e| {
+                let was = before.remove(&e.id);
+                let tab = match polled.remove(&e.id) {
                     Some(p) => Tab {
                         glance: p.glance.or(was.and_then(|w| w.glance)),
                         hub: p.hub,
-                        name,
+                        ..Tab::of(&e)
                     },
-                    None => was.unwrap_or_else(|| Tab::new(name)),
+                    None => was.unwrap_or_else(|| Tab::of(&e)),
+                };
+                Tab {
+                    label: e.name,
+                    default: e.default,
+                    ..tab
                 }
             })
             .collect();
@@ -1221,8 +1308,9 @@ impl AppState {
             .max_by_key(|(seq, _)| *seq)
     }
 
-    /// Switches to workspace `name` (`/ws <name>`, a click on its tab): one that exists is
-    /// opened; another, valid name asks first whether to create it.
+    /// Switches to the workspace `name` names (`/ws <name>`, by its name or its id; a click on
+    /// its tab, by its id): one that exists is opened; another, valid name asks first whether
+    /// to create it.
     pub fn switch_workspace(&mut self, name: &str) -> Vec<Action> {
         let Some(current) = self.workspace.clone() else {
             self.view.status =
@@ -1230,23 +1318,33 @@ impl AppState {
             return Vec::new();
         };
         if let Some(to) = &self.switching {
+            let to = self.ws_label(to);
             self.view.status = Some(format!("already opening workspace {to}"));
             return Vec::new();
+        }
+        if let Some(id) = self.ws_resolve(name) {
+            let label = self.ws_label(&id);
+            if id == current {
+                self.view.status = Some(format!("already in workspace {label}"));
+                return Vec::new();
+            }
+            self.view.status = Some(format!("opening workspace {label}..."));
+            self.switching = Some(id.clone());
+            // A question left waiting for `y` (another workspace to create, say) goes: its
+            // answer would start a second switch.
+            self.view.confirm = None;
+            return vec![Action::Workspace {
+                name: id,
+                create: false,
+            }];
         }
         if name == current {
             self.view.status = Some(format!("already in workspace {name}"));
             return Vec::new();
         }
-        if self.tabs.iter().any(|t| t.name == name) {
-            self.view.status = Some(format!("opening workspace {name}..."));
-            self.switching = Some(name.to_string());
-            // A question left waiting for `y` (another workspace to create, say) goes: its
-            // answer would start a second switch.
-            self.view.confirm = None;
-            return vec![Action::Workspace {
-                name: name.to_string(),
-                create: false,
-            }];
+        if let Some(why) = self.new_ws_error(name) {
+            self.view.status = Some(why);
+            return Vec::new();
         }
         if let Some(why) = workspace_name_error(name) {
             self.view.status = Some(why);
@@ -1277,6 +1375,7 @@ impl AppState {
     pub fn begin_switch(&mut self, name: &str) -> bool {
         match &self.switching {
             Some(other) if other != name => {
+                let other = self.ws_label(other);
                 self.view.status = Some(format!("already opening workspace {other}"));
                 false
             }
@@ -1296,15 +1395,19 @@ impl AppState {
             .tabs
             .iter()
             .map(|t| {
+                let mut name = t.label.clone();
                 if self.workspace.as_deref() == Some(t.name.as_str()) {
-                    format!("*{}", t.name)
-                } else {
-                    t.name.clone()
+                    name.insert(0, '*');
                 }
+                if t.default {
+                    name.push_str(" (default)");
+                }
+                name
             })
             .collect();
         format!(
-            "workspaces: {} (/ws <name> switches or creates one)",
+            "workspaces: {} (/ws <name> switches or creates one; /ws menu renames, deletes or \
+             makes one the default)",
             names.join(", ")
         )
     }
@@ -1670,6 +1773,8 @@ mod tests {
         st.workspace = Some("a".into());
         st.set_tabs(vec![Tab {
             name: "a".into(),
+            label: "a".into(),
+            default: false,
             hub: TabHub::Unknown,
             glance: Some(Glance {
                 active: false,
@@ -1724,6 +1829,8 @@ mod tests {
             .iter()
             .map(|n| Tab {
                 name: n.to_string(),
+                label: n.to_string(),
+                default: false,
                 hub: TabHub::Stopped,
                 glance: None,
             })
@@ -1888,7 +1995,10 @@ mod tests {
         let _ = st.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
             st.view.status.as_deref(),
-            Some("workspaces: default, *a (/ws <name> switches or creates one)")
+            Some(
+                "workspaces: default, *a (/ws <name> switches or creates one; /ws menu renames, \
+                 deletes or makes one the default)"
+            )
         );
     }
 
@@ -2047,24 +2157,16 @@ mod tests {
     /// opened on.
     #[test]
     fn attach_reaches_the_hub_shown() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
         use std::path::Path;
-        let a = Some(OsStr::new("a"));
-        assert_eq!(attach_via(None, Some("a"), None), " -w a");
-        assert_eq!(attach_via(None, Some("default"), None), "");
-        assert_eq!(attach_via(None, None, None), "");
-        // The shell selects another workspace (one not UTF-8 too): default must be named.
-        assert_eq!(attach_via(None, Some("default"), a), " -w default");
-        assert_eq!(
-            attach_via(None, Some("default"), Some(OsStr::from_bytes(b"a\xff"))),
-            " -w default"
-        );
-        assert_eq!(
-            attach_via(None, Some("default"), Some(OsStr::new("default"))),
-            ""
-        );
-        assert_eq!(attach_via(None, Some("b"), a), " -w b");
+        let d = Some("default");
+        assert_eq!(attach_via(None, Some("a"), d), " -w a");
+        assert_eq!(attach_via(None, Some("default"), d), "");
+        assert_eq!(attach_via(None, None, d), "");
+        // The shell selects another workspace (or none can be told): default must be named.
+        assert_eq!(attach_via(None, Some("default"), Some("a")), " -w default");
+        assert_eq!(attach_via(None, Some("default"), None), " -w default");
+        assert_eq!(attach_via(None, Some("a"), Some("a")), "");
+        assert_eq!(attach_via(None, Some("b"), Some("a")), " -w b");
         assert_eq!(
             attach_via(Some(Path::new("/tmp/custom.sock")), Some("a"), None),
             " --socket /tmp/custom.sock"
@@ -2098,6 +2200,8 @@ mod tests {
         let mut n = Notifier::new(&cfg, crate::notify::Multiplexer::None);
         let tab = |name: &str, waiting| Tab {
             name: name.into(),
+            label: name.into(),
+            default: false,
             hub: TabHub::Running {
                 threads: 1,
                 running: 0,
@@ -2136,6 +2240,8 @@ mod tests {
         use twr_core::notify::NotifyEvent;
         let tab = |permissions, questions| Tab {
             name: "a".into(),
+            label: "a".into(),
+            default: false,
             hub: TabHub::Running {
                 threads: 1,
                 running: 0,

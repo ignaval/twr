@@ -186,6 +186,10 @@ pub struct ViewState {
     pub runner: Option<RunnerPanel>,
     pub runner_session: Option<String>,
     pub runner_generation: u64,
+    /// `/phone`'s view ([`crate::phone`]): private, like the runner's.
+    pub phone: Option<crate::phone::PhonePanel>,
+    /// Which `/phone` run the view shows: a result of an older one is dropped.
+    pub phone_generation: u64,
     /// The selected card: a worker thread, [`HUB_THREAD`] for the hub's card, or the current
     /// orchestrator while its attention banner shows (in the stack view's main conversation
     /// only); `None` (as at start, or after Esc) selects nothing. Always something the current
@@ -387,6 +391,8 @@ pub struct ViewState {
     pub ws_wheeled: bool,
     /// The new-workspace dialog, while open: the name typed so far.
     pub new_ws: Option<String>,
+    /// The workspace menu, open ([`crate::wsmenu`]).
+    pub ws_menu: Option<crate::wsmenu::WsMenu>,
     /// The settings overlay, while open ([`crate::settings`]).
     pub settings: Option<crate::settings::Settings>,
     /// The loop settings editor, while open ([`crate::loops`]): over the settings overlay
@@ -1273,6 +1279,14 @@ pub enum Action {
     CancelRunner {
         session: Option<String>,
     },
+    /// Run `twr phone --json` for this access level (`/phone`); its results come back as
+    /// `phone.local`, with the generation.
+    Phone {
+        generation: u64,
+        level: String,
+    },
+    /// Stop the `twr phone` that runs, which cancels its invitation (Esc in `/phone`).
+    CancelPhone,
     /// A fresh orchestrator session, without a handoff (`/clear`).
     ResetOrchestrator,
     /// Read the orchestrator's access level, or set it (`orchestrator.access`, `/access`, the
@@ -1542,6 +1556,30 @@ pub enum Action {
         name: String,
         /// Create it first (`/ws` with a new name, once confirmed).
         create: bool,
+    },
+    /// Rename workspace `id` to `to` (the workspace menu, [`crate::wsmenu`]).
+    WsRename {
+        id: String,
+        to: String,
+    },
+    /// Make workspace `id` the default (the workspace menu).
+    WsDefault {
+        id: String,
+    },
+    /// Find out what deleting workspace `id` would do ([`crate::RemovalPlan`]), for the
+    /// workspace menu to show before it asks.
+    WsPlan {
+        id: String,
+    },
+    /// Delete workspace `id`, once the user confirmed what the plan said: stopping its hub
+    /// first when `stop_hub`; with `via`, the TUI switches to that workspace first (it is
+    /// deleting the one it shows).
+    WsRemove {
+        id: String,
+        stop_hub: bool,
+        via: Option<String>,
+        /// The plan's [`crate::RemovalPlan::generation`].
+        generation: Option<String>,
     },
 }
 
@@ -4010,6 +4048,16 @@ impl AppState {
     /// listing the items it names, and `y` purges exactly those, by id.
     pub fn apply_result(&mut self, method: &'static str, result: &Value) {
         match method {
+            "phone.local" => {
+                let current = result["generation"].as_u64() == Some(self.view.phone_generation);
+                if let (true, Some(panel)) = (current, self.view.phone.as_ref()) {
+                    let (next, status) = crate::phone::apply(panel, result);
+                    self.view.phone = next;
+                    if let Some(status) = status {
+                        self.view.status = Some(status);
+                    }
+                }
+            }
             "runner.local" => {
                 if self.view.runner.is_some() {
                     self.view.runner_session = result["session"].as_str().map(String::from);
@@ -5466,6 +5514,54 @@ impl AppState {
     /// Runs a slash command typed on the input line (see [`crate::slash`]). Returns the
     /// actions to run now (a confirmation or a status line otherwise) and whether the line is
     /// done with (cleared).
+    /// `/phone` with access `level`: the view waits for the invitation `twr phone` opens.
+    fn start_phone(&mut self, level: String) -> Vec<Action> {
+        self.view.phone_generation += 1;
+        self.view.phone = Some(crate::phone::PhonePanel::Preparing(level.clone()));
+        vec![Action::Phone {
+            generation: self.view.phone_generation,
+            level,
+        }]
+    }
+
+    /// A key in `/phone`'s view, which takes every key: the choice, then Esc cancels the
+    /// invitation and `c` copies its link; a note closes on any key.
+    fn phone_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        use crate::phone::PhonePanel;
+        let levels = twr_core::slash::PHONE_LEVELS;
+        match self.view.phone.clone() {
+            Some(PhonePanel::Choose(i)) => match key.code {
+                KeyCode::Up => self.view.phone = Some(PhonePanel::Choose(i.saturating_sub(1))),
+                KeyCode::Down => {
+                    self.view.phone = Some(PhonePanel::Choose((i + 1).min(levels.len() - 1)))
+                }
+                KeyCode::Enter => return self.start_phone(levels[i].to_string()),
+                KeyCode::Char(c @ '1'..='4') => {
+                    return self.start_phone(levels[c as usize - '1' as usize].to_string())
+                }
+                KeyCode::Esc => self.view.phone = None,
+                _ => {}
+            },
+            Some(PhonePanel::Preparing(_) | PhonePanel::Showing { .. })
+                if key.code == KeyCode::Esc =>
+            {
+                self.view.phone = None;
+                self.view.phone_generation += 1;
+                return vec![Action::CancelPhone];
+            }
+            Some(PhonePanel::Showing { line, .. }) if key.code == KeyCode::Char('c') => {
+                if let Some(link) = line["link"].as_str() {
+                    return vec![Action::Copy {
+                        text: link.to_string(),
+                    }];
+                }
+            }
+            Some(PhonePanel::Note(_)) => self.view.phone = None,
+            _ => {}
+        }
+        Vec::new()
+    }
+
     fn run_slash(&mut self, line: &str) -> (Vec<Action>, bool) {
         let cmd = match slash::parse(line) {
             Ok(c) => c,
@@ -5710,6 +5806,16 @@ impl AppState {
                     self.attach_via
                 ));
             }
+            Slash::Phone { level } => {
+                return match level {
+                    Some(level) => (self.start_phone(level), true),
+                    None => {
+                        self.view.phone_generation += 1;
+                        self.view.phone = Some(crate::phone::PhonePanel::Choose(1));
+                        (Vec::new(), true)
+                    }
+                };
+            }
             Slash::Runner => {
                 self.view.runner = Some(RunnerPanel("Preparing a pairing code…".into()));
                 self.view.runner_generation += 1;
@@ -5874,6 +5980,9 @@ impl AppState {
             Slash::Ws(None) => self.view.status = Some(self.workspaces_line()),
             Slash::Ws(Some(name)) => return (self.switch_workspace(&name), true),
             Slash::WsNew(name) => return (self.open_new_ws(name.as_deref()), true),
+            Slash::WsMenu(name) => return (self.open_ws_menu(name.as_deref()), true),
+            Slash::WsRename(name, to) => return (self.ws_rename_cmd(name.as_deref(), &to), true),
+            Slash::WsRm(name) => return (self.ws_rm_cmd(&name), true),
             Slash::Settings => return (self.open_settings(), true),
             Slash::Read { cmd, on } => return self.read_aloud(cmd, on),
             Slash::Review {
@@ -6444,6 +6553,9 @@ impl AppState {
         if self.view.new_ws.is_some() {
             return self.new_ws_key(key);
         }
+        if self.view.ws_menu.is_some() {
+            return self.ws_menu_key(key);
+        }
         // The loop settings editor, over the settings when their Loops row opened it.
         if self.view.loop_editor.is_some() {
             return self.loop_editor_key(key);
@@ -6453,6 +6565,9 @@ impl AppState {
         }
         // The help is drawn over the trash: it takes the key first. Both scroll with the
         // arrows, PgUp/PgDn and Home/End; any other key closes them.
+        if self.view.phone.is_some() {
+            return self.phone_key(key);
+        }
         if self.view.runner.is_some() {
             if key.code == KeyCode::Esc {
                 self.view.runner = None;
@@ -8991,6 +9106,7 @@ impl AppState {
             || self.view.settings.is_some()
             || self.view.loop_editor.is_some()
             || self.view.new_ws.is_some()
+            || self.view.ws_menu.is_some()
         {
             match ev.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -9008,10 +9124,20 @@ impl AppState {
                     match (click, target) {
                         // A workspace's card in the docked sidebar, which it does not cover,
                         // switches as a tab does; the sidebar's other controls wait.
-                        (_, Some(Target::Workspace(name))) => {
+                        // (Not under the workspace menu, which is about one of them.)
+                        (_, Some(Target::Workspace(name))) if self.view.ws_menu.is_none() => {
                             return self.ws_activate(WsRow::Workspace(name));
                         }
-                        (_, Some(Target::NewWorkspace | Target::Settings | Target::WsSidebar)) => {}
+                        (
+                            _,
+                            Some(
+                                Target::Workspace(_)
+                                | Target::WsMenu(_)
+                                | Target::NewWorkspace
+                                | Target::Settings
+                                | Target::WsSidebar,
+                            ),
+                        ) => {}
                         (_, Some(t)) => return self.tap(t),
                         (_, None) => {}
                     }
@@ -9023,6 +9149,12 @@ impl AppState {
                     if let Some(name) = released.filter(|n| click && pressed.as_ref() == Some(n)) {
                         return self.switch_workspace(&name);
                     }
+                }
+                // The workspace menu takes the wheel wherever it is: it scrolls its plan.
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    if self.view.ws_menu.is_some() =>
+                {
+                    return self.ws_menu_wheel(ev.kind == MouseEventKind::ScrollUp);
                 }
                 // Over the docked workspace list, the wheel scrolls it; elsewhere it picks.
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
@@ -9287,6 +9419,8 @@ impl AppState {
                 }
                 self.view.ws_sel = Some(WsRow::Workspace(name));
             }
+            Target::WsMenu(id) => return self.open_ws_menu(Some(&id)),
+            Target::WsChoice(choice) => return self.tap_ws_choice(choice),
             Target::NewWorkspace => return self.ws_activate(WsRow::New),
             Target::Settings => return self.ws_activate(WsRow::Settings),
             Target::WsSidebar => return self.toggle_workspaces(),
@@ -9386,6 +9520,7 @@ impl AppState {
         if self.view.loop_editor.take().is_some()
             || self.view.new_ws.take().is_some()
             || self.view.settings.take().is_some()
+            || self.view.ws_menu.take().is_some()
         {
             return Vec::new();
         }
@@ -9958,6 +10093,10 @@ impl AppState {
         }
         self.view.selection = None;
         // The new-workspace dialog takes it as typed (its first line), never the input line.
+        if self.view.ws_menu.is_some() {
+            self.ws_menu_paste(text);
+            return;
+        }
         if self.view.new_ws.is_some() {
             self.paste_new_ws(text);
             return;
@@ -15789,7 +15928,7 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(
             items,
-            ["/help", "/orch", "/trash", "/attach"],
+            ["/help", "/phone", "/orch", "/trash", "/attach"],
             "/orch: its alias has an h"
         );
         // Enter on a partial command without arguments completes and runs it.
@@ -25904,6 +26043,8 @@ pub(crate) mod tests {
                     | Target::Yes
                     | Target::No
                     | Target::Workspace(_)
+                    | Target::WsMenu(_)
+                    | Target::WsChoice(_)
             )
         }
 
@@ -25931,8 +26072,13 @@ pub(crate) mod tests {
                     assert_eq!(a.height, 1, "{what}: {ta:?} {a:?} on {rows:?}");
                 }
                 for (b, tb) in &targets[k + 1..] {
+                    // A workspace card's `⋯` is drawn over its card's end.
+                    let menu_on_card = matches!(
+                        (ta, tb),
+                        (Target::Workspace(x), Target::WsMenu(y)) if x == y
+                    );
                     assert!(
-                        ta == tb || !a.intersects(*b),
+                        ta == tb || menu_on_card || !a.intersects(*b),
                         "{what}: {ta:?} {a:?} {tb:?} {b:?}"
                     );
                 }
@@ -27762,16 +27908,20 @@ pub(crate) mod tests {
             )
         }
 
-        /// The conversation pane's rows as the last frame drew them, `w` x `h`.
+        /// The conversation pane's rows as the last frame drew them, `w` x `h`, a box's text
+        /// rows without its side bars (`│ … │`): an update about a thread is in its box.
         fn rows(st: &mut AppState, w: u16, h: u16) -> Vec<String> {
             let buf = draw(st, w, h);
             let pane = st.view.panes.get(&PaneId::Transcript).unwrap().clone();
             (pane.area.y..pane.area.bottom())
                 .map(|y| {
-                    (pane.area.x..pane.area.right())
+                    let row = (pane.area.x..pane.area.right())
                         .map(|x| buf[(x, y)].symbol())
-                        .collect::<String>()
-                        .trim_end()
+                        .collect::<String>();
+                    let row = row.trim_end();
+                    row.strip_prefix("│ ")
+                        .and_then(|r| r.strip_suffix('│'))
+                        .map_or(row, str::trim_end)
                         .to_string()
                 })
                 .filter(|r| !r.is_empty())
@@ -28953,7 +29103,7 @@ pub(crate) mod tests {
             let every = st.summary.every();
             let mut now = Instant::now();
             let mut ask = |st: &mut AppState, summary: &str, seq: u64| {
-                rows(st, 160, 120);
+                rows(st, 160, 400);
                 assert_eq!(st.take_summaries_due(now).len(), 1, "{summary}");
                 st.summary_result_now("t-gamma", covering(summary, seq), now);
                 now += every;
@@ -28976,7 +29126,7 @@ pub(crate) mod tests {
                 let seq = interim(&mut st, &mut o, "gamma", &format!("live {i}"));
                 ask(&mut st, &format!("Live {i}."), seq);
             }
-            let text = rows(&mut st, 160, 120).join("\n");
+            let text = rows(&mut st, 160, 400).join("\n");
             for i in 0..RUNS {
                 assert!(
                     text.contains(&format!("◦ gamma · Run {i}.")),
@@ -29008,7 +29158,7 @@ pub(crate) mod tests {
             assert_eq!(kept.len(), RUNS + 1 - 5, "{kept:?}");
             assert!(kept.iter().all(|(_, _, t)| t.as_deref() != Some("Run 4.")));
             assert!(kept.iter().any(|(_, _, t)| t.as_deref() == Some("Run 5.")));
-            let text = rows(&mut st, 160, 120).join("\n");
+            let text = rows(&mut st, 160, 400).join("\n");
             assert!(text.contains("◦ gamma · Run 5."), "{text}");
             assert!(text.contains("◦ gamma · Live 20."), "{text}");
         }
@@ -29409,7 +29559,10 @@ pub(crate) mod tests {
                 let cells: Vec<&str> = (pane.x..pane.right())
                     .map(|x| buf[(x, y)].symbol())
                     .collect();
-                if !cells.concat().trim_start().starts_with(lead) {
+                // A row in a box: its text after the side bar.
+                let line = cells.concat();
+                let line = line.trim_start();
+                if !line.strip_prefix("│ ").unwrap_or(line).starts_with(lead) {
                     return None;
                 }
                 let n = word.chars().count();
@@ -30104,5 +30257,76 @@ pub(crate) mod tests {
                 assert!(said.contains(says), "{said}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod phone_tests {
+    use super::*;
+    use crate::phone::PhonePanel;
+    use serde_json::json;
+
+    fn key(st: &mut AppState, code: KeyCode) -> Vec<Action> {
+        st.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// `/phone` offers the access, runs `twr phone` for the one chosen, shows its invitation,
+    /// and closes once a phone pairs; Esc cancels it; results of an older run are dropped. The
+    /// code reaches neither the input nor the history.
+    #[test]
+    fn phone_view_runs_an_invitation_to_its_end() {
+        let mut st = AppState::new();
+        let (actions, _) = st.run_slash("/phone");
+        assert!(actions.is_empty());
+        assert_eq!(st.view.phone, Some(PhonePanel::Choose(1)));
+        assert!(key(&mut st, KeyCode::Down).is_empty());
+        let actions = key(&mut st, KeyCode::Enter);
+        let generation = st.view.phone_generation;
+        assert_eq!(
+            actions,
+            [Action::Phone {
+                generation,
+                level: "terminal".into()
+            }]
+        );
+        let line = json!({"code":"ABCDEFGHJK23","expires_at":1,"link":"twr://pair#x",
+            "invitation":{"routes":["tls:192.168.1.20:47321"]}});
+        st.apply_result(
+            "phone.local",
+            &json!({"generation": generation - 1, "line": line}),
+        );
+        assert!(
+            matches!(st.view.phone, Some(PhonePanel::Preparing(_))),
+            "stale"
+        );
+        st.apply_result(
+            "phone.local",
+            &json!({"generation": generation, "line": line}),
+        );
+        assert!(
+            matches!(st.view.phone, Some(PhonePanel::Showing { ref level, .. }) if level == "terminal")
+        );
+        assert!(
+            key(&mut st, KeyCode::Char('x')).is_empty(),
+            "keys go to the view"
+        );
+        assert_eq!(
+            key(&mut st, KeyCode::Char('c')),
+            [Action::Copy {
+                text: "twr://pair#x".into()
+            }]
+        );
+        let paired = json!({"generation": generation, "outcome": {"paired": {"name": "Pixel"}}});
+        st.apply_result("phone.local", &paired);
+        assert_eq!(st.view.phone, None);
+        assert_eq!(st.view.status.as_deref(), Some("paired Pixel"));
+        // Straight to an access level; Esc cancels.
+        let (actions, _) = st.run_slash("/phone admin");
+        assert!(matches!(&actions[..], [Action::Phone { level, .. }] if level == "admin"));
+        assert_eq!(key(&mut st, KeyCode::Esc), [Action::CancelPhone]);
+        assert_eq!(st.view.phone, None);
+        assert!(!format!("{:?}", st.view).contains("ABCDEFGHJK23"));
+        let (actions, _) = st.run_slash("/phone root");
+        assert!(actions.is_empty() && st.view.phone.is_none());
     }
 }

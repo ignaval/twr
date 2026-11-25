@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   DesktopEvent,
+  EngineHub,
   HubEvent,
   InboxSource,
   Json,
@@ -84,6 +85,22 @@ type HostOptions = {
   voiceStatus?: () => Promise<VoiceCaptureStatus>;
   voiceSetup?: () => Promise<VoiceCaptureStatus>;
   inboxSources?: InboxSource[];
+  /**
+   * How `connect` answers (default: it connects): a function of the workspace asked for, or
+   * what it answers (`desktop.paths` and how the hub's engine compares).
+   */
+  connect?:
+    Json | ((workspace: string, options?: { byId?: boolean }) => Promise<Json>);
+  /** What `twr ws list --json` lists (default: the views' workspaces). */
+  listing?: Json[];
+  /** What the bootstrap says of the workspace (default: `default`, an id). */
+  boot?: { workspace: string; typed?: boolean };
+  /** No live view arrives at start (the first connection failed). */
+  noLive?: boolean;
+  /** The running workspaces' hubs on another engine (`engineHubs`). */
+  engineHubs?: EngineHub[];
+  /** The CLI's commands (`catalog`). */
+  catalog?: Json[];
 };
 
 function fakeHost(options: HostOptions = {}) {
@@ -142,6 +159,7 @@ function fakeHost(options: HostOptions = {}) {
     secureDelete: async (key: string) => void secure.delete(key),
     bootstrap: async () => ({
       workspace: "default",
+      ...options.boot,
       hostId: "composer-test",
       platform: "linux",
       home: "/home/test",
@@ -149,7 +167,15 @@ function fakeHost(options: HostOptions = {}) {
       theme: null,
       terminals: [],
     }),
-    connect: async () => ({}),
+    connect:
+      typeof options.connect === "function"
+        ? options.connect
+        : async () => options.connect || {},
+    /** The CLI commands run, joined. */
+    cliCalls: [] as string[],
+    engineHubs: options.engineHubs
+      ? async () => options.engineHubs || []
+      : undefined,
     inboxSources: async () => options.inboxSources || [],
     rpc: async (method: string, params: Json = {}) => {
       const answer = options.rpc?.(method, params);
@@ -174,11 +200,17 @@ function fakeHost(options: HostOptions = {}) {
       }
       return {};
     },
-    cli: async (args: string[]) =>
-      args.join(" ") === "ws list --json"
-        ? { stdout: JSON.stringify(Object.keys(views)), stderr: "", code: 0 }
-        : { stdout: "", stderr: "", code: 0 },
-    catalog: async () => [],
+    cli: async (args: string[]) => {
+      host.cliCalls.push(args.join(" "));
+      return args.join(" ") === "ws list --json"
+        ? {
+            stdout: JSON.stringify(options.listing || Object.keys(views)),
+            stderr: "",
+            code: 0,
+          }
+        : { stdout: "", stderr: "", code: 0 };
+    },
+    catalog: async () => options.catalog || [],
     configRead: async () => ({
       content: "",
       hash: "",
@@ -269,7 +301,7 @@ async function mount(
   };
   await act(async () => root.render(createElement(App)));
   await settle();
-  await live("default");
+  if (!options.noLive) await live("default");
   const all = (selector: string) => document.querySelectorAll(selector);
   const find = (selector: string, text?: string) => {
     const node = all(selector).find(
@@ -335,6 +367,70 @@ async function mount(
 
 let mounted: Mounted;
 const app = () => mounted;
+
+describe("a workspace that cannot be opened at start", () => {
+  it("still lists the workspaces, so another can be picked", async () => {
+    const app = await mount({
+      connect: async () => {
+        throw new Error(
+          "Workspace does not exist; create it before connecting",
+        );
+      },
+      listing: [{ id: "a", name: "acme", default: false, hub: "stopped" }],
+    });
+    expect(app.host.cliCalls).toContain("ws list --json");
+    expect(app.find("[data-workspace=a]").textContent).toContain("acme");
+    await app.unmount();
+    // (The file's first mount loads the whole app: more than the default 5 s under load.)
+  }, 30_000);
+});
+
+describe("a workspace the app holds the id of", () => {
+  it("is connected by that id alone: the bootstrap's, and a listed one's", async () => {
+    const calls: [string, { byId?: boolean } | undefined][] = [];
+    const app = await mount({
+      connect: async (workspace: string, options?: { byId?: boolean }) => {
+        calls.push([workspace, options]);
+        return { workspace };
+      },
+      listing: [
+        { id: "default", name: "default", default: true, hub: "running" },
+        { id: "b", name: "acme", default: false, hub: "stopped" },
+      ],
+    });
+    await app.click(app.find("[data-workspace=b] .workspace-orchestrator"));
+    expect(calls).toEqual([
+      ["default", { byId: true }],
+      ["b", { byId: true }],
+    ]);
+    await app.unmount();
+  }, 30_000);
+});
+
+describe("a workspace given by name", () => {
+  it("is asked for by name again on Reconnect, once its first connection failed", async () => {
+    const calls: [string, { byId?: boolean } | undefined][] = [];
+    const app = await mount({
+      // The desktop app started with `TWR_WORKSPACE=acme`, `client-x`'s new name.
+      boot: { workspace: "acme", typed: true },
+      noLive: true,
+      connect: async (workspace: string, options?: { byId?: boolean }) => {
+        calls.push([workspace, options]);
+        if (calls.length === 1) throw new Error("config.toml: invalid TOML");
+        return { workspace };
+      },
+      listing: [
+        { id: "client-x", name: "acme", default: true, hub: "stopped" },
+      ],
+    });
+    await app.click(app.find("button", "Reconnect"));
+    expect(calls).toEqual([
+      ["acme", { byId: false }],
+      ["client-x", { byId: false }],
+    ]);
+    await app.unmount();
+  }, 30_000);
+});
 
 describe("the latest user message above conversation history", () => {
   afterEach(async () => {
@@ -2617,6 +2713,107 @@ describe("Switch orchestrator's effort", () => {
   });
 });
 
+/* Choosing the first orchestrator (a new workspace's): the form starts from the configured
+ * one, its model and effort as well as its runtime, and once chosen it is final: the form
+ * does not offer to switch again. */
+describe("Choosing the first orchestrator", () => {
+  const used: Json[] = [];
+  const configured = {
+    runtime: "fake",
+    model: "m2",
+    effort: "high",
+    explicit: true,
+  };
+  beforeEach(async () => {
+    vi.resetModules();
+    used.length = 0;
+    const info = {
+      thread: null,
+      runtime: "fake",
+      model: "m2",
+      effort: "high",
+      runtimes: ["fake"],
+      configured,
+      models: {
+        fake: {
+          models: [{ id: "m1" }, { id: "m2" }],
+          efforts: ["low", "high"],
+        },
+      },
+    };
+    mounted = await mount({
+      rpc: (method, params) => {
+        if (method === "hub.info")
+          return Promise.resolve({ workspace: "default", orchestrator: info });
+        if (method === "orchestrator.show") return Promise.resolve(info);
+        if (method === "orchestrator.use") {
+          used.push(params);
+          return Promise.resolve({
+            thread: "orch",
+            runtime: params.runtime,
+            model: params.model ?? null,
+            effort: params.effort ?? null,
+          });
+        }
+        if (method === "desktop.parse_slash" && params.line.trim() === "/orch")
+          return Promise.resolve({ kind: "OrchPick" });
+        return undefined;
+      },
+    });
+    await app().wait(50);
+  });
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+  const form = () => app().find("[role=dialog]", "Switch orchestrator");
+  const submit = async () => {
+    await app().act(async () => {
+      app()
+        .find("[role=dialog] form", "Switch orchestrator")
+        .dispatchEvent(
+          new FakeEvent("submit", { bubbles: true, cancelable: true }),
+        );
+    });
+    await app().settle();
+  };
+
+  it("starts from the configured runtime, model and effort", async () => {
+    await app().type("/orch");
+    await app().press("Enter");
+    /** What a field holds: a select's chosen option, else its value. */
+    const shown = (id: string) => {
+      const field = form().querySelector(`#field-${id}`) as any;
+      const picked = field
+        ?.querySelectorAll?.("option")
+        .find((o: any) => o.selected) as any;
+      return picked?.value ?? field?.value;
+    };
+    expect(shown("runtime")).toBe("fake");
+    expect(shown("model")).toBe("m2");
+    expect(shown("effort")).toBe("high");
+    await submit();
+    expect(used).toHaveLength(1);
+    expect(used[0]).toMatchObject({
+      runtime: "fake",
+      model: "m2",
+      effort: "high",
+    });
+  });
+
+  it("does not offer to switch again once one is chosen", async () => {
+    await app().type("/orch");
+    await app().press("Enter");
+    const primary = () =>
+      form().querySelector("footer button.primary") as FakeElement | null;
+    expect(primary()?.textContent).toContain("Switch orchestrator");
+    await submit();
+    expect(used).toHaveLength(1);
+    expect(primary()).toBeNull();
+    expect(form().textContent).not.toContain("Switch orchestrator again");
+    expect(form().querySelector("footer button")?.textContent).toBe("Close");
+  });
+});
+
 /* `/access [limited|full]` (docs/orchestrator.md › Full access): the shared slash table's
  * command opens the palette's Orchestrator access form on the level named, and Full still
  * asks before anything reaches the hub. */
@@ -2956,5 +3153,274 @@ describe("messages put back in the box stay messages", () => {
     await app().press("Enter");
     expect(app().all(".usage-panel")).toHaveLength(0);
     expect(sentMessages()).toEqual(["/usage\n\n!ls"]);
+  });
+});
+
+describe("the working cursor in the conversation", () => {
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+  let subscription = "";
+  let answerSay: ((value: Json) => void) | undefined;
+  const start = async (options: HostOptions = {}) => {
+    vi.resetModules();
+    subscription = "";
+    answerSay = undefined;
+    mounted = await mount({
+      ...options,
+      rpc: (method, params) => {
+        if (method === "desktop.subscribe") subscription = params.subscription;
+        if (method === "thread.transcript")
+          return Promise.resolve({
+            events: [
+              {
+                id: "orch:1",
+                thread: "orch",
+                seq: 10,
+                turn: 1,
+                ts: "2026-11-23T12:00:00Z",
+                kind: "turn.started",
+                data: { from: "user", prompt: "Earlier" },
+              },
+              {
+                id: "orch:1:end",
+                thread: "orch",
+                seq: 11,
+                turn: 1,
+                ts: "2026-11-23T12:00:01Z",
+                kind: "turn.ended",
+                data: { result: "ok" },
+              },
+            ],
+            turn: 1,
+            more: false,
+          });
+        if (method === "say")
+          return new Promise<Json>((resolve) => (answerSay = resolve));
+        return options.rpc?.(method, params);
+      },
+    });
+  };
+  const orchestrator = (status: string) =>
+    views.default.map((t) => (t.id === "orch" ? { ...t, status } : t));
+  const lineCursor = () => app().all(".working-line .working-cursor").length;
+  const emit = async (event: Partial<HubEvent>) => {
+    await app().act(async () => {
+      app().host.emit({
+        type: "thread",
+        subscription,
+        event: {
+          id: "orch:" + event.seq,
+          thread: "orch",
+          turn: 2,
+          ts: "2026-11-23T12:01:00Z",
+          data: {},
+          ...event,
+        },
+      } as DesktopEvent);
+    });
+    await app().wait(60);
+  };
+
+  it("shows from the send through the turn, and goes while the thread waits on you", async () => {
+    await start();
+    expect(lineCursor()).toBe(0);
+    await app().type("Build the thing");
+    await app().press("Enter");
+    // In flight: the hub hasn't answered yet.
+    expect(lineCursor()).toBe(1);
+    await app().act(async () => answerSay!({ action: "sent" }));
+    await app().settle();
+    // Sent, the turn not running yet: still there.
+    expect(lineCursor()).toBe(1);
+    await app().live("default", orchestrator("running"));
+    await emit({
+      seq: 20,
+      kind: "turn.started",
+      data: { from: "user", prompt: "Build the thing" },
+    });
+    expect(lineCursor()).toBe(1);
+    // A permission waits on you: no cursor, though the turn is open.
+    await app().live("default", orchestrator("waiting"));
+    expect(lineCursor()).toBe(0);
+    await app().live("default", orchestrator("running"));
+    expect(lineCursor()).toBe(1);
+    // A reply streams in: the cursor leaves its own line for the reply's end (the
+    // virtual rows, which this stand-in DOM never lays out: working.test.ts covers it).
+    await emit({
+      seq: 21,
+      kind: "agent.text",
+      data: { text: "On it", delta: true },
+    });
+    expect(lineCursor()).toBe(0);
+    await emit({
+      seq: 22,
+      kind: "agent.text",
+      data: { text: "On it", final: true },
+    });
+    // The reply is done, the thread still works (background tasks, a tool): its own line.
+    expect(lineCursor()).toBe(1);
+    await emit({ seq: 23, kind: "turn.ended", data: { result: "ok" } });
+    await app().live("default", orchestrator("idle"));
+    expect(lineCursor()).toBe(0);
+  });
+
+  it("stops being awaited when the turn ends before the status ever showed it running", async () => {
+    await start();
+    await app().type("Quick one");
+    await app().press("Enter");
+    await app().act(async () => answerSay!({ action: "sent" }));
+    await app().settle();
+    expect(lineCursor()).toBe(1);
+    await emit({ seq: 30, kind: "turn.ended", data: { result: "ok" } });
+    expect(lineCursor()).toBe(0);
+  });
+
+  it("only shows while the conversation is scrolled to its bottom", async () => {
+    await start();
+    await app().live("default", orchestrator("running"));
+    expect(lineCursor()).toBe(1);
+    const scroller = app().find(".conversation-scroll");
+    Object.assign(scroller, {
+      scrollHeight: 3000,
+      clientHeight: 500,
+      scrollTop: 200,
+    });
+    await app().act(async () => {
+      scroller.dispatchEvent(new FakeEvent("scroll"));
+    });
+    await app().settle();
+    expect(lineCursor()).toBe(0);
+    Object.assign(scroller, { scrollTop: 2500 });
+    await app().act(async () => {
+      scroller.dispatchEvent(new FakeEvent("scroll"));
+    });
+    await app().settle();
+    expect(lineCursor()).toBe(1);
+  });
+
+  it("keeps still with [tui] animate = false, and moves again once it is set back", async () => {
+    let animate = false;
+    await start({
+      rpc: (method) =>
+        method === "config.show"
+          ? Promise.resolve({ preferences: { "tui.animate": animate } })
+          : undefined,
+    });
+    await app().live("default", orchestrator("running"));
+    expect(lineCursor()).toBe(1);
+    const still = () =>
+      app().find(".conversation-scroll").hasAttribute("data-still");
+    expect(still()).toBe(true);
+    // The orchestrator sets it at once: the conversation says so, the file says to what.
+    animate = true;
+    await emit({
+      seq: 40,
+      kind: "config.changed",
+      data: { key: "tui.animate", value: true, before: false },
+    });
+    expect(still()).toBe(false);
+  });
+});
+
+describe("the notice for a hub on another engine", () => {
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+  const start = async (options: HostOptions = {}) => {
+    vi.resetModules();
+    mounted = await mount(options);
+  };
+  const notice = () => app().all('[data-notice="version"]');
+  const buttons = () =>
+    notice()[0]
+      .querySelectorAll("button")
+      .map((b: FakeElement) => b.textContent);
+  const paths = {
+    version: "0.6.0",
+    build: "463a2ed0aaaaaaaa",
+    hubVersion: "0.6.0",
+    hubBuild: "85ab7b43eecbe2ec",
+  };
+
+  it("shows for a rebuild of the same version, in words about the build", async () => {
+    await start({
+      connect: { ...paths, engineDifference: "build", versionMismatch: true },
+    });
+    expect(notice()).toHaveLength(1);
+    expect(notice()[0].textContent).toContain(
+      "The app bundles a different build of twr 0.6.0 (463a2ed0) than this hub runs (85ab7b43).",
+    );
+    expect(buttons()).toEqual(["Stop hub…"]);
+  });
+
+  it("keeps the version words when the versions differ", async () => {
+    await start({
+      connect: {
+        ...paths,
+        hubVersion: "0.5.2",
+        engineDifference: "version",
+        versionMismatch: true,
+      },
+    });
+    expect(notice()[0].textContent).toContain(
+      "The app bundles twr 0.6.0; this hub still runs 0.5.2.",
+    );
+  });
+
+  it("names the other workspaces whose hubs run another build, and stops them all", async () => {
+    await start({
+      connect: { ...paths, engineDifference: "build", versionMismatch: true },
+      engineHubs: [
+        {
+          workspace: "default",
+          difference: "build",
+          version: "0.6.0",
+          build: "85ab7b43eecbe2ec",
+        },
+        {
+          workspace: "twr",
+          difference: "build",
+          version: "0.6.0",
+          build: "85ab7b43eecbe2ec",
+        },
+      ],
+      catalog: [
+        {
+          id: "cli:hub stop",
+          title: "twr hub stop",
+          group: "CLI · hub",
+          cli: ["hub", "stop"],
+          fields: [{ key: "all", label: "all", type: "boolean" }],
+        },
+      ],
+    });
+    expect(notice()[0].textContent).toContain(
+      "The hub of workspace twr also runs a different build of twr than the app bundles. Stop them and reconnect",
+    );
+    expect(buttons()).toEqual(["Stop hub…", "Stop all hubs…"]);
+    await app().click(app().find('[data-notice="version"] button', "Stop all"));
+    expect(app().find(".dialog").textContent).toContain("twr hub stop");
+  });
+
+  it("shows for another workspace's hub while this one runs the app's engine", async () => {
+    await start({
+      connect: { ...paths, hubBuild: paths.build },
+      engineHubs: [
+        { workspace: "twr", difference: "version", version: "0.5.2" },
+      ],
+    });
+    expect(notice()[0].textContent).toContain(
+      "The hub of workspace twr runs a different twr version than the app bundles.",
+    );
+    expect(buttons()).toEqual(["Stop all hubs…"]);
+  });
+
+  it("does not show when every hub runs the app's engine", async () => {
+    await start({
+      connect: { ...paths, hubBuild: paths.build },
+      engineHubs: [],
+    });
+    expect(notice()).toHaveLength(0);
   });
 });

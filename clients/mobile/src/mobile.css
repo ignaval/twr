@@ -423,6 +423,18 @@ select {
   display: flex;
   gap: 12px;
 }
+.pair-form label > small {
+  font-weight: 400;
+}
+/* A scanned version 2 invitation, in place of the address and code fields. */
+.pair-scanned {
+  display: grid;
+  gap: 8px;
+  overflow-wrap: anywhere;
+}
+.pair-scanned p {
+  margin: 0;
+}
 .hub-connect {
   display: grid;
   width: 100%;
@@ -567,9 +579,9 @@ select {
   [data-mobile="true"] .conversation-scroll {
     padding: 8px 12px 12px;
   }
-  [data-mobile="true"] .latest-user-message > button,
-  [data-mobile="true"] .latest-user-empty {
-    padding-inline: 12px;
+  /* In the phone's text column: the history's 12px inset. */
+  [data-mobile="true"] .latest-user-message {
+    width: calc(100% - 24px);
   }
   [data-mobile="true"] .dialog {
     width: 100%;

@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 const fake = vi.hoisted(() => ({
   listener: undefined as any,
+  network: undefined as any,
+  updateRoutes: vi.fn(async () => {}),
   connect: vi.fn(),
   send: vi.fn(),
   disconnect: vi.fn(async () => {}),
@@ -25,8 +27,9 @@ function reply(id: string, result: any) {
 beforeEach(() => {
   vi.clearAllMocks();
   fake.connect.mockResolvedValue(undefined);
-  fake.addListener.mockImplementation(async (_name, listener) => {
-    fake.listener = listener;
+  fake.addListener.mockImplementation(async (name, listener) => {
+    if (name === "network") fake.network = listener;
+    else fake.listener = listener;
     return { remove: async () => {} };
   });
   fake.send.mockImplementation(async ({ message }) => {
@@ -501,6 +504,63 @@ describe("mobile reconnect", () => {
     expect(fake.connect).toHaveBeenCalledTimes(1);
     await host.stop();
   });
+  it("connects the bootstrap's workspace by its id, the first time too", async () => {
+    const connects: any[] = [];
+    fake.send.mockImplementation(async ({ message }) => {
+      const call = JSON.parse(message);
+      if (call.method === "connect") connects.push(call.params);
+      reply(
+        call.id,
+        call.method === "bootstrap"
+          ? { workspace: "a", read_methods: ["hub.info", "notify.looking"] }
+          : call.method === "connect"
+            ? { workspace: "a" }
+            : {},
+      );
+    });
+    const host = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    await host.start();
+    // As the app does with the bootstrap's workspace; a name it was given goes by name.
+    await host.api().connect("a");
+    await host.api().connect("work");
+    expect(connects).toEqual([
+      { workspace: "a", by_id: true },
+      { workspace: "work" },
+    ]);
+    await host.stop();
+  });
+  it("reconnects by the id the gateway gave, never by a name", async () => {
+    const host = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    await host.start();
+    const connects: any[] = [];
+    fake.send.mockImplementation(async ({ message }) => {
+      const call = JSON.parse(message);
+      if (call.method === "connect") connects.push(call.params);
+      reply(
+        call.id,
+        call.method === "connect"
+          ? { workspace: "a", workspace_name: "acme" }
+          : {},
+      );
+    });
+    // Asked for by its name, connected by its id.
+    await host.api().connect("acme");
+    fake.listener({ message: { type: "transport-closed" } });
+    await host.resume();
+    expect(connects).toEqual([
+      { workspace: "acme" },
+      { workspace: "a", by_id: true },
+    ]);
+    await host.stop();
+  });
   it("serializes foreground recovery with an explicit workspace switch", async () => {
     const host = new RemoteHost(
       hub,
@@ -571,5 +631,165 @@ describe("mobile reconnect", () => {
     expect(mutations).toEqual(["already dispatched"]);
     expect(await next.api().rpc("hub.info")).toEqual({});
     await next.stop();
+  });
+});
+
+describe("network changes and routes (docs/design/phone-pairing.md)", () => {
+  const pinned = {
+    ...hub,
+    id: "pinned",
+    pin: "XNJS-wzokyQ2-vjM0QQJgbie5K1rn-niorfnGqyyfNM",
+    routes: ["tls:192.168.1.20:47321"],
+  };
+  it("saves the routes a pinned hub's hello reports, and only for pinned hubs", async () => {
+    const host = new RemoteHost(
+      pinned,
+      () => {},
+      async () => null,
+    );
+    await host.start();
+    const routes = ["tls:192.168.1.20:47321", "tls:box.tail1234.ts.net:47321"];
+    fake.listener({
+      message: { type: "authenticated", framing: true, routes },
+    });
+    expect(fake.updateRoutes).toHaveBeenCalledWith({ id: "pinned", routes });
+    // Not a list of strings: ignored.
+    fake.listener({ message: { type: "authenticated", routes: [1, 2] } });
+    expect(fake.updateRoutes).toHaveBeenCalledTimes(1);
+    await host.stop();
+    const certificate = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    await certificate.start();
+    fake.listener({ message: { type: "authenticated", routes } });
+    expect(fake.updateRoutes).toHaveBeenCalledTimes(1);
+    await certificate.stop();
+  });
+  it("reconnects at once when the network changes while connected, sending pending mutations once", async () => {
+    vi.useFakeTimers();
+    const host = new RemoteHost(
+      pinned,
+      () => {},
+      async () => null,
+    );
+    try {
+      await host.start();
+      await host.api().connect("default");
+      const original = fake.send.getMockImplementation()!;
+      const mutations: string[] = [];
+      let answer = false;
+      fake.send.mockImplementation(async (payload) => {
+        const call = JSON.parse(payload.message);
+        if (call.method === "rpc" && call.params.method === "thread.send") {
+          mutations.push(call.id);
+          if (answer) reply(call.id, { sent: true });
+          return;
+        }
+        await original(payload);
+      });
+      const pending = host.request("rpc", {
+        method: "thread.send",
+        params: { thread: "worker", prompt: "once" },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fake.connect).toHaveBeenCalledTimes(1);
+      answer = true;
+      fake.network({ type: "cellular" });
+      // No heartbeat timeout and no backoff: the reconnect starts now.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fake.disconnect).toHaveBeenCalledTimes(1);
+      expect(fake.connect).toHaveBeenCalledTimes(2);
+      expect(await pending).toEqual({ sent: true });
+      // The same durable ID twice: the gateway's receipt makes it run once.
+      expect(mutations).toHaveLength(2);
+      expect(new Set(mutations).size).toBe(1);
+    } finally {
+      await host.stop();
+      vi.useRealTimers();
+    }
+  });
+  it("cuts a backoff wait short and resets the backoff", async () => {
+    vi.useFakeTimers();
+    const host = new RemoteHost(
+      pinned,
+      () => {},
+      async () => null,
+    );
+    try {
+      await host.start();
+      await host.api().connect("default");
+      fake.connect.mockRejectedValue(new Error("unreachable"));
+      fake.listener({ message: { type: "transport-closed" } });
+      // Retries at 1 s, 2 s and 4 s fail; the next would wait 8 s.
+      await vi.advanceTimersByTimeAsync(1000 + 2000 + 4000);
+      expect(fake.connect).toHaveBeenCalledTimes(4);
+      fake.connect.mockResolvedValue(undefined);
+      fake.network({ type: "wifi" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fake.connect).toHaveBeenCalledTimes(5);
+      expect(host.socketConnected).toBe(true);
+    } finally {
+      await host.stop();
+      vi.useRealTimers();
+    }
+  });
+  it("ends an attempt stuck on the old network and retries at once", async () => {
+    vi.useFakeTimers();
+    const host = new RemoteHost(
+      pinned,
+      () => {},
+      async () => null,
+    );
+    try {
+      await host.start();
+      await host.api().connect("default");
+      let fail!: (error: Error) => void;
+      fake.connect.mockImplementationOnce(
+        () =>
+          new Promise<void>((_, reject) => {
+            fail = reject;
+          }),
+      );
+      fake.disconnect.mockImplementation(async () => {
+        fail?.(new Error("Connection was superseded"));
+      });
+      fake.listener({ message: { type: "transport-closed" } });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(fake.connect).toHaveBeenCalledTimes(2);
+      fake.network({ type: "wifi" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fake.connect).toHaveBeenCalledTimes(3);
+      expect(host.socketConnected).toBe(true);
+    } finally {
+      fake.disconnect.mockImplementation(async () => {});
+      await host.stop();
+      vi.useRealTimers();
+    }
+  });
+  it("ignores network changes offline, in the background and before the first workspace", async () => {
+    vi.useFakeTimers();
+    const host = new RemoteHost(
+      pinned,
+      () => {},
+      async () => null,
+    );
+    try {
+      await host.start();
+      fake.network({ type: "wifi" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fake.disconnect).not.toHaveBeenCalled();
+      await host.api().connect("default");
+      fake.network({ type: "none" });
+      host.setForeground(false);
+      fake.network({ type: "wifi" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fake.disconnect).not.toHaveBeenCalled();
+      expect(fake.connect).toHaveBeenCalledTimes(1);
+    } finally {
+      await host.stop();
+      vi.useRealTimers();
+    }
   });
 });

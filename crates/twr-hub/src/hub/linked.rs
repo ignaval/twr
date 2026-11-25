@@ -38,10 +38,10 @@ pub(super) fn start(inner: &Arc<Inner>, rbox: RemoteBox) {
                         _=state.changed()=>return,
                         _=capacity.tick()=>{
                             if rbox.is_ready() && hub.retire_idle_linked_runtime(&name,false) {
-                                if let Ok(pressure)=twr_link::bootstrap::request(&paths,&twr_link::service::Request::Pressure{name:name.clone(),workspace:paths.workspace_name().into(),release:None}).await {
+                                if let Ok(pressure)=twr_link::bootstrap::request(&paths,&twr_link::service::Request::Pressure{name:name.clone(),workspace:paths.workspace_id().into(),release:None}).await {
                                     if pressure["waiting"]==true && !hub.retire_idle_linked_runtime(&name,true) {
                                         if let Some(claim)=pressure["claim"].as_str() {
-                                            let _=twr_link::bootstrap::request(&paths,&twr_link::service::Request::Pressure{name:name.clone(),workspace:paths.workspace_name().into(),release:Some(claim.into())}).await;
+                                            let _=twr_link::bootstrap::request(&paths,&twr_link::service::Request::Pressure{name:name.clone(),workspace:paths.workspace_id().into(),release:Some(claim.into())}).await;
                                         }
                                     }
                                 }
@@ -157,7 +157,7 @@ impl Hub {
                 })?;
                 twr_link::service::Request::Manage {
                     name: p.name,
-                    workspace: paths.workspace_name().into(),
+                    workspace: paths.workspace_id().into(),
                     admin: p.admin,
                 }
             }
@@ -186,12 +186,12 @@ impl Hub {
                     code: p.code,
                     replace: p.replace,
                     name: p.name,
-                    workspace: paths.workspace_name().into(),
+                    workspace: paths.workspace_id().into(),
                 }
             }
             "runner.recover" => twr_link::service::Request::Recover {
                 name: params["name"].as_str().unwrap_or_default().into(),
-                workspace: paths.workspace_name().into(),
+                workspace: paths.workspace_id().into(),
             },
             "runner.revoke" => twr_link::service::Request::Revoke {
                 machine: params["machine"].as_str().unwrap_or_default().into(),
@@ -294,7 +294,7 @@ impl Hub {
             &paths,
             &twr_link::service::Request::PushRepo {
                 name: name.clone(),
-                workspace: paths.workspace_name().into(),
+                workspace: paths.workspace_id().into(),
                 project: request.project.clone(),
                 repository: source,
                 base: request.base.clone(),
@@ -374,7 +374,7 @@ impl Hub {
             &paths,
             &twr_link::service::Request::PullRepo {
                 name: name.into(),
-                workspace: paths.workspace_name().into(),
+                workspace: paths.workspace_id().into(),
                 project: project.into(),
                 repository,
                 branch: branch.into(),

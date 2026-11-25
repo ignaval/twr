@@ -23,6 +23,8 @@ The [README](../README.md) has the short version: what twr is, install, the main
 | [workspaces.md](workspaces.md) | separate twrs on one machine (`twr ws`, `-w`): each with its own hub, orchestrator and threads, as tabs in the TUI |
 | [runner-links.md](runner-links.md) | machine pairing, default runner service, source builds, access and capacity |
 | [runners.md](runners.md) | threads on other machines: tokens, tunnels, TLS, outages, attach over ssh |
+| [relay.md](relay.md) | running a twr relay for phones and linked runners: self-hosting with or without a DNS name, configuration, monitoring, what it keeps |
+| [relay-protocol.md](relay-protocol.md) | the relay's wire protocol: the one-port front end, the hub protocol, phone passthrough, the record store, iroh admission, versioning |
 | [architecture.md](architecture.md) | the event log, control stream, reducers, decision ladder, adapters, crates |
 | [security-model.md](security-model.md) | what twr guarantees and how: agents on the socket, the orchestrator's limits, jobs, twr's git, the trash, runners, releases; and what it doesn't protect against |
 | [recipes.md](recipes.md) | setups built from twr's pieces: a jobserver shared by every thread's builds, a review loop |

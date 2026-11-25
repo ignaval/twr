@@ -252,6 +252,7 @@ async fn the_tui_reconnects_after_its_hub_restarts() {
     let (key_tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut input = Input { rx, thread: None };
     let (late_tx, late_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ws_done_tx, ws_done_rx) = tokio::sync::mpsc::unbounded_channel();
     let (_saved_tx, saved_rx) = tokio::sync::mpsc::unbounded_channel();
     let place = speaker::Place {
         remote: false,
@@ -263,6 +264,12 @@ async fn the_tui_reconnects_after_its_hub_restarts() {
         all_callers: Vec::new(),
         late_tx: late_tx.clone(),
         late_rx,
+        pending_removal: None,
+        cancel: Default::default(),
+        opens: 0,
+        note: None,
+        ws_done_tx,
+        ws_done_rx,
         followed: Default::default(),
         tui: twr_core::config::TuiConfig {
             suggest: false,
