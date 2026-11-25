@@ -43,7 +43,8 @@ with the environment it was launched with.
 
 ## Sidebar
 
-The sidebar lists every workspace of the hub, as the TUI's does: `default` first, each with
+The sidebar lists every workspace of the hub by its name, as the TUI's does: the default
+workspace first, each with
 `⚠` (requests waiting on you) and `●` (threads at work) counts, or `○` when its hub isn't
 running. Under each workspace are its **Orchestrator** and its threads. The current
 workspace shows its full thread cards (with the focus filter and parked toggle). Other
@@ -59,6 +60,16 @@ and `+N more` opens that workspace's grid. Each workspace's
 `+` starts a new thread in it. Its name collapses or expands it, and the app remembers
 that on this device. **New workspace** at the end of the list creates or removes
 workspaces. Needs you and the thread grid stay at the top.
+
+The app opens the workspace `TWR_WORKSPACE` names when it is set, else the one it showed
+last while it still exists (by its id: not another workspace renamed into it since), else the default workspace (`twr ws default`), and with no
+default workspace the first one listed, as a bare `twr` does. When the workspace it opens
+can't be (it was removed, say), the sidebar still lists the others, to pick one; and, when
+no workspace could be opened since the app started, to make a new one. Once one was open, a
+failed switch to another still lists them, but making one waits until a workspace is
+connected again. A renamed
+workspace keeps everything the app saved of it: the app knows workspaces by the id their
+hub reports, which a rename leaves.
 
 Under the workspaces, **Manage** lists **Machines & accounts** (the hub's boxes and your
 accounts; it needs `admin` on a paired device), **Activity** (jobs and usage), **Context &

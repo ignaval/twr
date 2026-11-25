@@ -214,7 +214,7 @@ async fn run_call(
             return Ok(json!({"ok":true}));
         }
         if call.method == "desktop.paths" {
-            return Ok(json!({"config":paths.config_file,"data":paths.data_dir,"socket":socket,"workspace":paths.workspace_name(),"version":twr_core::version(),"fold":FOLD}));
+            return Ok(json!({"config":paths.config_file,"data":paths.data_dir,"socket":socket,"workspace":paths.workspace_id(),"workspace_name":paths.display_name(),"version":twr_core::version(),"fold":FOLD}));
         }
         if call.method == "desktop.runner.use" || call.method == "desktop.runner.cancel" || call.method == "desktop.runner.status" {
             anyhow::ensure!(tokio::task::spawn_blocking(||twr_hub::local_agent(std::process::id()).is_none()).await?,"Runner controls are user-only");
@@ -408,7 +408,11 @@ pub async fn run(workspace: String) -> Result<()> {
         anyhow::ensure!(token.len() == 64, "Invalid device credential");
         let _ = DEVICE_TOKEN.set(token.to_owned());
     }
-    let paths = Arc::new(Paths::from_env_in(Some(&workspace))?);
+    // An id its starter held (the gateway's, the desktop app's: [`WORKSPACE_ID_ENV`]) by id
+    // alone; a name the desktop app was given (`TWR_WORKSPACE`) as `-w` takes it.
+    //
+    // [`WORKSPACE_ID_ENV`]: twr_core::paths::WORKSPACE_ID_ENV
+    let paths = Arc::new(Paths::from_env_selected(Some(&workspace))?);
     let config = Config::load_from(&paths);
     let socket = config
         .as_ref()

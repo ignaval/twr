@@ -48,6 +48,14 @@ pub const DEFAULT_WORKSPACE: &str = "default";
 /// what it runs, so an agent's own `twr` calls reach the hub of its workspace.
 pub const WORKSPACE_ENV: &str = "TWR_WORKSPACE";
 
+/// Set by a process of twr that runs `twr` (or its desktop bridge) for a workspace it holds
+/// the id of (a hub it starts, what a hub runs, the phone gateway's commands and terminals,
+/// the desktop app's): a selector (`-w`, [`WORKSPACE_ENV`]) equal to it is that id, resolved
+/// by id alone ([`Paths::from_env_selected`]), so a workspace renamed into the id once its own
+/// is gone is never taken for it. Internal: a person's selectors are resolved by id, else by
+/// name.
+pub const WORKSPACE_ID_ENV: &str = "TWR_WORKSPACE_ID";
+
 /// Longest workspace name, in bytes (it is part of the socket path).
 pub const MAX_WORKSPACE_NAME: usize = 32;
 
@@ -128,16 +136,27 @@ pub fn localize_commands(text: &str, selection: &str) -> String {
 }
 
 /// What a client puts after `twr` in a command it shows (`` `twr -w a attach api` ``), so that
-/// the command reaches the workspace it shows (`workspace`; `None`: `default`) from a shell
-/// whose `TWR_WORKSPACE` is `inherited`: ` -w <name>` for a named one, ` -w default` when the
-/// shell selects another (one that is not UTF-8 too), else nothing.
-pub fn workspace_selection(workspace: Option<&str>, inherited: Option<&std::ffi::OsStr>) -> String {
-    match workspace.filter(|w| *w != DEFAULT_WORKSPACE) {
-        Some(w) => format!(" -w {w}"),
-        None if inherited.is_some_and(|v| !v.is_empty() && v != DEFAULT_WORKSPACE) => {
-            format!(" -w {DEFAULT_WORKSPACE}")
+/// the command reaches workspace `target` (an id) from a shell where `twr` without `-w`
+/// selects `bare` (an id, [`bare_selection`]; `None`: none, or it can't be told): nothing when
+/// that is `target`, else ` -w <target>`. By id, which a rename leaves as it is.
+pub fn workspace_selection(target: &str, bare: Option<&str>) -> String {
+    if bare == Some(target) {
+        String::new()
+    } else {
+        format!(" -w {target}")
+    }
+}
+
+/// The id of the workspace of `root` that `twr` without `-w` selects in a shell whose
+/// `TWR_WORKSPACE` is `inherited`: the one it names (`None` when that is no workspace, or not
+/// UTF-8), else the default workspace ([`Paths::default_id`]).
+pub fn bare_selection(root: &Paths, inherited: Option<&std::ffi::OsStr>) -> Option<String> {
+    match inherited.filter(|v| !v.is_empty()) {
+        Some(v) => {
+            let ws = root.find_workspace(v.to_str()?).ok()?;
+            ws.exists().then(|| ws.workspace_id().to_string())
         }
-        None => String::new(),
+        None => root.default_id(),
     }
 }
 
@@ -178,6 +197,38 @@ impl Paths {
         Self::resolve_in(|k| std::env::var(k).ok(), workspace)
     }
 
+    /// [`Paths::from_env_in`] for the workspace `twr` runs in (`-w`, else [`WORKSPACE_ENV`]),
+    /// which may be an id another process of twr held ([`WORKSPACE_ID_ENV`]): that one by id
+    /// alone (its paths, which do not exist once it is gone), anything else as
+    /// [`Paths::from_env_in`] has it.
+    pub fn from_env_selected(workspace: Option<&str>) -> anyhow::Result<Paths> {
+        match Self::held_id(|k| std::env::var(k).ok(), workspace) {
+            Some(id) => Self::resolve_root(&|k: &str| std::env::var(k).ok())?.workspace(&id),
+            None => Self::from_env_in(workspace),
+        }
+    }
+
+    /// [`Paths::from_env_selected`] with `env` to look up variables.
+    pub fn resolve_selected(
+        env: impl Fn(&str) -> Option<String>,
+        workspace: Option<&str>,
+    ) -> anyhow::Result<Paths> {
+        match Self::held_id(&env, workspace) {
+            Some(id) => Self::resolve_root(&env)?.workspace(&id),
+            None => Self::resolve_in(env, workspace),
+        }
+    }
+
+    /// The selector (`workspace`, else [`WORKSPACE_ENV`]) when it is the id
+    /// [`WORKSPACE_ID_ENV`] says another process of twr held.
+    fn held_id(env: impl Fn(&str) -> Option<String>, workspace: Option<&str>) -> Option<String> {
+        let selector = match workspace {
+            Some(w) => Some(w.to_string()),
+            None => env(WORKSPACE_ENV).filter(|v| !v.is_empty()),
+        }?;
+        (env(WORKSPACE_ID_ENV).as_deref() == Some(selector.as_str())).then_some(selector)
+    }
+
     /// Resolves paths using `env` to look up variables (testable without touching the
     /// process environment), in the workspace [`WORKSPACE_ENV`] names. Empty values count as
     /// unset.
@@ -196,8 +247,10 @@ impl Paths {
         };
         let root = Self::resolve_root(&env)?;
         match name {
-            Some(name) => root.workspace(&name),
-            None => Ok(root),
+            Some(name) => root.find_workspace(&name),
+            // The default workspace; when there is none, the root slot's paths, which do not
+            // exist ([`Paths::exists`]).
+            None => Ok(root.default_workspace().unwrap_or(root)),
         }
     }
 
@@ -271,11 +324,6 @@ impl Paths {
         }
     }
 
-    /// The workspace's name: its own, or [`DEFAULT_WORKSPACE`].
-    pub fn workspace_name(&self) -> &str {
-        self.workspace.as_deref().unwrap_or(DEFAULT_WORKSPACE)
-    }
-
     /// Where the root keeps its named workspaces: `<root data>/workspaces`.
     pub fn workspaces_dir(&self) -> PathBuf {
         self.root().data_dir.join("workspaces")
@@ -288,10 +336,13 @@ impl Paths {
         self.root().data_dir.join("accounts")
     }
 
-    /// Whether the workspace exists: `default` always does; a named one once its directory
-    /// was made (`twr ws new`).
+    /// Whether the workspace exists: the root slot unless it was removed
+    /// ([`Paths::root_removed`]); a named one once its directory was made (`twr ws new`).
     pub fn exists(&self) -> bool {
-        self.workspace.is_none() || self.data_dir.is_dir()
+        match self.workspace {
+            None => !self.root_removed(),
+            Some(_) => self.data_dir.is_dir(),
+        }
     }
 
     /// The root's named workspaces, sorted: the directories under [`Paths::workspaces_dir`]
@@ -332,8 +383,18 @@ impl Paths {
     /// The instance's display name: a named workspace's name; else a `TWR_HOME` layout uses
     /// its directory's name, and the standard XDG layout is `default`.
     pub fn instance_name(&self) -> String {
-        if let Some(w) = &self.workspace {
-            return w.clone();
+        if self.workspace.is_some() || self.data_dir.join(crate::workspaces::NAME_FILE).exists() {
+            return self.display_name();
+        }
+        self.base_instance_name()
+    }
+
+    /// [`Paths::instance_name`] as it is before any rename: a named workspace's id; else the
+    /// `TWR_HOME` directory's name, or `default`. A hub reports its name file's name over it
+    /// while there is one, read as it is asked (`hub.info` `instance`).
+    pub fn base_instance_name(&self) -> String {
+        if let Some(id) = &self.workspace {
+            return id.clone();
         }
         let Some(home) = self.instance_home() else {
             return "default".into();
@@ -423,9 +484,24 @@ pub fn effective_uid() -> u32 {
 /// what it names is checked. So is every directory on its way ([`check_ancestors`]): another
 /// user who may rename one could put the whole path somewhere else after it was checked.
 pub fn ensure_private_dir(dir: &Path) -> anyhow::Result<()> {
+    private_dir(dir, true)
+}
+
+/// [`ensure_private_dir`] for a directory that must exist already: one that does not is an
+/// error, never made (a named workspace's, which only `twr ws new` makes: a hub starting as
+/// `twr ws rm` removes it must not make it again).
+pub fn check_private_dir(dir: &Path) -> anyhow::Result<()> {
+    private_dir(dir, false)
+}
+
+fn private_dir(dir: &Path, create: bool) -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     let mut created = false;
     if std::fs::symlink_metadata(dir).is_err() {
+        // (One check: a directory removed after it would otherwise be made here.)
+        if !create {
+            return Err(anyhow!("{} does not exist", dir.display()));
+        }
         if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)
                 .map_err(|e| anyhow!("creating {}: {e}", parent.display()))?;
@@ -961,13 +1037,13 @@ mod tests {
         );
         assert_eq!(w.db_file(), w.data_dir.join("twr.db"));
         assert_eq!(w.worktrees_dir(), w.data_dir.join("worktrees"));
-        assert_eq!(w.workspace_name(), "client-x");
+        assert_eq!(w.workspace_id(), "client-x");
         assert_eq!(w.instance_name(), "client-x");
         assert_eq!(w.worktree_namespace().as_deref(), Some("@client-x"));
         assert_eq!(w.orchestrator_dir(), Some(w.data_dir.join("orchestrator")));
         assert_eq!(w.root(), root);
         assert_eq!(w.workspaces_dir(), root.workspaces_dir());
-        assert_eq!(root.workspace_name(), "default");
+        assert_eq!(root.workspace_id(), "default");
         assert_eq!(root.orchestrator_dir(), None);
         // `default` is the root itself.
         assert_eq!(
@@ -977,6 +1053,51 @@ mod tests {
         assert_eq!(root.workspace("default").unwrap(), root);
         assert_eq!(w.workspace("default").unwrap(), root);
         assert_eq!(w.workspace("client-x").unwrap(), w);
+    }
+
+    /// A selector equal to the id another process of twr held ([`WORKSPACE_ID_ENV`]) is that
+    /// id alone: once its workspace is gone, never one renamed into it, from `-w` or
+    /// [`WORKSPACE_ENV`]; any other selector is by id, else by name.
+    #[test]
+    fn a_held_id_never_resolves_by_name() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().to_string_lossy().into_owned();
+        let root = Paths::with_home(d.path());
+        crate::workspaces::create(&root, "a").unwrap();
+        crate::workspaces::create(&root, "b").unwrap();
+        std::fs::remove_dir_all(root.workspace("a").unwrap().data_dir).unwrap();
+        crate::workspaces::rename(&root, "b", "a").unwrap();
+        let typed = [("TWR_HOME", home.as_str())];
+        assert_eq!(
+            Paths::resolve_selected(env(&typed), Some("a"))
+                .unwrap()
+                .workspace_id(),
+            "b"
+        );
+        let held = [("TWR_HOME", home.as_str()), (WORKSPACE_ID_ENV, "a")];
+        let p = Paths::resolve_selected(env(&held), Some("a")).unwrap();
+        assert!(p.workspace_id() == "a" && !p.exists());
+        let by_var = [
+            ("TWR_HOME", home.as_str()),
+            (WORKSPACE_ENV, "a"),
+            (WORKSPACE_ID_ENV, "a"),
+        ];
+        let p = Paths::resolve_selected(env(&by_var), None).unwrap();
+        assert!(p.workspace_id() == "a" && !p.exists());
+        // Another selector than the held id is a person's: by id, else by name.
+        let other = [("TWR_HOME", home.as_str()), (WORKSPACE_ID_ENV, "b")];
+        assert_eq!(
+            Paths::resolve_selected(env(&other), Some("a"))
+                .unwrap()
+                .workspace_id(),
+            "b"
+        );
+        // `default`'s held id is the root slot, as ever.
+        let root_held = [("TWR_HOME", home.as_str()), (WORKSPACE_ID_ENV, "default")];
+        assert_eq!(
+            Paths::resolve_selected(env(&root_held), Some("default")).unwrap(),
+            root
+        );
     }
 
     #[test]
@@ -1089,24 +1210,56 @@ mod tests {
         let token = "too short: `twr runner token` prints a new one; `twr runner` too";
         assert_eq!(localize_commands(token, " -w a"), token);
         assert_eq!(localize_commands(token, " --socket /s"), token);
+        assert_eq!(workspace_selection("a", None), " -w a");
+        assert_eq!(workspace_selection("a", Some("a")), "");
+        assert_eq!(workspace_selection("default", Some("default")), "");
+        assert_eq!(workspace_selection("default", Some("a")), " -w default");
+        assert_eq!(workspace_selection("default", None), " -w default");
+    }
+
+    /// `check_private_dir` checks a directory that exists and never makes one that does not:
+    /// whatever happens between its looks, it opens what is there (`open_dir`, which fails on
+    /// none).
+    #[test]
+    fn a_checked_private_dir_is_never_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        assert!(check_private_dir(&gone).is_err());
+        assert!(!gone.exists());
+        std::fs::create_dir(&gone).unwrap();
+        check_private_dir(&gone).unwrap();
+        ensure_private_dir(&dir.path().join("made")).unwrap();
+        assert!(dir.path().join("made").is_dir());
+    }
+
+    #[test]
+    fn a_bare_twr_selects_the_shells_workspace_else_the_default() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
-        assert_eq!(workspace_selection(Some("a"), None), " -w a");
-        assert_eq!(workspace_selection(Some("default"), None), "");
+        let dir = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(dir.path());
+        crate::workspaces::create(&root, "a").unwrap();
+        crate::workspaces::rename(&root, "a", "acme").unwrap();
+        assert_eq!(bare_selection(&root, None).as_deref(), Some("default"));
         assert_eq!(
-            workspace_selection(None, Some(OsStr::new("a"))),
-            " -w default"
-        );
-        assert_eq!(workspace_selection(None, Some(OsStr::new("default"))), "");
-        assert_eq!(workspace_selection(None, Some(OsStr::new(""))), "");
-        assert_eq!(
-            workspace_selection(None, Some(OsStr::from_bytes(b"a\xff"))),
-            " -w default"
+            bare_selection(&root, Some(OsStr::new(""))).as_deref(),
+            Some("default")
         );
         assert_eq!(
-            workspace_selection(Some("b"), Some(OsStr::new("a"))),
-            " -w b"
+            bare_selection(&root, Some(OsStr::new("acme"))).as_deref(),
+            Some("a")
         );
+        assert_eq!(
+            bare_selection(&root, Some(OsStr::new("a"))).as_deref(),
+            Some("a")
+        );
+        assert_eq!(bare_selection(&root, Some(OsStr::new("nope"))), None);
+        assert_eq!(
+            bare_selection(&root, Some(OsStr::from_bytes(b"a\xff"))),
+            None
+        );
+        crate::workspaces::set_default(&root, "acme").unwrap();
+        assert_eq!(bare_selection(&root, None).as_deref(), Some("a"));
     }
 
     #[test]

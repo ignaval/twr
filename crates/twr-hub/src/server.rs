@@ -12,7 +12,7 @@
 //! | `box.restart`       | `{box}` (users only)                                | `{box, epoch}`: SSH box `box`'s supervisor ends its session and connects again with the relay's `--restart` (`crate::ssh_box`); `epoch`: the connection replaced |
 //! | `box.token`         | `{box}` (users only)                                | `{box, changed, accepting}`: token box `box` takes its token from `config.toml` / `boxes.toml` again, or none when they no longer give it one; a change drops its runner connection (`hub::boxes`). Never the token |
 //! | `box.agents`        | `{box, refresh?}` (`refresh`: users only)           | `{box, online, agents}`: the box's agent CLIs (`local`: the hub's own), probed again first with `refresh` (`hub::box_agents`); the orchestrator and agents see `runtime, found, login` of each |
-//! | `hub.shutdown`      | -                                                   | `{ok: true}` (then the hub stops) |
+//! | `hub.shutdown`      | `{if_idle?}`                                        | `{ok: true, if_idle}` (then the hub stops); with `if_idle` (the TUI's Delete), only while nothing would be lost, else `conflict` saying what |
 //! | `config.show`       | -                                                   | the configuration the hub loaded, from an allowlist (`hub::config_view`): no token, `env` value, preset command line, `ssh` destination or TLS file; `env` tables as `env_names` (not for agents) |
 //! | `config.set`        | `{key, value}` (`key` dotted, `value` a boolean, number or string; a device needs `admin`; not for agents) | `{status: "applied", key, value, before, effect}`, or for the orchestrator and a key that goes on the confirm card `{status: "needs_confirmation", key, value, before, effect, message}`: one key of `config.toml` set, its comments and the rest of the file kept, and `config.changed` recorded (`hub::config_set`). The orchestrator's only in a turn of the user's latest message (`relay_forbidden` otherwise); boxes, `hub.tls`, `env` entries, command lines and secret-looking values are refused for everyone (`bad_request`) |
 //! | `thread.spawn` | `{operation_id, request: <thread.new params>, prompt?}` | durable operation (pending/complete/error) |
@@ -2738,7 +2738,7 @@ async fn hello(hub: &Hub, conn: &mut Conn, p: Value) -> Result<Value, RpcError> 
         conn.client = format!("device:{}", device.id);
         conn.device = Some(device);
         return Ok(
-            json!({"client":conn.client,"identity":format!("user:{}",conn.client),"workspace":hub.workspace()}),
+            json!({"client":conn.client,"identity":format!("user:{}",conn.client),"workspace":hub.workspace(),"workspace_name":hub.workspace_name()}),
         );
     }
     if conn.device.is_some() {
@@ -2803,7 +2803,7 @@ async fn hello(hub: &Hub, conn: &mut Conn, p: Value) -> Result<Value, RpcError> 
             conn.client = p.client;
             conn.token = Some(token);
             Ok(
-                json!({ "client": conn.client, "identity": "orchestrator", "workspace": hub.workspace() }),
+                json!({ "client": conn.client, "identity": "orchestrator", "workspace": hub.workspace(), "workspace_name": hub.workspace_name() }),
             )
         }
         // Once a connection presented a token it stays the orchestrator's (or nobody's, when
@@ -2827,7 +2827,12 @@ async fn hello(hub: &Hub, conn: &mut Conn, p: Value) -> Result<Value, RpcError> 
             conn.client = p.client;
             conn.token = None;
             let identity = conn.identity(&Caller::user(conn.client.clone()));
-            let mut out = json!({ "client": conn.client, "identity": identity, "workspace": hub.workspace() });
+            let mut out = json!({
+                "client": conn.client,
+                "identity": identity,
+                "workspace": hub.workspace(),
+                "workspace_name": hub.workspace_name(),
+            });
             if let Some(why) = conn.why() {
                 out["why"] = json!(why);
             }
@@ -3157,7 +3162,23 @@ fn call(
             }
             Ok(info)
         }
-        "hub.shutdown" => Ok(json!({ "ok": true })),
+        "hub.shutdown" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct ShutdownParams {
+                #[serde(default)]
+                if_idle: bool,
+            }
+            let p: ShutdownParams = if p.is_null() {
+                ShutdownParams::default()
+            } else {
+                params(p)?
+            };
+            if p.if_idle {
+                hub.shutdown_if_idle()?;
+            }
+            Ok(json!({ "ok": true, "if_idle": p.if_idle }))
+        }
         "config.show" => Ok(hub.config_show()),
         "thread.spawn" => {
             #[derive(Default, Deserialize)]

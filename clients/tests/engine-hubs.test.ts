@@ -88,6 +88,21 @@ describe("engineHubs", () => {
       { workspace: "older", difference: "version", version: "0.5.2" },
     ]);
   });
+  it("keys a renamed workspace's hub by its id, named as shown", () => {
+    const listing = [
+      { id: "a", name: "acme", hub: "running", version: "0.5.2" },
+      { id: "default", name: "default", hub: "running", version: "0.5.2" },
+    ];
+    const hubs = engineHubs(listing, app);
+    expect(hubs).toEqual([
+      { workspace: "a", name: "acme", difference: "version", version: "0.5.2" },
+      { workspace: "default", difference: "version", version: "0.5.2" },
+    ]);
+    // The app's workspace is the id: the current one is told apart by it.
+    expect(engineNotice(app, hubs, "default")).toBe(
+      "The app bundles twr 0.6.0; this hub still runs 0.5.2. The hub of workspace acme also runs a different twr version than the app bundles. Stop them and reconnect when you’re ready to use the app’s engine.",
+    );
+  });
   it("drops a build that is not one", () => {
     expect(
       engineHubs([running("default", { version: "0.5.2", build: "x" })], app),

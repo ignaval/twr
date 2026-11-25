@@ -82,21 +82,31 @@ export async function localInboxSources(
 ): Promise<InboxSource[]> {
   if (!Array.isArray(workspaces) || workspaces.length > 256)
     throw new Error("Invalid workspace listing");
+  // By id, what each workspace's hub reports as `workspace` (an older twr's rows have only
+  // `name`, its id then); its name is what is shown.
   const listing = new Map<string, any>();
   for (const value of workspaces)
     listing.set(
-      workspaceSchema.parse(typeof value === "string" ? value : value?.name),
+      workspaceSchema.parse(
+        typeof value === "string" ? value : value?.id || value?.name,
+      ),
       value,
     );
   const names = [...listing.keys()];
   const sources: InboxSource[] = new Array(names.length);
-  const base = (workspace: string): InboxSource => ({
-    hubId: "local",
-    hubName: "This computer",
-    workspace,
-    attention: [],
-    threads: [],
-  });
+  const base = (workspace: string): InboxSource => {
+    const row = listing.get(workspace);
+    const name =
+      typeof row?.name === "string" && row.name ? row.name : workspace;
+    return {
+      hubId: "local",
+      hubName: "This computer",
+      workspace,
+      ...(name !== workspace ? { workspaceName: name } : {}),
+      attention: [],
+      threads: [],
+    };
+  };
   const unread: number[] = [];
   names.forEach((workspace, index) => {
     const row = listing.get(workspace);

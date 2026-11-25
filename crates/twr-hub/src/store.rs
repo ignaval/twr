@@ -338,6 +338,36 @@ pub fn connect(path: &Path) -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
+/// [`connect`] to a database that must exist: one that does not is an error, never made
+/// (a workspace's that `twr ws rm` removed meanwhile).
+pub fn connect_existing(path: &Path) -> anyhow::Result<Connection> {
+    use rusqlite::OpenFlags;
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags)
+        .with_context(|| format!("opening database {}", path.display()))?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    conn.set_prepared_statement_cache_capacity(64);
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    Ok(conn)
+}
+
+/// A connection to a database that must exist, as it is: no pragma that writes (not even the
+/// journal mode), for a look at its schema before anything else opens it
+/// ([`connect_existing`] sets WAL, which rewrites a database not in WAL mode).
+pub fn connect_as_is(path: &Path) -> anyhow::Result<Connection> {
+    use rusqlite::OpenFlags;
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags)
+        .with_context(|| format!("opening database {}", path.display()))?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    Ok(conn)
+}
+
 /// Creates or checks the schema.
 fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     let version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -664,7 +694,8 @@ impl Store {
     /// migrated already: for a replay in the background that writes nothing but a checkpoint
     /// (`hub::checkpoint`).
     pub fn open_existing(path: &Path) -> anyhow::Result<Store> {
-        let conn = connect(path)?;
+        // Never made here: a log gone meanwhile (its workspace removed) stays gone.
+        let conn = connect_existing(path)?;
         Ok(Store {
             wal: WalSync::of(&conn),
             conn,

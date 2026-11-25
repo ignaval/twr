@@ -1,0 +1,1453 @@
+//! The workspaces of a root ([`crate::paths`]): what each is called, which one commands
+//! without `-w` select, and the registry operations that change them (`twr ws new`, `rename`,
+//! `default`, and the bookkeeping of `rm`).
+//!
+//! A workspace has an **id**, its storage slot, which never changes: [`DEFAULT_WORKSPACE`]
+//! for the one in the root's own data directory (the *root slot*), else the name of its
+//! directory under `<root data>/workspaces/`. Everything a workspace keeps is keyed by its id:
+//! its data directory, its socket (`ws/<id>.sock`), its branches (`@<id>`), its orchestrator's
+//! working directory (which Claude Code keys its sessions and memories by). A workspace is
+//! created with its name as its id.
+//!
+//! Its **name** is what it is shown as: the [`NAME_FILE`] in its data directory, else its id.
+//! Renaming writes that file and moves nothing, so a running hub, its threads, sessions,
+//! worktrees and the TUIs on it keep going.
+//!
+//! A selector (`-w`, `$TWR_WORKSPACE`, `/ws <x>`) is a name or an id. Names and ids share one
+//! namespace: no workspace may be named another's name or id, and only the root slot may be
+//! named `default`. So a selector names one workspace at most, and a renamed workspace's
+//! original name keeps selecting it (until it is removed): an alias of that workspace, not a
+//! workspace of its own.
+//!
+//! The **default** workspace, which commands without `-w` (and `$TWR_WORKSPACE`) select, is
+//! the one whose id [`DEFAULT_FILE`] holds, else the root slot. There can be none: the root
+//! slot was removed and no other was made the default.
+//!
+//! The root slot can be removed like any other: [`REMOVED_FILE`] in the root's data directory
+//! says so (the directory itself holds what every workspace shares, so it stays), and no hub
+//! starts there until `twr ws new default` makes it again.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, bail, Context};
+
+use crate::paths::{workspace_name_error, Paths, DEFAULT_WORKSPACE};
+
+/// The file in a workspace's data directory that holds its name, when it was renamed.
+pub const NAME_FILE: &str = "workspace-name";
+
+/// The file in a workspace's data directory that holds a token of its own, made with it: a
+/// workspace removed and made again with the same id has another ([`generation`]).
+pub const GENERATION_FILE: &str = "workspace-generation";
+
+/// The file in the root's data directory that holds the default workspace's id, once one
+/// other than the root slot was made the default (`twr ws default`).
+pub const DEFAULT_FILE: &str = "default-workspace";
+
+/// The file in the root's data directory that says the root slot's workspace was removed.
+pub const REMOVED_FILE: &str = "workspace-removed";
+
+/// The lock in the root's data directory held while workspaces are created, renamed, removed
+/// or made the default, so two of those never pass the same check.
+pub const REGISTRY_LOCK: &str = "workspaces.lock";
+
+/// What the root slot's workspace keeps in the root's data directory, and its removal takes
+/// (entries starting with one of [`ROOT_OWNED_PREFIXES`] too). Everything else there is
+/// shared by every workspace (`workspaces/`, `accounts/`, `job-slots/`, the TUI's and the
+/// speaker's state, the boxes' key) or not twr's, and stays.
+pub const ROOT_OWNED: &[&str] = &[
+    "twr.db",
+    "twr.db-wal",
+    "twr.db-shm",
+    "twr.db-journal",
+    "archive.db",
+    "archive.db-wal",
+    "archive.db-shm",
+    "archive.db-journal",
+    "hub.log",
+    "trash",
+    "jobs",
+    "suggest",
+    "memory",
+    "loops",
+    "worktrees",
+    "tui-history",
+    // Its identity to the runner service (`twr-link`): one made again is another workspace.
+    "link-identity",
+    NAME_FILE,
+    GENERATION_FILE,
+];
+
+/// Prefixes of the root slot's own files in the root's data directory: its orchestrator's
+/// MCP configs (`orch-mcp-<hash>.json`).
+pub const ROOT_OWNED_PREFIXES: &[&str] = &["orch-mcp-"];
+
+/// A workspace that exists, as listed ([`Paths::workspaces`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// Its id ([`crate::workspaces`]).
+    pub id: String,
+    /// Its name.
+    pub name: String,
+    /// Whether commands without `-w` select it.
+    pub default: bool,
+    /// Its paths.
+    pub paths: Paths,
+}
+
+impl Paths {
+    /// This workspace's id: [`DEFAULT_WORKSPACE`] for the root slot, else its directory's name.
+    pub fn workspace_id(&self) -> &str {
+        self.workspace.as_deref().unwrap_or(DEFAULT_WORKSPACE)
+    }
+
+    /// This workspace's name: its [`NAME_FILE`] when that holds a valid name, else its id.
+    pub fn display_name(&self) -> String {
+        read_name(&self.data_dir.join(NAME_FILE)).unwrap_or_else(|| self.workspace_id().into())
+    }
+
+    /// Where the root says its root slot's workspace was removed ([`REMOVED_FILE`]).
+    pub fn removed_marker(&self) -> PathBuf {
+        self.root().data_dir.join(REMOVED_FILE)
+    }
+
+    /// Whether the root slot's workspace was removed (and not made again).
+    pub fn root_removed(&self) -> bool {
+        std::fs::symlink_metadata(self.removed_marker()).is_ok()
+    }
+
+    /// The ids of the root's workspaces that exist: the root slot's first (unless it was
+    /// removed), then the others' by id.
+    pub fn workspace_ids(&self) -> std::io::Result<Vec<String>> {
+        let root = self.root();
+        let mut ids = Vec::new();
+        if !root.root_removed() {
+            ids.push(DEFAULT_WORKSPACE.to_string());
+        }
+        ids.extend(root.named_workspaces()?);
+        Ok(ids)
+    }
+
+    /// The root's workspaces that exist: the default first, then the others by name.
+    pub fn workspaces(&self) -> std::io::Result<Vec<Entry>> {
+        let root = self.root();
+        let ids = root.workspace_ids()?;
+        let default = root.default_id();
+        let mut out: Vec<Entry> = ids
+            .into_iter()
+            .filter_map(|id| {
+                let paths = root.workspace(&id).ok()?;
+                Some(Entry {
+                    name: paths.display_name(),
+                    default: default.as_deref() == Some(id.as_str()),
+                    id,
+                    paths,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| b.default.cmp(&a.default).then_with(|| a.name.cmp(&b.name)));
+        Ok(out)
+    }
+
+    /// The id of the root's default workspace: the one [`DEFAULT_FILE`] names while it exists,
+    /// else the root slot unless it was removed. `None`: there is none.
+    pub fn default_id(&self) -> Option<String> {
+        let root = self.root();
+        if let Some(id) = read_name(&root.data_dir.join(DEFAULT_FILE)) {
+            if id != DEFAULT_WORKSPACE {
+                if root.workspace(&id).is_ok_and(|p| p.exists()) {
+                    return Some(id);
+                }
+            } else if !root.root_removed() {
+                return Some(id);
+            }
+        }
+        (!root.root_removed()).then(|| DEFAULT_WORKSPACE.to_string())
+    }
+
+    /// The paths of the workspace `selector` names in this root: the one so named, else the
+    /// one with that id ([`crate::workspaces`]). One that names none gives the paths it would
+    /// have as an id, which do not exist ([`Paths::exists`]). Fails on a selector that is no
+    /// valid name.
+    pub fn find_workspace(&self, selector: &str) -> anyhow::Result<Paths> {
+        if let Some(why) = workspace_name_error(selector) {
+            return Err(anyhow!(why));
+        }
+        let root = self.root();
+        if selector == DEFAULT_WORKSPACE {
+            return Ok(root);
+        }
+        let by_id = root.workspace(selector)?;
+        if by_id.data_dir.is_dir() {
+            return Ok(by_id);
+        }
+        if !root.root_removed() && root.display_name() == selector {
+            return Ok(root);
+        }
+        for id in root.named_workspaces().unwrap_or_default() {
+            let p = root.workspace(&id)?;
+            if p.display_name() == selector {
+                return Ok(p);
+            }
+        }
+        Ok(by_id)
+    }
+
+    /// The paths of the workspace whose id is `id`, while it exists: by id alone, never a
+    /// workspace only named so (once `id`'s workspace is removed, another may be renamed into
+    /// it). For what is kept by id and must reach that workspace or none.
+    pub fn existing_by_id(&self, id: &str) -> anyhow::Result<Paths> {
+        let ws = self.root().workspace(id)?;
+        if !ws.exists() {
+            bail!("there is no workspace {id}");
+        }
+        Ok(ws)
+    }
+
+    /// The default workspace's paths ([`Paths::default_id`]); `None` when there is none.
+    pub fn default_workspace(&self) -> Option<Paths> {
+        let id = self.default_id()?;
+        self.root().workspace(&id).ok()
+    }
+}
+
+/// A name read from `file` (its first line, trimmed), when it is a valid workspace name.
+fn read_name(file: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(file).ok()?;
+    let name = text.lines().next()?.trim();
+    workspace_name_error(name)
+        .is_none()
+        .then(|| name.to_string())
+}
+
+/// Writes `text` to `path` whole or not at all: to a private temporary file beside it, then
+/// renamed over it.
+pub fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let base = path.file_name().map(|n| n.to_string_lossy().into_owned());
+    let tmp = dir.join(format!(
+        ".{}.tmp-{}",
+        base.unwrap_or_default(),
+        std::process::id()
+    ));
+    let res = (|| {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// The registry lock ([`REGISTRY_LOCK`]), held until dropped.
+pub struct RegistryLock {
+    file: std::fs::File,
+}
+
+/// Unlocked when let go, not only closed: a process another thread starts meanwhile shares the
+/// open file until it execs, and the lock stays on it while anyone has it open.
+impl Drop for RegistryLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+impl RegistryLock {
+    /// Takes the lock of `root`'s registry, waiting for another holder (they hold it while
+    /// they check and write a few small files, and `twr ws rm` while its question waits): as
+    /// it starts to wait it calls the hook [`on_registry_wait`] set, which says so. Makes the
+    /// root's data directory, private, when there is none yet.
+    pub fn take(root: &Paths) -> anyhow::Result<RegistryLock> {
+        let root = root.root();
+        crate::paths::ensure_private_dir(&root.data_dir)?;
+        let path = root.data_dir.join(REGISTRY_LOCK);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if let Some(hook) = WAIT_HOOK
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                {
+                    hook();
+                }
+                // A wait the caller can give up ([`cancellable`]): polled, so that it notices.
+                match CANCEL.with(|c| c.borrow().clone()) {
+                    None => file
+                        .lock()
+                        .with_context(|| format!("locking {}", path.display()))?,
+                    Some(cancel) => loop {
+                        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                            bail!(
+                                "given up while it waited for another change to the \
+                                 workspaces: nothing was changed"
+                            );
+                        }
+                        match file.try_lock() {
+                            Ok(()) => break,
+                            Err(std::fs::TryLockError::WouldBlock) => {
+                                std::thread::sleep(std::time::Duration::from_millis(50))
+                            }
+                            Err(std::fs::TryLockError::Error(e)) => {
+                                return Err(e)
+                                    .with_context(|| format!("locking {}", path.display()))
+                            }
+                        }
+                    },
+                }
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("locking {}", path.display()))
+            }
+        }
+        Ok(RegistryLock { file })
+    }
+}
+
+impl RegistryLock {
+    /// Whether another process holds the registry lock now (a `twr ws` change, `twr ws rm`
+    /// maybe asking its question): looked at without waiting, and let go at once.
+    pub fn is_held(root: &Paths) -> bool {
+        let path = root.root().data_dir.join(REGISTRY_LOCK);
+        let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) else {
+            return false;
+        };
+        match file.try_lock() {
+            Ok(()) => {
+                let _ = file.unlock();
+                false
+            }
+            Err(std::fs::TryLockError::WouldBlock) => true,
+            Err(std::fs::TryLockError::Error(_)) => false,
+        }
+    }
+
+    /// [`RegistryLock::take`] for long-lived code (the runner service): waits at most `wait`
+    /// for another holder (`twr ws rm` may hold it while its question waits, for hours), then
+    /// fails saying a workspace change is in progress, for its caller to try again later. Never
+    /// calls the wait hook.
+    pub fn take_within(root: &Paths, wait: std::time::Duration) -> anyhow::Result<RegistryLock> {
+        let root = root.root();
+        crate::paths::ensure_private_dir(&root.data_dir)?;
+        let path = root.data_dir.join(REGISTRY_LOCK);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(RegistryLock { file }),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(e).with_context(|| format!("locking {}", path.display()))
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "another change to the workspaces is in progress (a `twr ws` command, maybe \
+                     asking a question): try again once it is done"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+thread_local! {
+    /// The flag that gives up this thread's wait for the registry lock ([`cancellable`]).
+    static CANCEL: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` on this thread with `cancel` as what gives up its waits for the registry lock
+/// ([`RegistryLock::take`]): once it is set, a wait ends with an error and changes nothing.
+/// For a long-lived process that runs a change for its user (the TUI's Rename, Make default,
+/// New workspace) and must not apply it once they quit.
+pub fn cancellable<T>(
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    f: impl FnOnce() -> T,
+) -> T {
+    /// Puts back what the thread had, however `f` ends (a panic too: a pool's thread lives
+    /// on).
+    struct Restore(Option<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let was = self.0.take().flatten();
+            CANCEL.with(|c| *c.borrow_mut() = was);
+        }
+    }
+    let _restore = Restore(Some(CANCEL.with(|c| c.replace(Some(cancel.clone())))));
+    f()
+}
+
+/// The removals of a process past their checks, by workspace name, from the first thing they
+/// change to the end of their deletion ([`Removing`]), and whether it is closing: a process
+/// that quits waits for those it lists (the TUI), and once it closes, none begins, so none is
+/// cut off half deleted. [`REMOVALS`] is the process's own.
+pub struct Removals(std::sync::Mutex<(bool, Vec<String>)>);
+
+/// This process's removals ([`Removals`]): only the TUI's quit closes it.
+pub static REMOVALS: Removals = Removals::new();
+
+impl Default for Removals {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Removals {
+    pub const fn new() -> Removals {
+        Removals(std::sync::Mutex::new((false, Vec::new())))
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, (bool, Vec<String>)> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Marks workspace `name`'s removal as past its checks until the guard is dropped: refused
+    /// once the process is closing, before the removal changes anything.
+    pub fn begin(&'static self, name: &str) -> anyhow::Result<Removing> {
+        let mut state = self.state();
+        if state.0 {
+            bail!("workspace {name} not deleted: twr is quitting; delete it again");
+        }
+        state.1.push(name.to_string());
+        Ok(Removing {
+            set: self,
+            name: name.to_string(),
+        })
+    }
+
+    /// Closes it (no removal begins from now on) and says which are past their checks, in one
+    /// step: each is either listed here, to be waited for, or never begins.
+    pub fn close(&self) -> Vec<String> {
+        let mut state = self.state();
+        state.0 = true;
+        state.1.clone()
+    }
+
+    /// The removals past their checks now, by name.
+    pub fn in_progress(&self) -> Vec<String> {
+        self.state().1.clone()
+    }
+}
+
+/// A removal past its checks, while it lives ([`Removals::begin`]).
+pub struct Removing {
+    set: &'static Removals,
+    name: String,
+}
+
+impl Drop for Removing {
+    fn drop(&mut self) {
+        let mut state = self.set.state();
+        if let Some(i) = state.1.iter().position(|n| *n == self.name) {
+            state.1.remove(i);
+        }
+    }
+}
+
+/// What a removal that is no longer running left set aside: the `.rm-<id>-<pid>-<ns>`
+/// directories ([`aside_name`]) in the workspaces' directory and the root's data directory
+/// whose process is gone (its removal was killed, or cut off). One whose process runs, or
+/// whose process can't be told, is left. Looked at under the registry lock; deleted after it
+/// ([`delete_asides`]), off any async worker.
+pub fn stale_asides(root: &Paths) -> Vec<PathBuf> {
+    let root = root.root();
+    let mut out = Vec::new();
+    for dir in [root.workspaces_dir(), root.data_dir.clone()] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            let Some(pid) = aside_pid(&n) else {
+                continue;
+            };
+            if e.file_type().is_ok_and(|t| t.is_dir()) && !process_runs(pid) {
+                out.push(e.path());
+            }
+        }
+    }
+    out
+}
+
+/// Deletes the aside directories [`stale_asides`] found, without any lock: nothing takes one
+/// for a workspace. One that can't be deleted is left, for the next `twr ws new` or `rm`.
+pub fn delete_asides(stale: Vec<PathBuf>) {
+    for path in stale {
+        let _ = remove_tree(&path);
+    }
+}
+
+/// [`delete_asides`] on a thread of its own, so nothing waits for it (the TUI, which goes on
+/// at once). Cut off if the process exits first, or if no thread starts: what is left is a
+/// stale aside the next sweep deletes once this process is gone.
+pub fn delete_asides_later(asides: Vec<PathBuf>) {
+    if asides.is_empty() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("twr-delete-asides".into())
+        .spawn(move || delete_asides(asides));
+}
+
+/// The process id in an aside directory's name [`aside_name`] made, `.rm-<id>-<pid>-<ns>`.
+fn aside_pid(name: &str) -> Option<i32> {
+    let rest = name.strip_prefix(".rm-")?;
+    let mut parts = rest.rsplitn(3, '-');
+    let nanos = parts.next()?;
+    let pid = parts.next()?;
+    let id = parts.next()?;
+    // (Its time in nanoseconds since 1970 has 19 digits: an older name, `.rm-<id>-<pid>`,
+    // whose id ends in a number, is not taken for one.)
+    (!id.is_empty() && nanos.len() >= 18 && nanos.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| pid.parse().ok())
+        .flatten()
+        .filter(|p| *p > 0)
+}
+
+/// Whether process `pid` runs (or can't be told: another user's).
+fn process_runs(pid: i32) -> bool {
+    // SAFETY: signal 0 checks for the process and sends nothing.
+    let r = unsafe { libc::kill(pid, 0) };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+type WaitHook = Box<dyn Fn() + Send + Sync>;
+
+/// What this process does when a change to the workspaces waits for another's
+/// ([`RegistryLock::take`]); none at first.
+static WAIT_HOOK: std::sync::RwLock<Option<WaitHook>> = std::sync::RwLock::new(None);
+
+/// Sets what this process does when a workspace change has to wait for another process's
+/// (`twr ws rm` asking its question in another terminal, say): `twr ws` prints that it waits,
+/// the TUI says it in its status line, rather than seeming to hang.
+pub fn on_registry_wait(hook: impl Fn() + Send + Sync + 'static) {
+    *WAIT_HOOK
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
+}
+
+/// Why `name` can't be the name of workspace `own` (an id; `None`: a new workspace) in the
+/// workspaces `all`: not a valid name, `default` for another than the root slot, or another
+/// workspace's name or id. `None` when it can.
+pub fn name_conflict(all: &[Entry], own: Option<&str>, name: &str) -> Option<String> {
+    if let Some(why) = workspace_name_error(name) {
+        return Some(why);
+    }
+    for e in all {
+        if Some(e.id.as_str()) == own {
+            continue;
+        }
+        if e.name == name {
+            return Some(match own {
+                None => format!("workspace {name} already exists"),
+                Some(_) => format!("there is a workspace {name} already (`twr ws` lists them)"),
+            });
+        }
+        if e.id == name {
+            return Some(format!(
+                "{name} is the original name of workspace {}, which it still answers to: \
+                 pick another name (or rename {} back to {name})",
+                e.name, e.name
+            ));
+        }
+    }
+    if name == DEFAULT_WORKSPACE && own.is_some_and(|o| o != DEFAULT_WORKSPACE) {
+        return Some(format!(
+            "only the workspace in twr's root, which `twr ws new {DEFAULT_WORKSPACE}` makes, \
+             can be named {DEFAULT_WORKSPACE}"
+        ));
+    }
+    None
+}
+
+/// Which workspace with its id `ws` is: the token it was made with ([`GENERATION_FILE`]);
+/// for one made before twr kept one, its directory's device, inode and birth time (one made
+/// again since has a token, so never the same). `None` when neither can be read.
+pub fn generation(ws: &Paths) -> Option<String> {
+    dir_generation(&ws.data_dir)
+}
+
+/// [`generation`] of the workspace whose data directory is `dir`.
+pub fn dir_generation(dir: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(t) = std::fs::read_to_string(dir.join(GENERATION_FILE)) {
+        return Some(t.trim().to_string());
+    }
+    let dir = std::fs::metadata(dir).ok()?;
+    let born = dir
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    Some(format!("before:{}:{}:{born}", dir.dev(), dir.ino()))
+}
+
+/// Writes a new token in `ws`'s data directory ([`GENERATION_FILE`]).
+fn new_generation(ws: &Paths) -> anyhow::Result<()> {
+    let file = ws.data_dir.join(GENERATION_FILE);
+    write_atomic(&file, &format!("{}\n", ulid::Ulid::generate()))
+        .with_context(|| format!("writing {}", file.display()))
+}
+
+/// What [`create`] made.
+#[derive(Debug)]
+pub struct Created {
+    pub paths: Paths,
+    /// It is the root slot, made again after it was removed.
+    pub root_slot: bool,
+    /// It became the default: there was none.
+    pub made_default: bool,
+}
+
+/// Creates workspace `name` in `root`, under the registry lock: a data directory of its own
+/// (private, like every data directory) named `name`, its id; or, for `default`, the root
+/// slot again once it was removed (what its removal left half done is removed first). The
+/// first workspace made while there is no default becomes the default. What removals no
+/// longer running left set aside ([`stale_asides`]), and what `default`'s own removal left,
+/// is deleted once the lock is let go. Callers refuse agents, and keep it off async workers:
+/// it may wait for the lock, and delete.
+pub fn create(root: &Paths, name: &str) -> anyhow::Result<Created> {
+    let (asides, made) = create_deferring(root, name);
+    delete_asides(asides);
+    made
+}
+
+/// [`create`], with the aside directories still to delete left to the caller
+/// ([`delete_asides`], without the lock, which is let go here): the TUI deletes them after
+/// it switches to the new workspace. Returned whether or not it was made.
+pub fn create_deferring(root: &Paths, name: &str) -> (Vec<PathBuf>, anyhow::Result<Created>) {
+    let root = root.root();
+    let lock = match RegistryLock::take(&root) {
+        Ok(lock) => lock,
+        Err(e) => return (Vec::new(), Err(e)),
+    };
+    let mut asides = stale_asides(&root);
+    let made = create_locked(&root, name, &mut asides);
+    drop(lock);
+    (asides, made)
+}
+
+/// [`create`], under the registry lock; what is to go once it is let go is added to `asides`.
+fn create_locked(root: &Paths, name: &str, asides: &mut Vec<PathBuf>) -> anyhow::Result<Created> {
+    use std::os::unix::fs::DirBuilderExt;
+    let root = root.clone();
+    let all = root.workspaces()?;
+    if name == DEFAULT_WORKSPACE {
+        if !root.root_removed() {
+            let shown = root.display_name();
+            if shown == DEFAULT_WORKSPACE {
+                bail!("workspace {DEFAULT_WORKSPACE} already exists");
+            }
+            bail!(
+                "{DEFAULT_WORKSPACE} is the original name of workspace {shown}, which it still \
+                 answers to: pick another name (or rename {shown} back to {DEFAULT_WORKSPACE})"
+            );
+        }
+        if let Some(why) = name_conflict(&all, Some(DEFAULT_WORKSPACE), name) {
+            bail!(why);
+        }
+        crate::paths::check_socket_path(&root.socket)?;
+        // A `twr runner` keeping its data here uses `worktrees/` and `trash/` as its own.
+        if let Some(why) = runner_spool_why(&root, false) {
+            bail!(why);
+        }
+        clear_root_leftovers(&root, asides)?;
+        new_generation(&root)?;
+        let had_default = root.default_id().is_some();
+        std::fs::remove_file(root.removed_marker())
+            .with_context(|| format!("removing {}", root.removed_marker().display()))?;
+        return Ok(Created {
+            paths: root,
+            root_slot: true,
+            made_default: !had_default,
+        });
+    }
+    if let Some(why) = name_conflict(&all, None, name) {
+        bail!(why);
+    }
+    let ws = root.workspace(name)?;
+    crate::paths::check_socket_path(&ws.socket)?;
+    // A record of the default naming this id is left from a workspace that went (a removal cut
+    // short): the new one does not become the default by it.
+    forget_default(&root, name).context("updating the default workspace")?;
+    crate::paths::ensure_private_dir(&root.workspaces_dir())?;
+    match std::fs::DirBuilder::new().mode(0o700).create(&ws.data_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!("workspace {name} already exists")
+        }
+        Err(e) => return Err(e).with_context(|| format!("creating {}", ws.data_dir.display())),
+    }
+    new_generation(&ws)?;
+    let made_default = root.default_id().is_none();
+    if made_default {
+        write_atomic(&root.data_dir.join(DEFAULT_FILE), &format!("{name}\n"))
+            .with_context(|| "recording the default workspace")?;
+    }
+    Ok(Created {
+        paths: ws,
+        root_slot: false,
+        made_default,
+    })
+}
+
+/// What the root slot's removal left in the root's data directory when it stopped half way
+/// (a `.rm-default-*` directory, or its own entries when it stopped before it moved them):
+/// gone before it is made again, its own entries moved aside, and the `.rm-default-*`
+/// directories added to `asides`, deleted once the registry lock is let go (nothing takes one
+/// for a workspace). Never what appeared under `default`'s names after the removal moved its
+/// own aside ([`ROOT_MOVED`]), a `twr runner`'s `worktrees/` say: an empty one goes, and one
+/// that holds anything refuses, listed, for the user to move or delete.
+fn clear_root_leftovers(root: &Paths, asides: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    if root_moved(root) {
+        let later = later_entries(root)?;
+        // (A link identity written meanwhile holds no one's work: it goes like an empty one.)
+        let full: Vec<&(String, u64, u64)> = later
+            .iter()
+            .filter(|(n, _, b)| *b > 0 && n != "link-identity")
+            .collect();
+        if !full.is_empty() {
+            let listed: Vec<String> = full
+                .iter()
+                .map(|(n, files, bytes)| {
+                    let slash = if root.data_dir.join(n).is_dir() {
+                        "/"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "{n}{slash} ({files} file{}, {})",
+                        if *files == 1 { "" } else { "s" },
+                        crate::git::human_bytes(*bytes)
+                    )
+                })
+                .collect();
+            bail!(
+                "{} holds files under `default`'s names that came after it was removed (a \
+                 `twr runner` keeping its data there, say, whose worktrees may hold a thread's \
+                 work): {}. Move them elsewhere, or delete them if nothing in them is needed, \
+                 then make the workspace again",
+                root.data_dir.display(),
+                listed.join(", ")
+            );
+        }
+        for (n, _, _) in &later {
+            let path = root.data_dir.join(n);
+            let gone = if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+                remove_tree(&path)
+            } else {
+                std::fs::remove_file(&path).or_else(|e| {
+                    (e.kind() == std::io::ErrorKind::NotFound)
+                        .then_some(())
+                        .ok_or(e)
+                })
+            };
+            gone.with_context(|| format!("removing {}", path.display()))?;
+        }
+    } else {
+        // Its entries left in place go aside, under a name no workspace has (listed below).
+        move_root_owned_aside(root)?;
+    }
+    for e in std::fs::read_dir(&root.data_dir)?.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        // (The removal that left one may be deleting it at this moment: either may finish.)
+        if n.starts_with(".rm-default-")
+            && e.file_type().is_ok_and(|t| t.is_dir())
+            && !asides.contains(&e.path())
+        {
+            asides.push(e.path());
+        }
+    }
+    Ok(())
+}
+
+/// The second line of [`REMOVED_FILE`] once the removal moved the root slot's own entries
+/// aside ([`mark_root_moved`]): from then on, anything under their names in the root's data
+/// directory came after the removal, not from the workspace it removed.
+pub const ROOT_MOVED: &str = "moved";
+
+/// Records in [`REMOVED_FILE`] that the root slot's removal moved its own entries aside
+/// ([`move_root_owned_aside`]), as it does right after (still under its locks).
+pub fn mark_root_moved(root: &Paths) -> std::io::Result<()> {
+    write_atomic(&root.removed_marker(), &format!("removed\n{ROOT_MOVED}\n"))
+}
+
+/// Whether the root slot's removal got as far as moving its own entries aside.
+fn root_moved(root: &Paths) -> bool {
+    std::fs::read_to_string(root.removed_marker())
+        .is_ok_and(|t| t.lines().any(|l| l.trim() == ROOT_MOVED))
+}
+
+/// What is in the root's data directory under the root slot's names ([`root_owned`]): each
+/// one's name, how many files it holds and their bytes.
+fn later_entries(root: &Paths) -> anyhow::Result<Vec<(String, u64, u64)>> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(&root.data_dir)
+        .with_context(|| format!("reading {}", root.data_dir.display()))?
+        .flatten()
+    {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if root_owned(&n) {
+            let (files, bytes) = tree_size(&e.path());
+            out.push((n, files, bytes));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// How many files are under `path` (or `path`, a file) and their bytes, symlinks counted as
+/// themselves and never followed; what can't be read counts as nothing.
+pub fn tree_size(path: &Path) -> (u64, u64) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return (0, 0);
+    };
+    if !meta.is_dir() {
+        return (1, meta.len());
+    }
+    std::fs::read_dir(path)
+        .map(|d| {
+            d.flatten()
+                .map(|e| tree_size(&e.path()))
+                .fold((0, 0), |(f, b), (f2, b2)| (f + f2, b + b2))
+        })
+        .unwrap_or((0, 0))
+}
+
+/// The spool of a `twr runner` keeping its data in the root's data directory (its default),
+/// `runner-<box>.db`, if there is one.
+pub fn runner_spool(root: &Paths) -> Option<String> {
+    std::fs::read_dir(&root.root().data_dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.starts_with("runner-") && n.ends_with(".db"))
+}
+
+/// Why `default` can't be removed (`removing`) or made again while a `twr runner`'s spool is
+/// in the root's data directory (its default `--data-dir`), whether that runner runs or not:
+/// the spool holds what it has not delivered to its hub, and its worktrees and trash there are
+/// `default`'s directories too, which hold its threads' files. What to do. `None`: no spool is
+/// there.
+pub fn runner_spool_why(root: &Paths, removing: bool) -> Option<String> {
+    let spool = runner_spool(root)?;
+    let dir = root.root().data_dir;
+    let name = spool
+        .strip_prefix("runner-")
+        .and_then(|s| s.strip_suffix(".db"))
+        .unwrap_or(&spool);
+    // What of its directories holds files now (its threads' worktrees, their trash).
+    let held: Vec<String> = ["worktrees", "trash", "loops"]
+        .iter()
+        .filter_map(|d| {
+            let (files, bytes) = tree_size(&dir.join(d));
+            (bytes > 0).then(|| {
+                format!(
+                    "{d}/ ({files} file{}, {})",
+                    if files == 1 { "" } else { "s" },
+                    crate::git::human_bytes(bytes)
+                )
+            })
+        })
+        .collect();
+    let rest = if held.is_empty() {
+        String::new()
+    } else if removing {
+        format!(
+            ", and what it left in {} goes with `default`, which lists it before it asks",
+            held.join(", ")
+        )
+    } else {
+        format!(
+            "; what it left in {} stays, and `twr ws new {DEFAULT_WORKSPACE}` refuses to take it \
+             as `default`'s own until you move it elsewhere or delete it",
+            held.join(", ")
+        )
+    };
+    Some(format!(
+        "a `twr runner` for box {name} keeps its data in {dir}: its spool {spool}, which holds \
+         what it has not delivered to its hub yet (and the agents it started), and its \
+         worktrees and trash, which are `default`'s directories too. If that runner runs, or \
+         will again, start it with a `--data-dir` of its own once its hub has what it holds \
+         (it delivers it when it connects); if it never will, deleting {} loses what it never \
+         delivered{rest}. Then {}",
+        dir.join(&spool).display(),
+        if removing {
+            "remove the workspace"
+        } else {
+            "make the workspace again"
+        },
+        dir = dir.display(),
+    ))
+}
+
+/// Deletes the directory `path` and what is in it, a removal's aside one: what another
+/// process deletes at the same time (the removal that moved it, or `twr ws new default`
+/// clearing leftovers) is not an error.
+pub fn remove_tree(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        r => r,
+    }
+}
+
+/// The name a removal moves workspace `id`'s files aside to, `.rm-<id>-<pid>-<nanoseconds>`:
+/// a name no workspace can have, and none that a removal cut short left (whose process id
+/// may since be another's) is taken again.
+pub fn aside_name(id: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!(".rm-{id}-{}-{nanos}", std::process::id())
+}
+
+/// Whether `name`, an entry of the root's data directory, is the root slot's own: one of
+/// [`ROOT_OWNED`] or [`ROOT_OWNED_PREFIXES`], or what a writer of those left half written (a
+/// temporary file of the input history's, or of [`write_atomic`]'s). `tui-history.lock`
+/// stays: the removal holds it as it goes (so a TUI's save waits, then finds it gone).
+pub fn root_owned(name: &str) -> bool {
+    ROOT_OWNED.contains(&name)
+        || ROOT_OWNED_PREFIXES.iter().any(|p| name.starts_with(p))
+        || (name.starts_with("tui-history.") && name.ends_with(".tmp"))
+        || [NAME_FILE, GENERATION_FILE]
+            .iter()
+            .any(|f| name.starts_with(&format!(".{f}.tmp-")))
+}
+
+/// Moves the root slot's own entries of the root's data directory ([`root_owned`]) into a
+/// new directory beside them, `.rm-default-…` ([`aside_name`]), which it returns (`None` when there were
+/// none): renames within one directory, so none is ever half moved.
+pub fn move_root_owned_aside(root: &Paths) -> anyhow::Result<Option<PathBuf>> {
+    let root = root.root();
+    let mut owned = Vec::new();
+    for e in std::fs::read_dir(&root.data_dir)
+        .with_context(|| format!("reading {}", root.data_dir.display()))?
+    {
+        let e = e?;
+        let n = e.file_name().to_string_lossy().into_owned();
+        if root_owned(&n) {
+            owned.push(n);
+        }
+    }
+    if owned.is_empty() {
+        return Ok(None);
+    }
+    let aside = root.data_dir.join(aside_name(DEFAULT_WORKSPACE));
+    crate::paths::ensure_private_dir(&aside)?;
+    for n in owned {
+        std::fs::rename(root.data_dir.join(&n), aside.join(&n))
+            .with_context(|| format!("moving {} aside", root.data_dir.join(&n).display()))?;
+    }
+    Ok(Some(aside))
+}
+
+/// What [`rename`] did.
+#[derive(Debug)]
+pub struct Renamed {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+}
+
+/// Renames the workspace `selector` names to `to`, under the registry lock: writes its
+/// [`NAME_FILE`] (removes it when `to` is its id). Its hub may run meanwhile: nothing it
+/// uses moves. Callers refuse agents.
+pub fn rename(root: &Paths, selector: &str, to: &str) -> anyhow::Result<Renamed> {
+    rename_found(root, |root| root.find_workspace(selector), selector, to)
+}
+
+/// [`rename`] of the workspace whose id is `id`, never one only named so (the TUI's, which
+/// knows its workspaces by id: one removed meanwhile is not taken for another).
+pub fn rename_id(root: &Paths, id: &str, to: &str) -> anyhow::Result<Renamed> {
+    rename_found(root, |root| root.workspace(id), id, to)
+}
+
+fn rename_found(
+    root: &Paths,
+    find: impl Fn(&Paths) -> anyhow::Result<Paths>,
+    selector: &str,
+    to: &str,
+) -> anyhow::Result<Renamed> {
+    let root = root.root();
+    let _lock = RegistryLock::take(&root)?;
+    let ws = find(&root)?;
+    if !ws.exists() {
+        bail!("there is no workspace {selector} (`twr ws` lists them)");
+    }
+    let id = ws.workspace_id().to_string();
+    let from = ws.display_name();
+    if from == to {
+        bail!("workspace {from} is named {to} already");
+    }
+    let all = root.workspaces()?;
+    if let Some(why) = name_conflict(&all, Some(&id), to) {
+        bail!(why);
+    }
+    let file = ws.data_dir.join(NAME_FILE);
+    if to == id {
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("removing {}", file.display())),
+        }
+    } else {
+        write_atomic(&file, &format!("{to}\n"))
+            .with_context(|| format!("writing {}", file.display()))?;
+    }
+    Ok(Renamed {
+        id,
+        from,
+        to: to.to_string(),
+    })
+}
+
+/// Makes the workspace `selector` names the default, under the registry lock. Its id and its
+/// name. Callers refuse agents.
+pub fn set_default(root: &Paths, selector: &str) -> anyhow::Result<(String, String)> {
+    set_default_found(root, |root| root.find_workspace(selector), selector)
+}
+
+/// [`set_default`] of the workspace whose id is `id` (the TUI's, as [`rename_id`]).
+pub fn set_default_id(root: &Paths, id: &str) -> anyhow::Result<(String, String)> {
+    set_default_found(root, |root| root.workspace(id), id)
+}
+
+fn set_default_found(
+    root: &Paths,
+    find: impl Fn(&Paths) -> anyhow::Result<Paths>,
+    selector: &str,
+) -> anyhow::Result<(String, String)> {
+    let root = root.root();
+    let _lock = RegistryLock::take(&root)?;
+    let ws = find(&root)?;
+    if !ws.exists() {
+        bail!("there is no workspace {selector} (`twr ws` lists them)");
+    }
+    let id = ws.workspace_id().to_string();
+    let file = root.data_dir.join(DEFAULT_FILE);
+    if id == DEFAULT_WORKSPACE {
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("removing {}", file.display())),
+        }
+    } else {
+        write_atomic(&file, &format!("{id}\n"))
+            .with_context(|| format!("writing {}", file.display()))?;
+    }
+    Ok((id, ws.display_name()))
+}
+
+/// After workspace `id` was removed (under the registry lock): the default workspace's
+/// record no longer names it, so a workspace made later with the same id does not become the
+/// default by surprise. The default is then the root slot, when it exists.
+pub fn forget_default(root: &Paths, id: &str) -> std::io::Result<()> {
+    let file = root.root().data_dir.join(DEFAULT_FILE);
+    if read_name(&file).as_deref() == Some(id) {
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn home() -> (tempfile::TempDir, Paths) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(dir.path());
+        (dir, root)
+    }
+
+    fn names(root: &Paths) -> Vec<(String, String, bool)> {
+        root.workspaces()
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.id, e.name, e.default))
+            .collect()
+    }
+
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+
+    #[test]
+    fn a_fresh_root_has_its_default_workspace_only() {
+        let (_d, root) = home();
+        assert_eq!(names(&root), [(s("default"), s("default"), true)]);
+        assert_eq!(root.default_id().as_deref(), Some("default"));
+        assert!(root.exists());
+    }
+
+    #[test]
+    fn a_renamed_workspace_answers_to_both_names_and_keeps_its_paths() {
+        let (_d, root) = home();
+        let made = create(&root, "client-x").unwrap();
+        assert!(!made.made_default);
+        let before = made.paths.clone();
+        rename(&root, "client-x", "acme").unwrap();
+        let by_name = root.find_workspace("acme").unwrap();
+        let by_id = root.find_workspace("client-x").unwrap();
+        assert_eq!(by_name, before);
+        assert_eq!(by_id, before);
+        assert_eq!(by_name.socket, before.socket);
+        assert_eq!(by_name.worktree_namespace(), before.worktree_namespace());
+        assert_eq!(by_name.display_name(), "acme");
+        // Its original name is its own: nothing else may take it, it may go back to it.
+        assert!(create(&root, "client-x").is_err());
+        rename(&root, "acme", "client-x").unwrap();
+        assert!(!before.data_dir.join(NAME_FILE).exists());
+        assert_eq!(before.display_name(), "client-x");
+    }
+
+    #[test]
+    fn the_default_workspace_can_be_renamed_and_keeps_being_the_default() {
+        let (_d, root) = home();
+        create(&root, "beta").unwrap();
+        rename(&root, "default", "main").unwrap();
+        assert_eq!(
+            names(&root),
+            [
+                (s("default"), s("main"), true),
+                (s("beta"), s("beta"), false)
+            ]
+        );
+        assert_eq!(root.find_workspace("main").unwrap(), root);
+        assert_eq!(root.find_workspace("default").unwrap(), root);
+        // `default` stays its alias: no other workspace can be named it.
+        let e = rename(&root, "beta", "default").unwrap_err().to_string();
+        assert!(e.contains("original name of workspace main"), "{e}");
+        let e = create(&root, "default").unwrap_err().to_string();
+        assert!(e.contains("original name of workspace main"), "{e}");
+        let e = create(&root, "main").unwrap_err().to_string();
+        assert!(e.contains("already"), "{e}");
+    }
+
+    #[test]
+    fn names_are_checked_against_every_name_and_id() {
+        let (_d, root) = home();
+        create(&root, "a").unwrap();
+        create(&root, "b").unwrap();
+        assert!(rename(&root, "a", "b").is_err());
+        assert!(rename(&root, "a", "Bad").is_err());
+        assert!(rename(&root, "a", "a").is_err());
+        assert!(rename(&root, "nope", "c").is_err());
+        rename(&root, "a", "c").unwrap();
+        // `a` is still a's alias; `c` is taken by name.
+        assert!(rename(&root, "b", "a").is_err());
+        assert!(rename(&root, "b", "c").is_err());
+        assert!(create(&root, "c").is_err());
+    }
+
+    #[test]
+    fn the_default_can_be_moved_and_falls_back_to_the_root_slot() {
+        let (_d, root) = home();
+        create(&root, "a").unwrap();
+        set_default(&root, "a").unwrap();
+        assert_eq!(root.default_id().as_deref(), Some("a"));
+        assert_eq!(root.workspaces().unwrap()[0].id, "a");
+        // A record naming a workspace that went counts for nothing.
+        std::fs::remove_dir_all(root.workspace("a").unwrap().data_dir).unwrap();
+        assert_eq!(root.default_id().as_deref(), Some("default"));
+        set_default(&root, "default").unwrap();
+        assert!(!root.data_dir.join(DEFAULT_FILE).exists());
+    }
+
+    #[test]
+    fn a_removed_root_slot_is_no_workspace_and_comes_back_by_name() {
+        let (_d, root) = home();
+        create(&root, "a").unwrap();
+        std::fs::create_dir_all(&root.data_dir).unwrap();
+        std::fs::write(root.data_dir.join("twr.db"), "x").unwrap();
+        std::fs::write(root.data_dir.join("orch-mcp-1.json"), "x").unwrap();
+        std::fs::write(root.data_dir.join("keep.bak"), "x").unwrap();
+        std::fs::create_dir_all(root.data_dir.join("accounts")).unwrap();
+        write_atomic(&root.removed_marker(), "").unwrap();
+        assert!(!root.exists());
+        assert_eq!(root.default_id(), None);
+        assert_eq!(names(&root), [(s("a"), s("a"), false)]);
+        // Nothing to select without `-w`; `default` names none.
+        assert!(root.default_workspace().is_none());
+        assert!(!root.find_workspace("default").unwrap().exists());
+        // Not while a runner keeps its data there: its worktrees and trash would go.
+        std::fs::write(root.data_dir.join("runner-gpu.db"), "").unwrap();
+        let e = create(&root, "default").unwrap_err().to_string();
+        assert!(
+            e.contains("a `twr runner` for box gpu keeps its data in")
+                && e.contains("runner-gpu.db"),
+            "{e}"
+        );
+        assert!(
+            e.contains("deleting ") && e.ends_with("Then make the workspace again"),
+            "{e}"
+        );
+        assert!(root.data_dir.join("twr.db").exists() && root.root_removed());
+        std::fs::remove_file(root.data_dir.join("runner-gpu.db")).unwrap();
+        // A half done removal's leftovers go when it is made again; the rest stays.
+        let made = create(&root, "default").unwrap();
+        assert!(made.root_slot && made.made_default);
+        assert!(root.exists());
+        assert!(!root.data_dir.join("twr.db").exists());
+        assert!(!root.data_dir.join("orch-mcp-1.json").exists());
+        assert!(root.data_dir.join("keep.bak").exists());
+        assert!(root.data_dir.join("accounts").is_dir());
+        assert!(root.workspace("a").unwrap().exists());
+    }
+
+    /// A workspace kept by id is reached by id alone: once it is removed and another is
+    /// renamed into its id, the id names none, though `-w` with it names the other.
+    #[test]
+    fn an_id_kept_reaches_its_workspace_or_none() {
+        let (_d, root) = home();
+        create(&root, "a").unwrap();
+        create(&root, "b").unwrap();
+        assert_eq!(root.existing_by_id("a").unwrap().workspace_id(), "a");
+        std::fs::remove_dir_all(root.workspace("a").unwrap().data_dir).unwrap();
+        rename(&root, "b", "a").unwrap();
+        assert_eq!(root.find_workspace("a").unwrap().workspace_id(), "b");
+        assert!(root.existing_by_id("a").is_err());
+        assert_eq!(root.existing_by_id("b").unwrap().workspace_id(), "b");
+    }
+
+    /// A change that waits for the registry lock under [`cancellable`] gives up once its flag
+    /// is set, at once, and changes nothing after the lock goes.
+    #[test]
+    fn a_cancelled_wait_gives_up_and_changes_nothing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_d, root) = home();
+        create(&root, "a").unwrap();
+        let held = RegistryLock::take(&root).unwrap();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let renaming = {
+            let (root, cancel) = (root.clone(), cancel.clone());
+            std::thread::spawn(move || cancellable(&cancel, || rename(&root, "a", "acme")))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let asked = std::time::Instant::now();
+        cancel.store(true, Ordering::SeqCst);
+        let e = renaming.join().unwrap().unwrap_err().to_string();
+        assert!(asked.elapsed() < std::time::Duration::from_secs(1));
+        assert!(e.contains("given up"), "{e}");
+        drop(held);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(root.workspace("a").unwrap().display_name(), "a");
+    }
+
+    /// A panic in a cancellable change leaves no cancel flag on its thread.
+    #[test]
+    fn a_panic_leaves_no_cancel_flag_behind() {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let r = std::panic::catch_unwind(|| cancellable(&cancel, || panic!("boom")));
+        assert!(r.is_err());
+        assert!(CANCEL.with(|c| c.borrow().is_none()));
+    }
+
+    /// The sweep deletes the aside directories of removals whose process is gone, and keeps a
+    /// running one's, an older name's and anything else.
+    #[test]
+    fn the_sweep_takes_only_a_dead_removal_s_aside() {
+        let (_d, root) = home();
+        create(&root, "a").unwrap();
+        let dir = root.workspaces_dir();
+        let live = dir.join(aside_name("x"));
+        // A pid no process has: above the kernel's limit.
+        let dead = dir.join(".rm-x-2147483646-1764000000000000000");
+        let old = dir.join(".rm-x-12345");
+        let root_dead = root
+            .data_dir
+            .join(".rm-default-2147483646-1764000000000000000");
+        for d in [&live, &dead, &old, &root_dead] {
+            std::fs::create_dir_all(d.join("worktrees")).unwrap();
+        }
+        let stale = stale_asides(&root);
+        assert!(live.exists() && old.exists() && dead.exists());
+        delete_asides(stale);
+        assert!(live.exists() && old.exists());
+        assert!(!dead.exists() && !root_dead.exists());
+        assert!(root.workspace("a").unwrap().exists());
+        assert_eq!(aside_pid(".rm-my-ws-42-1764000000000000000"), Some(42));
+        assert_eq!(aside_pid(".rm-x-12345"), None);
+    }
+
+    /// `default` made again leaves what its cut-off removal left, its own entries moved aside
+    /// and its `.rm-default-*` directories, to be deleted once the registry lock is let go.
+    #[test]
+    fn default_made_again_deletes_its_leftovers_after_the_lock() {
+        let (_d, root) = home();
+        std::fs::create_dir_all(root.data_dir.join("worktrees/p/t")).unwrap();
+        std::fs::write(root.data_dir.join("twr.db"), "x").unwrap();
+        let dead = root
+            .data_dir
+            .join(".rm-default-2147483646-1764000000000000000");
+        std::fs::create_dir_all(dead.join("worktrees")).unwrap();
+        write_atomic(&root.removed_marker(), "").unwrap();
+        let (asides, made) = create_deferring(&root, "default");
+        assert!(made.unwrap().root_slot && root.exists());
+        assert!(!RegistryLock::is_held(&root));
+        // Made, the lock let go, and the leftovers not deleted yet: out of `default`'s names.
+        assert!(!root.data_dir.join("twr.db").exists());
+        assert!(!root.data_dir.join("worktrees").exists());
+        assert_eq!(asides.len(), 2, "{asides:?}");
+        assert!(asides.contains(&dead) && asides.iter().all(|a| a.is_dir()));
+        delete_asides(asides);
+        let left: Vec<_> = std::fs::read_dir(&root.data_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".rm-"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// A removal past its checks is listed while it runs, and no longer once it is done.
+    #[test]
+    fn a_removal_in_progress_is_listed_while_it_runs() {
+        static SET: Removals = Removals::new();
+        let guard = SET.begin("listed-while-it-runs").unwrap();
+        assert_eq!(SET.in_progress(), ["listed-while-it-runs"]);
+        drop(guard);
+        assert!(SET.in_progress().is_empty());
+    }
+
+    /// Closing lists the removals already past their checks, which go on, and none begins
+    /// after it.
+    #[test]
+    fn once_closed_no_removal_begins() {
+        static SET: Removals = Removals::new();
+        let before = SET.begin("began-before").unwrap();
+        assert_eq!(SET.close(), ["began-before"]);
+        let e = SET.begin("after").err().unwrap().to_string();
+        assert!(e.contains("not deleted: twr is quitting"), "{e}");
+        assert_eq!(SET.in_progress(), ["began-before"]);
+        drop(before);
+        assert!(SET.in_progress().is_empty());
+        // Another set closing leaves the process's own open.
+        assert!(REMOVALS.begin("unclosed").is_ok());
+    }
+
+    /// Deleting an aside directory another process deleted first is no error.
+    #[test]
+    fn an_aside_directory_gone_meanwhile_is_no_error() {
+        let (d, _root) = home();
+        let aside = d.path().join(".rm-default-1-2");
+        std::fs::create_dir_all(aside.join("worktrees")).unwrap();
+        remove_tree(&aside).unwrap();
+        assert!(!aside.exists());
+        remove_tree(&aside).unwrap();
+    }
+
+    /// A change that has to wait for another (one holding the registry lock, `twr ws rm`
+    /// asking its question) says so through the hook as it starts to wait, then goes on once
+    /// the other lets go.
+    #[test]
+    fn a_change_that_waits_for_another_says_so() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static WAITS: AtomicUsize = AtomicUsize::new(0);
+        on_registry_wait(|| {
+            WAITS.fetch_add(1, Ordering::SeqCst);
+        });
+        let (_d, root) = home();
+        let held = RegistryLock::take(&root).unwrap();
+        let before = WAITS.load(Ordering::SeqCst);
+        let creating = {
+            let root = root.clone();
+            std::thread::spawn(move || create(&root, "a").map(|_| ()))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while WAITS.load(Ordering::SeqCst) == before {
+            assert!(std::time::Instant::now() < deadline, "never said it waits");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!root.workspace("a").unwrap().exists());
+        drop(held);
+        creating.join().unwrap().unwrap();
+        assert!(root.workspace("a").unwrap().exists());
+    }
+
+    #[test]
+    fn the_root_slots_own_files_include_half_written_ones_but_not_the_history_lock() {
+        for own in [
+            "twr.db",
+            "orch-mcp-1.json",
+            "tui-history",
+            "tui-history.1234.tmp",
+            ".workspace-name.tmp-99",
+            ".workspace-generation.tmp-99",
+            GENERATION_FILE,
+        ] {
+            assert!(root_owned(own), "{own}");
+        }
+        for shared in [
+            "tui-history.lock",
+            "twr.lock",
+            "workspaces",
+            "accounts",
+            "job-slots",
+            "tui-state.json",
+            "twr.db.bak-mine",
+            REMOVED_FILE,
+            DEFAULT_FILE,
+            REGISTRY_LOCK,
+        ] {
+            assert!(!root_owned(shared), "{shared}");
+        }
+    }
+
+    #[test]
+    fn the_first_workspace_made_without_a_default_becomes_it() {
+        let (_d, root) = home();
+        std::fs::create_dir_all(&root.data_dir).unwrap();
+        write_atomic(&root.removed_marker(), "").unwrap();
+        let made = create(&root, "solo").unwrap();
+        assert!(made.made_default);
+        assert_eq!(root.default_id().as_deref(), Some("solo"));
+        let other = create(&root, "two").unwrap();
+        assert!(!other.made_default);
+    }
+
+    #[test]
+    fn forgetting_a_removed_default_leaves_others_alone() {
+        let (_d, root) = home();
+        create(&root, "a").unwrap();
+        set_default(&root, "a").unwrap();
+        forget_default(&root, "b").unwrap();
+        assert_eq!(root.default_id().as_deref(), Some("a"));
+        forget_default(&root, "a").unwrap();
+        assert_eq!(root.default_id().as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn an_unreadable_or_invalid_name_file_shows_the_id() {
+        let (_d, root) = home();
+        let a = create(&root, "a").unwrap().paths;
+        std::fs::write(a.data_dir.join(NAME_FILE), "Not A Name\n").unwrap();
+        assert_eq!(a.display_name(), "a");
+    }
+}

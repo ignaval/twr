@@ -37,7 +37,14 @@ import { ThreadBox, aboutThread } from "./ThreadMessage";
 import { ConversationSearch, NeedsYouInbox } from "./InboxSearch";
 import { PaneResize } from "./LayoutOptions";
 import { stepTextSize, textSizeShortcut } from "./layoutPreferences";
-import { WORKSPACE_REFRESH_MS, workspaceEntries } from "./workspaceTree";
+import {
+  WORKSPACE_REFRESH_MS,
+  labelOf,
+  resolveWorkspace,
+  workspaceEntries,
+  workspaceId,
+  workspaceLabel,
+} from "./workspaceTree";
 import { attentionSummary } from "./attentionSummary";
 import { connectionWords, errorMessage } from "./errors";
 import { savedAppearance } from "./appearance";
@@ -364,6 +371,9 @@ export default function App({
   const [searchOpen, setSearchOpen] = useState(false);
   const [homePath, setHomePath] = useState("");
   const [workspaces, setWorkspaces] = useState<Json[]>([]);
+  // The listing as last read, for `connect` to take a name for its workspace's id.
+  const listingRef = useRef<Json[]>([]);
+  listingRef.current = workspaces;
   const [paths, setPaths] = useState<Json>();
   // Other running workspaces' hubs whose engine is not the app's (desktop only).
   const [staleHubs, setStaleHubs] = useState<EngineHub[]>([]);
@@ -636,6 +646,10 @@ export default function App({
   const recentTurn = useRef<number | undefined>(undefined);
   const earlierRequest = useRef<number | undefined>(undefined);
   const connectGeneration = useRef(0);
+  // Whether `workspace` is an id the app holds (given as one, found in the listing, or what a
+  // connect said it serves), not a name a person typed that nothing resolved yet: only then
+  // does Reconnect ask for it by id alone.
+  const workspaceHeld = useRef(false);
   const transcriptGeneration = useRef(0);
   const activeThread = useRef<string | undefined>(undefined);
   /** The conversation whose transcript on screen was loaded live from the hub. */
@@ -722,6 +736,7 @@ export default function App({
     window.twrApp.setAttention(
       attentionSummary({
         current: workspace,
+        currentName: labelOf(workspaces, workspace),
         hubId: hostId,
         live: connecting
           ? undefined
@@ -992,6 +1007,15 @@ export default function App({
           setInboxSources(
             sources.map((source) => ({
               ...source,
+              // This hub's workspaces by name, as its listing says them.
+              ...(source.hubId === hostId && !source.workspaceName
+                ? {
+                    workspaceName: labelOf(
+                      listingRef.current,
+                      source.workspace,
+                    ),
+                  }
+                : {}),
               updatedAt:
                 source.updatedAt ||
                 (!source.cached && !source.error && source.running !== false
@@ -1010,7 +1034,7 @@ export default function App({
         if (generation === inboxGeneration.current) setInboxRefreshing(false);
       }
     },
-    [hostApi, fail],
+    [hostApi, fail, hostId],
   );
   useEffect(() => {
     if (section === "attention" && connected) void refreshInboxSources();
@@ -1061,7 +1085,17 @@ export default function App({
     [fail],
   );
   const connect = useCallback(
-    async (name: string) => {
+    async (selector: string, options?: { byId?: boolean }) => {
+      // By id (what the hub, the gateway and the saved state name it by). An id the app holds
+      // (`byId`: a listing's, the bootstrap's, a push's, an inbox source's, the one shown) is
+      // that workspace or none: once it is gone, never another renamed into it. A selector a
+      // person typed (`/ws`, a new workspace's name) is by name, else by id.
+      const byId = options?.byId === true;
+      const listed = byId
+        ? undefined
+        : resolveWorkspace(listingRef.current, selector);
+      const name = byId ? selector : (listed ?? selector);
+      workspaceHeld.current = byId || listed !== undefined;
       const generation = ++connectGeneration.current;
       transcriptGeneration.current++;
       activeThread.current = undefined;
@@ -1091,8 +1125,13 @@ export default function App({
       setSection("chat");
       if (window.innerWidth <= 800) setSidebar(false);
       try {
-        const value = await hostApi.connect(name);
+        const value = await hostApi.connect(name, { byId });
         if (generation !== connectGeneration.current) return;
+        // The id its hub serves, as it says it (a listing not read yet took no name).
+        if (typeof value?.workspace === "string" && value.workspace) {
+          setWorkspace(value.workspace);
+          workspaceHeld.current = true;
+        }
         setPaths(value);
         // In the background: one `hub.info` per running workspace, at most a few seconds.
         void hostApi
@@ -1105,8 +1144,12 @@ export default function App({
         await refreshWorkspaces();
         setRefresh((n) => n + 1);
       } catch (e) {
-        if (generation === connectGeneration.current)
+        if (generation === connectGeneration.current) {
           setConnectionError(e instanceof Error ? e.message : String(e));
+          // The workspaces are listed all the same, so another one can be picked or made
+          // (this one may have been removed).
+          void refreshWorkspaces().catch(() => {});
+        }
       } finally {
         if (generation === connectGeneration.current) setConnecting(false);
       }
@@ -1121,7 +1164,8 @@ export default function App({
         setSection("attention");
         setSidebar(false);
       };
-      if (next && next !== workspace) void connect(next).then(show);
+      if (next && next !== workspace)
+        void connect(next, { byId: true }).then(show);
       else show();
     };
     window.addEventListener("twr:open-attention", open);
@@ -1313,7 +1357,9 @@ export default function App({
         document.documentElement.dataset.theme = savedAppearance();
         applyOmarchyTheme(boot.theme);
         setHomePath(boot.home);
-        return connect(boot.workspace).then(() => onReady?.());
+        return connect(boot.workspace, { byId: !boot.typed }).then(() =>
+          onReady?.(),
+        );
       })
       .catch(fail);
     void hostApi.catalog().then(setCliCommands).catch(fail);
@@ -1704,14 +1750,15 @@ export default function App({
     const previous = connectionAnnounced.current;
     if (key === previous) return;
     connectionAnnounced.current = key;
-    if (connected) announce(`Connected to ${workspace}`);
+    if (connected)
+      announce(`Connected to ${labelOf(listingRef.current, workspace)}`);
     else if (previous)
       announce(
-        `Disconnected from ${workspace}${connectionError ? ". " + connectionWords(connectionError).text : ""}`,
+        `Disconnected from ${labelOf(listingRef.current, workspace)}${connectionError ? ". " + connectionWords(connectionError).text : ""}`,
       );
     else if (connectionError)
       announce(
-        `Could not connect to ${workspace}. ${connectionWords(connectionError).text}`,
+        `Could not connect to ${labelOf(listingRef.current, workspace)}. ${connectionWords(connectionError).text}`,
       );
   }, [connected, connecting, workspace]);
   const knownAttention = useRef<{ workspace: string; ids: Set<string> }>(
@@ -2297,11 +2344,7 @@ export default function App({
         }
         case "Ws": {
           if (!args) setWorkspaceModal(true);
-          else if (
-            workspaces.some(
-              (item) => (typeof item === "string" ? item : item.name) === args,
-            )
-          )
+          else if (resolveWorkspace(workspaces, args) !== undefined)
             await connect(args);
           else {
             setNewWorkspace(args);
@@ -2796,7 +2839,7 @@ export default function App({
     }
     if (name === workspace) return show(thread, talk, then);
     pendingOpen.current = { workspace: name, thread, talk, then };
-    const switched = connect(name);
+    const switched = connect(name, { byId: true });
     // A later switch (here, the workspaces dialog, `/ws`) supersedes this one.
     const generation = connectGeneration.current;
     void switched.then(() => {
@@ -3284,7 +3327,13 @@ export default function App({
               </>
             ),
             actions: !connecting && (
-              <button onClick={() => void connect(workspace)}>Reconnect</button>
+              <button
+                onClick={() =>
+                  void connect(workspace, { byId: workspaceHeld.current })
+                }
+              >
+                Reconnect
+              </button>
             ),
           },
         ]
@@ -3606,8 +3655,8 @@ export default function App({
           role="group"
         >
           {entries.map((entry) => {
-            const shut = collapsed.includes(entry.name);
-            const headingId = `twr-ws-${entry.name}`;
+            const shut = collapsed.includes(entry.id);
+            const headingId = `twr-ws-${entry.id}`;
             const status =
               entry.running === false
                 ? "hub not running"
@@ -3621,9 +3670,9 @@ export default function App({
               entry.current && section === "chat" && !destination;
             return (
               <section
-                key={entry.name}
+                key={entry.id}
                 className={`workspace-entry ${entry.current ? "current" : ""} ${entry.running === false ? "stopped" : ""}`}
-                data-workspace={entry.name}
+                data-workspace={entry.id}
                 aria-labelledby={headingId}
               >
                 <div className="workspace-entry-head">
@@ -3633,7 +3682,7 @@ export default function App({
                     aria-expanded={!shut}
                     aria-current={entry.current ? "true" : undefined}
                     title={`${entry.name}: ${status}`}
-                    onClick={() => toggleCollapsed(entry.name)}
+                    onClick={() => toggleCollapsed(entry.id)}
                   >
                     {shut ? (
                       <ChevronRight size={14} aria-hidden="true" />
@@ -3671,7 +3720,7 @@ export default function App({
                     title={`New thread in ${entry.name}`}
                     disabled={!permitted("operate")}
                     onClick={() =>
-                      openIn(entry.name, undefined, false, () =>
+                      openIn(entry.id, undefined, false, () =>
                         actionRef.current("new"),
                       )
                     }
@@ -3684,7 +3733,7 @@ export default function App({
                     <button
                       className={`workspace-orchestrator ${talkingToOrchestrator ? "active" : ""}`}
                       aria-current={talkingToOrchestrator ? "page" : undefined}
-                      onClick={() => openIn(entry.name)}
+                      onClick={() => openIn(entry.id)}
                     >
                       <MessageSquare size={15} />
                       Orchestrator
@@ -3752,7 +3801,7 @@ export default function App({
                               title={`${thread.name} in ${entry.name}: ${thread.status_label || thread.status}. ${document.documentElement.dataset.mobile === "true" ? "Double-click" : "Click"} to talk to it.`}
                               onClick={(event) =>
                                 openIn(
-                                  entry.name,
+                                  entry.id,
                                   thread.id,
                                   document.documentElement.dataset.mobile !==
                                     "true" || event.detail > 1,
@@ -3782,7 +3831,7 @@ export default function App({
                             <button
                               className="workspace-thread workspace-more"
                               onClick={() =>
-                                openIn(entry.name, undefined, false, () =>
+                                openIn(entry.id, undefined, false, () =>
                                   setSection("grid"),
                                 )
                               }
@@ -3897,7 +3946,9 @@ export default function App({
                 <ArrowLeft size={18} />
               </button>
             )}
-            <span className="workspace-breadcrumb">{workspace}</span>
+            <span className="workspace-breadcrumb">
+              {labelOf(workspaces, workspace)}
+            </span>
             <ChevronRight size={13} />
             <span className="visually-hidden">,</span>
             <span className="topbar-title">
@@ -4446,7 +4497,7 @@ export default function App({
                 onRefresh={() => void refreshInboxSources()}
                 onOpenSource={(source) => {
                   if (source.hubId === hostId)
-                    void connect(source.workspace).then(() =>
+                    void connect(source.workspace, { byId: true }).then(() =>
                       setSection("attention"),
                     );
                   else
@@ -5236,25 +5287,27 @@ export default function App({
         >
           <div className="operation-fields">
             {workspaces.map((w) => (
-              <div className="workspace-row" key={w.name}>
+              <div className="workspace-row" key={workspaceId(w)}>
                 <button
-                  aria-current={w.name === workspace ? "true" : undefined}
+                  aria-current={
+                    workspaceId(w) === workspace ? "true" : undefined
+                  }
                   onClick={() => {
                     setWorkspaceModal(false);
-                    void connect(w.name);
+                    void connect(workspaceId(w), { byId: true });
                   }}
                 >
-                  {w.name}
+                  {workspaceLabel(w)}
                   <span className="visually-hidden">, </span>
                   <span>{w.state || w.status}</span>
                 </button>
                 <button
                   className="icon-button danger-quiet"
-                  aria-label={`Remove workspace ${w.name}`}
-                  title={`Remove workspace ${w.name}`}
+                  aria-label={`Remove workspace ${workspaceLabel(w)}`}
+                  title={`Remove workspace ${workspaceLabel(w)}`}
                   onClick={() => {
                     setWorkspaceModal(false);
-                    cliAction("ws rm", { name: w.name });
+                    cliAction("ws rm", { name: workspaceId(w) });
                   }}
                 >
                   <Trash2 size={14} />

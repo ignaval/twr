@@ -143,6 +143,7 @@ pub fn start_detached(program: &Path, dir: &Path) -> Result<()> {
         .env_remove("TWR_DEVICE_TOKEN")
         .env_remove("TWR_MOBILE_TRANSPORT")
         .env_remove("TWR_WORKSPACE")
+        .env_remove(twr_core::paths::WORKSPACE_ID_ENV)
         .env_remove("TWR_ORCH_TOKEN");
     twr_core::fork::prepare_fork();
     // SAFETY: only async-signal-safe calls between fork and exec.

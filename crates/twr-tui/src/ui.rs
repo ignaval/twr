@@ -149,6 +149,8 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
         render_picker(frame, body, state, &mut panes);
     } else if state.view.new_ws.is_some() {
         crate::sidebar::render_new(frame, body, state, &mut panes);
+    } else if state.view.ws_menu.is_some() {
+        crate::wsmenu::render(frame, body, state, &mut panes);
     } else if state.view.settings.is_some() || state.view.loop_editor.is_some() {
         // The loop settings editor over the settings when their Loops row opened it.
         if state.view.settings.is_some() {
@@ -259,7 +261,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
                     (waiting > 0).then(|| format!(" ⚠{waiting}")),
                 ),
             };
-            (t.name.clone(), badges, waiting, current)
+            (t.label.clone(), badges, waiting, current)
         })
         .collect();
     // The `≡` before them.
@@ -11100,6 +11102,8 @@ mod tests {
             tabs.iter()
                 .map(|(name, hub)| crate::workspace::Tab {
                     name: name.to_string(),
+                    label: name.to_string(),
+                    default: false,
                     hub: *hub,
                     glance: None,
                 })

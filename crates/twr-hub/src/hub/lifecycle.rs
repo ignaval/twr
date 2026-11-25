@@ -31,19 +31,48 @@ use crate::store::{self, Store};
 /// open file description until `exec` closes it).
 const LOCK_RETRY: Duration = Duration::from_secs(3);
 
+/// How long [`Hub::shutdown`] waits for the jobs to end, then for the review runs, then for
+/// the notification command.
+const JOBS_STOP: Duration = Duration::from_secs(15);
+const REVIEWS_STOP: Duration = Duration::from_secs(10);
+const HOOK_STOP: Duration = Duration::from_secs(15);
+
+/// The longest [`Hub::shutdown`] of a hub with the default stop timeout can take, each of its
+/// waits in turn ([`JOBS_STOP`], [`REVIEWS_STOP`], [`HOOK_STOP`], then
+/// [`super::STOP_TIMEOUT`] for the runtimes): what a client waiting for a hub it asked to stop
+/// waits before it says the hub did not stop.
+pub const SHUTDOWN_LONGEST: Duration = JOBS_STOP
+    .saturating_add(REVIEWS_STOP)
+    .saturating_add(HOOK_STOP)
+    .saturating_add(super::STOP_TIMEOUT);
+
 impl Hub {
     /// Locks the data directory (failing if another hub uses it), opens the database,
     /// rebuilds state by replaying it, kills and closes threads whose runtime outlived the
     /// previous hub, and dispatches queued prompts. Must run inside a tokio runtime.
     pub async fn open(mut opts: HubOptions) -> anyhow::Result<Hub> {
         checked_config(&mut opts.config)?;
-        let lock = lock_data_dir(&opts.db_path, None).await?;
+        let lock = lock_data_dir(&opts.db_path, None, opts.data_dir_must_exist).await?;
         Self::open_locked(opts, lock).await
     }
 
     /// The daemon claims its data before binding, so workspace operations can see a
     /// startup even before its socket appears. In-process callers use `open` as before.
     pub(crate) async fn open_locked(mut opts: HubOptions, lock: File) -> anyhow::Result<Hub> {
+        // Under the lock, which `twr ws rm` holds as it marks the workspace removed: one that
+        // was is not opened (and so not made again).
+        if let Some(marker) = &opts.removed_marker {
+            if std::fs::symlink_metadata(marker).is_ok() {
+                // Let go unlocked, not only closed (a process started meanwhile shares the open
+                // file until it execs).
+                let _ = lock.unlock();
+                anyhow::bail!(
+                    "workspace {} was removed: `twr ws new {}` makes it again",
+                    twr_core::paths::DEFAULT_WORKSPACE,
+                    twr_core::paths::DEFAULT_WORKSPACE
+                );
+            }
+        }
         checked_config(&mut opts.config)?;
         // MCP config files of orchestrators that outlived a previous hub (dead tokens).
         orch::remove_stale_mcp_files(&data_dir_of(&opts.db_path));
@@ -186,6 +215,7 @@ impl Hub {
             db_path: opts.db_path,
             instance_name: opts.instance_name,
             workspace: opts.workspace,
+            workspace_name_file: opts.workspace_name_file,
             workspaces_root: opts.workspaces_root,
             stop_timeout: opts.stop_timeout,
             hello_timeout: opts.hello_timeout,
@@ -415,10 +445,10 @@ impl Hub {
         }
         // Every job first: each records its end (its process group gone) before the runtimes
         // stop.
-        self.end_jobs(Duration::from_secs(15)).await;
+        self.end_jobs(JOBS_STOP).await;
         // Every review run too (their process groups killed); nothing is recorded of them: the
         // next hub runs their rounds again (`hub::loops::driver`).
-        self.end_reviews(Duration::from_secs(10)).await;
+        self.end_reviews(REVIEWS_STOP).await;
         // The notification command too, if one runs: it ends it, its group with it.
         let _ = self.inner.hook_stop.send(true);
         let hook = self
@@ -428,7 +458,7 @@ impl Hub {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         if let Some(task) = hook {
-            let _ = tokio::time::timeout(Duration::from_secs(15), task).await;
+            let _ = tokio::time::timeout(HOOK_STOP, task).await;
         }
         {
             let mut core = self.inner.core();
@@ -1244,10 +1274,14 @@ impl Core {
 
 /// Takes the exclusive lock on `<data_dir>/twr.lock` (the directory of `db_path`), retrying a
 /// busy lock for up to [`LOCK_RETRY`].
-pub(crate) async fn lock_data_dir(db_path: &Path, socket: Option<&Path>) -> anyhow::Result<File> {
+pub(crate) async fn lock_data_dir(
+    db_path: &Path,
+    socket: Option<&Path>,
+    must_exist: bool,
+) -> anyhow::Result<File> {
     let deadline = tokio::time::Instant::now() + LOCK_RETRY;
     loop {
-        match try_lock_data_dir(db_path)? {
+        match try_lock_data_dir(db_path, must_exist)? {
             Some(f) => return Ok(f),
             None => {
                 // Preserve the immediate same-socket refusal while claiming the data
@@ -1325,10 +1359,24 @@ pub(super) fn data_dir_of(db_path: &Path) -> PathBuf {
 }
 
 /// One attempt at the data-directory lock: `None` when another open file holds it.
-fn try_lock_data_dir(db_path: &Path) -> anyhow::Result<Option<File>> {
+fn try_lock_data_dir(db_path: &Path, must_exist: bool) -> anyhow::Result<Option<File>> {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = data_dir_of(db_path);
-    twr_core::paths::ensure_private_dir(&dir)?;
+    // A named workspace's directory is never made here ([`HubOptions::data_dir_must_exist`]):
+    // `twr ws rm` may have removed it since the hub was started.
+    if must_exist {
+        twr_core::paths::check_private_dir(&dir).map_err(|e| {
+            // Removed only when it is gone: a directory that is there failed the check itself
+            // (another user's, open to others), which `e` says.
+            if std::fs::symlink_metadata(&dir).is_err() {
+                anyhow::anyhow!("{e:#}: the workspace was removed (`twr ws` lists them)")
+            } else {
+                e
+            }
+        })?;
+    } else {
+        twr_core::paths::ensure_private_dir(&dir)?;
+    }
     let path = dir.join(LOCK_FILE);
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -1370,6 +1418,153 @@ mod tests {
     use super::super::STOP_TIMEOUT;
     use super::*;
 
+    /// `hub.shutdown` with `if_idle` starts the shutdown only while nothing would be lost
+    /// (the TUI's Delete): refused with a worker thread or a trash item, and once it is idle
+    /// the hub refuses new work from then on, so nothing starts between the check and the
+    /// stop.
+    #[tokio::test]
+    async fn an_idle_shutdown_refuses_while_anything_would_be_lost() {
+        use twr_core::event::{EventBody, Source, ThreadCreated};
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("twr.db");
+        let hub = Hub::open(HubOptions::new(&db, twr_core::config::Config::default()))
+            .await
+            .unwrap();
+        std::fs::create_dir_all(tmp.path().join("trash/item")).unwrap();
+        let e = hub.shutdown_if_idle().unwrap_err();
+        assert!(e.message.contains("trash"), "{}", e.message);
+        std::fs::remove_dir_all(tmp.path().join("trash")).unwrap();
+        hub.append(
+            "t1",
+            None,
+            Source::User("test".into()),
+            EventBody::ThreadCreated(ThreadCreated {
+                name: "api".into(),
+                box_name: "local".into(),
+                runtime: "fake".into(),
+                mode: "manual".into(),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        let e = hub.shutdown_if_idle().unwrap_err();
+        assert!(e.message.contains("threads now (api)"), "{}", e.message);
+        assert!(!hub.inner.core().shutting_down);
+        drop(hub);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("twr.db");
+        let hub = Hub::open(HubOptions::new(&db, twr_core::config::Config::default()))
+            .await
+            .unwrap();
+        // An orchestrator whose status says done, with a `!` command still running.
+        hub.append(
+            "o",
+            None,
+            Source::User("test".into()),
+            EventBody::ThreadCreated(ThreadCreated {
+                name: "orchestrator".into(),
+                box_name: "local".into(),
+                runtime: "fake".into(),
+                mode: "manual".into(),
+                ext: crate::hub::twr_ext_map(serde_json::json!({"role": "orchestrator"})),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        hub.append(
+            "o",
+            None,
+            Source::Adapter("fake".into()),
+            EventBody::TaskUpdated(twr_core::event::TaskUpdated {
+                task_id: "sh1".into(),
+                running: true,
+                description: "cargo test".into(),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        let e = hub.shutdown_if_idle().unwrap_err();
+        assert!(e.message.contains("at work now"), "{}", e.message);
+        assert!(!hub.inner.core().shutting_down);
+        hub.append(
+            "o",
+            None,
+            Source::Adapter("fake".into()),
+            EventBody::TaskUpdated(twr_core::event::TaskUpdated {
+                task_id: "sh1".into(),
+                running: false,
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        // A message queued for it, which a next hub would send.
+        hub.inner
+            .core()
+            .store
+            .enqueue_prompt("o", "then do X", Default::default(), None, &Source::Hub, 0)
+            .unwrap();
+        let e = hub.shutdown_if_idle().unwrap_err();
+        assert!(e.message.contains("queued"), "{}", e.message);
+        hub.inner.core().store.clear_pending("o").unwrap();
+        hub.shutdown_if_idle().unwrap();
+        assert!(hub.inner.core().shutting_down);
+        hub.shutdown().await;
+    }
+
+    /// A hub does not open the root slot once `twr ws rm` marked it removed (checked under
+    /// its lock, which the removal holds as it marks it): nothing of it is made again. Its
+    /// name is read as it is asked, so a rename shows without a restart.
+    #[tokio::test]
+    async fn a_removed_workspace_is_not_opened_and_a_rename_shows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("twr.db");
+        let marker = tmp.path().join(twr_core::workspaces::REMOVED_FILE);
+        std::fs::write(&marker, "removed\n").unwrap();
+        let mut opts = HubOptions::new(&db, twr_core::config::Config::default());
+        opts.removed_marker = Some(marker.clone());
+        let e = Hub::open(opts).await.err().expect("refused").to_string();
+        assert!(e.contains("was removed"), "{e}");
+        assert!(!db.exists());
+        std::fs::remove_file(&marker).unwrap();
+        let name = tmp.path().join(twr_core::workspaces::NAME_FILE);
+        let mut opts = HubOptions::new(&db, twr_core::config::Config::default());
+        opts.removed_marker = Some(marker);
+        opts.workspace_name_file = Some(name.clone());
+        let hub = Hub::open(opts).await.unwrap();
+        assert_eq!(hub.workspace(), "default");
+        assert_eq!(hub.workspace_name(), "default");
+        std::fs::write(&name, "main\n").unwrap();
+        assert_eq!(hub.workspace(), "default");
+        assert_eq!(hub.workspace_name(), "main");
+        assert_eq!(hub.info()["workspace_name"], "main");
+        // So does its instance, read as it is asked, and its own again once renamed back.
+        assert_eq!(hub.info()["instance"], "main");
+        std::fs::remove_file(&name).unwrap();
+        assert_eq!(hub.info()["instance"], "default");
+        hub.shutdown().await;
+    }
+
+    /// A named workspace's hub that can't open its data directory says why: removed only when
+    /// it is gone, else what the check found.
+    #[test]
+    fn a_named_data_directory_says_why_it_cannot_be_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("gone/twr.db");
+        let e = try_lock_data_dir(&gone, true).unwrap_err().to_string();
+        assert!(e.contains("the workspace was removed"), "{e}");
+        let file = tmp.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        let e = try_lock_data_dir(&file.join("twr.db"), true)
+            .unwrap_err()
+            .to_string();
+        assert!(!e.contains("removed"), "{e}");
+    }
+
     /// A lock on a data directory's lock file that was moved away (by `twr ws rm`) after it
     /// was opened guards nothing: it does not count.
     #[test]
@@ -1389,7 +1584,7 @@ mod tests {
         assert!(lock_opened(file, &path).unwrap().is_none());
         // The real thing takes the new one.
         let db = data.join("twr.db");
-        let lock = try_lock_data_dir(&db).unwrap().unwrap();
+        let lock = try_lock_data_dir(&db, false).unwrap().unwrap();
         assert!(locks_path(&lock, &path));
     }
 

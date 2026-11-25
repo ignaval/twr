@@ -128,6 +128,7 @@ export const attentionSummarySchema = z
         z
           .object({
             workspace: z.string().min(1).max(64),
+            workspaceName: label(64).optional(),
             thread: z.string().max(200),
             title: label(200),
             summary: label(300),
@@ -174,3 +175,20 @@ export const attentionSummarySchema = z
       .optional(),
   })
   .strict();
+
+/**
+ * Whether a CLI command runs while no workspace is connected: listing the workspaces, always
+ * (the root's, `twr ws`), so a workspace that could not be opened (removed, say) leaves the
+ * app able to pick another; and making one only while this session never had a workspace
+ * connected (`everConnected` false: none could be opened at start, the default one removed,
+ * say), so it isn't stuck. Once one was, a failed switch refuses it: the user picked another
+ * workspace, and nothing is made in the one shown before.
+ */
+export function runsWithoutWorkspace(words: string[], everConnected: boolean) {
+  return (
+    words[0] === "ws" &&
+    (words.length === 1 ||
+      (words[1] === "list" && words.length <= 4) ||
+      (!everConnected && words[1] === "new" && words.length === 3))
+  );
+}

@@ -28,7 +28,10 @@ export function trayEntries(
   for (const item of shown) {
     if (grouped && item.workspace !== heading) {
       heading = item.workspace;
-      entries.push({ kind: "workspace", label: item.workspace });
+      entries.push({
+        kind: "workspace",
+        label: item.workspaceName || item.workspace,
+      });
     }
     entries.push({
       kind: "item",

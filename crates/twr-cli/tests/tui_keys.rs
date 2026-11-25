@@ -33,6 +33,7 @@ fn test_token(dir: &Path) -> std::path::PathBuf {
 fn twr_cmd(home: &Path, token: &Path) -> Command {
     let mut c = Command::new(TWR);
     c.env_remove("TWR_WORKSPACE")
+        .env_remove("TWR_WORKSPACE_ID")
         .env_remove("RUST_LOG")
         .env("TWR_HOME", home)
         .env("TWR_TEST_USER_TOKEN_FILE", token)

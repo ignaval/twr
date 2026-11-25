@@ -382,8 +382,12 @@ impl Dock {
                 continue;
             };
             panes.target(*rect, Target::Workspace(name.clone()));
+            let first = named.insert(name.clone());
+            if first && has_menu(state) {
+                menu_target(panes, *rect, 1, name);
+            }
             // A moving icon on a card's first row keeps the clock ticking.
-            if named.insert(name.clone()) && state.view.animate && tab_active(state, name) {
+            if first && state.view.animate && tab_active(state, name) {
                 panes.moves(Rect::new(rect.x + 1, rect.y, 1, 1).intersection(*rect));
             }
         }
@@ -679,10 +683,13 @@ pub fn render_list(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut 
     for (i, (_, row)) in shown.iter().enumerate() {
         if let Some(WsRow::Workspace(name)) = row {
             let y = cards_area.y + u16::try_from(i).unwrap_or(u16::MAX);
-            panes.target(
-                Rect::new(cards_area.x, y, cards_area.width, 1).intersection(cards_area),
-                Target::Workspace(name.clone()),
-            );
+            let cells = Rect::new(cards_area.x, y, cards_area.width, 1).intersection(cards_area);
+            panes.target(cells, Target::Workspace(name.clone()));
+            // Its name row: the first of its rows, drawn as its own.
+            let first = rows.iter().position(|(_, r)| r.as_ref() == row.as_ref());
+            if first == Some(start + i) && has_menu(state) {
+                menu_target(panes, cells, 1, name);
+            }
         }
     }
     // A moving icon on a card keeps the clock ticking.
@@ -764,6 +771,24 @@ pub fn card_lines(state: &AppState, tab: &Tab, width: usize, selected: bool) -> 
     lines
 }
 
+/// How many cells at the end of a workspace card's name row its `⋯` takes, and its target
+/// with them ([`Target::WsMenu`]).
+pub const MENU_CELLS: usize = 3;
+
+/// Whether workspace cards have a `⋯` for their menu: in a TUI that switches workspaces
+/// (one opened on a socket has none to change).
+fn has_menu(state: &AppState) -> bool {
+    state.workspace.is_some()
+}
+
+/// The `⋯` target at the end of `row`, a workspace card's name row (`rows` tall from there:
+/// two on a phone, its whole entry).
+fn menu_target(panes: &mut Panes, row: Rect, rows: u16, id: &str) {
+    let w = u16::try_from(MENU_CELLS).unwrap_or(3).min(row.width);
+    let r = Rect::new(row.right() - w, row.y, w, rows.max(1));
+    panes.target(r, Target::WsMenu(id.to_string()));
+}
+
 /// The rows of workspace `tab`'s card ([`card_lines`]) at `detail`, without its blank
 /// separator: its name row; its status at [`Detail::Short`] and more; its reply at
 /// [`Detail::Full`].
@@ -821,9 +846,11 @@ fn card_rows(
         }
     }
     let badges_w: usize = badges.iter().map(|s| crate::edit::width(&s.content)).sum();
-    // The mark, the icon, a space, the name, the badges, a space at the end.
-    let room = width.saturating_sub(3 + badges_w + 1);
-    let name = crate::ui::truncate_cells(&tab.name, room);
+    // Its menu's `⋯` ([`Target::WsMenu`], [`crate::wsmenu`]), at the row's end.
+    let menu = has_menu(state);
+    // The mark, the icon, a space, the name, the badges, the menu, a space at the end.
+    let room = width.saturating_sub(3 + badges_w + if menu { MENU_CELLS - 1 } else { 0 } + 1);
+    let name = crate::ui::truncate_cells(&tab.label, room);
     let pad = room.saturating_sub(crate::edit::width(&name));
     let mut head = vec![
         mark.clone(),
@@ -831,6 +858,15 @@ fn card_rows(
         Span::styled(format!(" {name}{}", " ".repeat(pad)), name_style),
     ];
     head.extend(badges);
+    if menu {
+        // In the TUI's cyan, but on the current or selected row (a fill) as its name is.
+        let menu_style = if current || selected {
+            name_style
+        } else {
+            name_style.fg(crate::color::LABEL)
+        };
+        head.push(Span::styled(" ⋯", menu_style));
+    }
     head.push(Span::styled(" ", name_style));
     let (status, status_style) = status_text(hub, glance.as_ref());
     let text_room = width.saturating_sub(3);
@@ -1145,6 +1181,11 @@ pub fn render_phone(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut
             Entry::Rows(lines, name) => {
                 frame.render_widget(Paragraph::new(lines.clone()), rect);
                 panes.target(rect, Target::Workspace(name.clone()));
+                // Its card's entry (not one of its threads' rows): the `⋯` on its name row,
+                // with the row under it, a menu choice's two rows.
+                if first_of(name) == Some(i) && has_menu(state) {
+                    menu_target(panes, rect, eh.min(crate::ui::TAP_ROWS), name);
+                }
                 if state.view.animate && first_of(name) == Some(i) && tab_active(state, name) {
                     panes.moves(Rect::new(rect.x + 1, rect.y, 1, 1).intersection(rect));
                 }
@@ -1453,11 +1494,15 @@ pub(crate) mod tests {
         st.set_tabs(vec![
             Tab {
                 name: "default".into(),
+                label: "default".into(),
+                default: false,
                 hub: TabHub::Unknown,
                 glance: None,
             },
             Tab {
                 name: "client-x".into(),
+                label: "client-x".into(),
+                default: false,
                 hub: TabHub::Running {
                     threads: 2,
                     running: 1,
@@ -1472,6 +1517,8 @@ pub(crate) mod tests {
             },
             Tab {
                 name: "scratch".into(),
+                label: "scratch".into(),
+                default: false,
                 hub: TabHub::Stopped,
                 glance: Some(glance(
                     ThreadStatus::Idle,
@@ -1481,6 +1528,8 @@ pub(crate) mod tests {
             },
             Tab {
                 name: "docs".into(),
+                label: "docs".into(),
+                default: false,
                 hub: TabHub::Running {
                     threads: 0,
                     running: 0,
@@ -1495,7 +1544,13 @@ pub(crate) mod tests {
 
     /// The cell `x`, `y` of the last frame was a tap on: down and up there, a frame drawn
     /// before each, as the IO loop draws. Returns the actions.
-    fn tap_at(st: &mut AppState, w: u16, h: u16, x: u16, y: u16) -> Vec<crate::app::Action> {
+    pub(crate) fn tap_at(
+        st: &mut AppState,
+        w: u16,
+        h: u16,
+        x: u16,
+        y: u16,
+    ) -> Vec<crate::app::Action> {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         let ev = |kind| MouseEvent {
             kind,
@@ -1511,7 +1566,7 @@ pub(crate) mod tests {
     }
 
     /// Every cell of control `t` as a `w` x `h` frame draws it.
-    fn cells(st: &mut AppState, w: u16, h: u16, t: &Target) -> Vec<Rect> {
+    pub(crate) fn cells(st: &mut AppState, w: u16, h: u16, t: &Target) -> Vec<Rect> {
         crate::app::tests::draw(st, w, h);
         st.view
             .panes
@@ -1523,7 +1578,7 @@ pub(crate) mod tests {
     }
 
     /// A tap on control `t` (at its last cell) as a `w` x `h` frame draws it.
-    fn tap(st: &mut AppState, w: u16, h: u16, t: &Target) -> Vec<crate::app::Action> {
+    pub(crate) fn tap(st: &mut AppState, w: u16, h: u16, t: &Target) -> Vec<crate::app::Action> {
         let r = *cells(st, w, h, t)
             .last()
             .unwrap_or_else(|| panic!("no {t:?} in {:?}", st.view.panes.targets));
@@ -1562,6 +1617,8 @@ pub(crate) mod tests {
             assert_eq!(status_text(hub, Some(&glance)).0, status);
             assert!(matches!(hub, TabHub::Running { running: n, .. } if n == running));
             let mut other = AppState::new();
+            // Another TUI that switches workspaces too (its cards have a `⋯`), shown another.
+            other.workspace = Some("elsewhere".into());
             other.merge_poll(
                 Some(vec!["default".into()]),
                 vec![crate::workspace::Polled {
@@ -1663,6 +1720,8 @@ pub(crate) mod tests {
         let st = AppState::new();
         let mut tab = Tab {
             name: "test".into(),
+            label: "test".into(),
+            default: false,
             hub: TabHub::Running {
                 threads: 0,
                 running: 0,
@@ -1769,7 +1828,6 @@ pub(crate) mod tests {
         let mut st = in_workspaces("default");
         for i in 0..8 {
             st.tabs.push(Tab {
-                name: format!("extra-{i}"),
                 hub: TabHub::Running {
                     threads: 0,
                     running: 0,
@@ -1785,6 +1843,7 @@ pub(crate) mod tests {
                     }),
                     workers: None,
                 }),
+                ..Tab::new(format!("extra-{i}"))
             });
         }
         // Render the list directly so the same assertions exercise narrow and wide sidebars, including a viewport too short for the selected card and both arrows.
@@ -2318,8 +2377,25 @@ pub(crate) mod tests {
                 if matches!(ta, Target::NewWorkspace | Target::Settings) {
                     assert_eq!(a.height, 1, "{ta:?} {a:?} at {w}x{h}: {text}");
                 }
+                // A card's `⋯`, two rows too, is drawn over the end of its card's entry.
+                if let Target::WsMenu(id) = ta {
+                    assert!(a.height >= 2, "{ta:?} {a:?} at {w}x{h}: {text}");
+                    assert!(
+                        targets[..k]
+                            .iter()
+                            .any(|(b, tb)| *tb == Target::Workspace(id.clone())
+                                && b.contains(a.as_position())
+                                && b.intersection(*a) == *a),
+                        "{ta:?} {a:?} is not over its card at {w}x{h}: {text}"
+                    );
+                }
                 for (b, tb) in &targets[k + 1..] {
-                    assert!(ta == tb || !a.intersects(*b), "{ta:?} {tb:?} at {w}x{h}");
+                    let menu_on_card =
+                        matches!((ta, tb), (Target::Workspace(x), Target::WsMenu(y)) if x == y);
+                    assert!(
+                        ta == tb || menu_on_card || !a.intersects(*b),
+                        "{ta:?} {tb:?} at {w}x{h}"
+                    );
                 }
             }
             // Every workspace and the buttons, one after the other, each in view.
@@ -2481,7 +2557,7 @@ pub(crate) mod tests {
         for (bad, why) in [
             ("Bad_Name", "invalid workspace name"),
             ("client-x", "already exists"),
-            ("default", "always exists"),
+            ("default", "already exists"),
             ("-x", "invalid workspace name"),
         ] {
             st.handle_key(crate::app::tests::ctrl('u'));

@@ -26,6 +26,7 @@ const START: &str = "start and save these settings";
 fn twr_cmd() -> Command {
     let mut c = Command::new(TWR);
     c.env_remove("TWR_WORKSPACE");
+    c.env_remove("TWR_WORKSPACE_ID");
     c.env("TWR_TEST_USER_TOKEN_FILE", test_token());
     c.env("TWR_AGENT_PROBE", "off");
     c.env("TWR_BOX_PROBE", "off");

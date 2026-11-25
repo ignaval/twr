@@ -155,7 +155,10 @@ export interface InboxSource {
   updatedAt?: number;
   hubId: string;
   hubName: string;
+  /** The workspace's id, which its hub reports as `workspace` (a rename leaves it). */
   workspace: string;
+  /** Its name as shown, when known (`twr ws list`); its id otherwise. */
+  workspaceName?: string;
   attention: Attention[];
   threads: Thread[];
   cached?: boolean;
@@ -169,7 +172,10 @@ export interface FilePickRequest {
 }
 /** A running workspace hub whose engine differs from the app's (`shared/engineHubs`). */
 export interface EngineHub {
+  /** The workspace's id, which keys it (`twr ws list --json`'s `id`). */
   workspace: string;
+  /** Its name as shown, when it is not its id (a renamed workspace). */
+  name?: string;
   /** `"version"`: another twr version; `"build"`: the same version, another build. */
   difference: "version" | "build";
   version: string;
@@ -212,6 +218,8 @@ export interface DesktopAPI {
   copyText(text: string): Promise<void>;
   bootstrap(): Promise<{
     workspace: string;
+    /** `workspace` is a name a person gave (the desktop app's `TWR_WORKSPACE`), not an id. */
+    typed?: boolean;
     hostId?: string;
     scopes?: string[];
     allowed_methods?: string[];
@@ -221,7 +229,12 @@ export interface DesktopAPI {
     theme: Record<string, string> | null;
     terminals: TerminalSession[];
   }>;
-  connect(workspace: string): Promise<Json>;
+  /**
+   * Connects workspace `workspace`: a name or an id (`/ws`, a name typed), or with `byId` an id
+   * the app holds (from a listing, the bootstrap, a push, an inbox source), reached by that id
+   * alone: once it is gone, never another workspace renamed into it.
+   */
+  connect(workspace: string, options?: { byId?: boolean }): Promise<Json>;
   rpc(method: string, params?: Json): Promise<Json>;
   cli(
     args: string[],
@@ -264,7 +277,10 @@ export interface DesktopAPI {
 }
 /** One request waiting on the user, in a summary for the host app. */
 export interface AttentionSummaryItem {
+  /** Its workspace's id. */
   workspace: string;
+  /** Its workspace's name as shown, when it is not its id (a renamed workspace). */
+  workspaceName?: string;
   thread: string;
   /** The thread's name. */
   title: string;

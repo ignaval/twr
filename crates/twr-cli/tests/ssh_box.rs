@@ -245,6 +245,7 @@ cd '{box_home}' || exit 1
             .env("TWR_ENABLE_FAKE", "1")
             .env("TWR_TEST_USER_TOKEN_FILE", test_token())
             .env_remove("TWR_WORKSPACE")
+            .env_remove("TWR_WORKSPACE_ID")
             .env_remove("RUST_LOG")
             // Nothing of the user's agent overrides: the hub's own agent probe and what the
             // tests' commands run never pick another program for them.
@@ -719,6 +720,7 @@ impl Setup {
         .env_remove("TWR_AGENT")
         .env_remove("TWR_TEST_USER_TOKEN_FILE")
         .env_remove("TWR_WORKSPACE")
+        .env_remove("TWR_WORKSPACE_ID")
         .env_remove("RUST_LOG")
         // Nothing of the user's agent overrides: the hub's own agent probe and what the
         // tests' commands run never pick another program for them.
@@ -1342,6 +1344,7 @@ impl Setup {
             .env("TWR_HOME", &self.home)
             .env("TWR_TEST_USER_TOKEN_FILE", test_token())
             .env_remove("TWR_WORKSPACE")
+            .env_remove("TWR_WORKSPACE_ID")
             .env_remove("RUST_LOG")
             .stdin(Stdio::null())
             .output()
@@ -1979,6 +1982,7 @@ impl Setup {
             .env("TWR_TEST_USER_TOKEN_FILE", test_token())
             .env("HOME", &self.hub_home)
             .env_remove("TWR_WORKSPACE")
+            .env_remove("TWR_WORKSPACE_ID")
             .env_remove("RUST_LOG")
             .stdin(Stdio::piped())
             .stdout(std::fs::File::create(out).unwrap())
@@ -2487,6 +2491,7 @@ impl Setup {
             .env("TWR_TEST_USER_TOKEN_FILE", test_token())
             .env("HOME", &self.hub_home)
             .env_remove("TWR_WORKSPACE")
+            .env_remove("TWR_WORKSPACE_ID")
             .env_remove("RUST_LOG")
             .stdin(Stdio::null());
         for (k, v) in env {
@@ -2850,7 +2855,10 @@ fn box_project_guards_come_first() {
         .unwrap();
     assert!(!out.status.success());
     assert!(
-        said(&out).contains("boxes belong to the default workspace's hub"),
+        said(&out).contains(
+            "boxes belong to the hub of the workspace in twr's data directory (default), not \
+             workspace other's: run `twr -w default box project`"
+        ),
         "{}",
         said(&out)
     );

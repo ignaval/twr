@@ -46,7 +46,7 @@ pub async fn pair(paths: &Paths, name: String, code_stdin: bool, replace: bool) 
             code,
             replace,
             name,
-            workspace: paths.workspace_name().into(),
+            workspace: paths.workspace_id().into(),
         },
     )
     .await?;
@@ -62,7 +62,7 @@ pub async fn manage(paths: &Paths, name: String, admin: twr_link::service::Admin
         paths,
         &Request::Manage {
             name,
-            workspace: paths.workspace_name().into(),
+            workspace: paths.workspace_id().into(),
             admin,
         },
     )
@@ -82,7 +82,7 @@ pub async fn recover(paths: &Paths, name: String) -> Result<()> {
         paths,
         &Request::Recover {
             name: name.clone(),
-            workspace: paths.workspace_name().into(),
+            workspace: paths.workspace_id().into(),
         },
     )
     .await?;

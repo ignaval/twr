@@ -30,6 +30,7 @@ const TWR: &str = env!("CARGO_BIN_EXE_twr");
 fn twr_cmd() -> std::process::Command {
     let mut c = std::process::Command::new(TWR);
     c.env_remove("TWR_WORKSPACE");
+    c.env_remove("TWR_WORKSPACE_ID");
     c.env("TWR_TEST_USER_TOKEN_FILE", test_token());
     // No hub or runner of a test runs the user's login shell or real agent CLIs.
     c.env("TWR_AGENT_PROBE", "off");

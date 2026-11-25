@@ -25,12 +25,14 @@ pub struct Terminal {
     sequence: Arc<AtomicU64>,
 }
 impl Terminal {
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         binary: &Path,
         args: &[String],
         cwd: &Path,
         title: String,
         workspace: String,
+        held: Option<&str>,
         events: mpsc::Sender<Value>,
         permits: Vec<OwnedSemaphorePermit>,
     ) -> Result<Self> {
@@ -45,6 +47,12 @@ impl Terminal {
         command.cwd(cwd);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
+        // A `twr` run for the workspace id `held` reaches that one or none
+        // ([`twr_core::paths::WORKSPACE_ID_ENV`]).
+        match held {
+            Some(id) => command.env(twr_core::paths::WORKSPACE_ID_ENV, id),
+            None => command.env_remove(twr_core::paths::WORKSPACE_ID_ENV),
+        }
         let mut child = pair
             .slave
             .spawn_command(command)

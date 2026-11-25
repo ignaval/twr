@@ -125,6 +125,7 @@ impl Env {
     fn cmd(&self, home: &Path) -> Command {
         let mut c = Command::new(TWR);
         c.env_remove("TWR_WORKSPACE")
+            .env_remove("TWR_WORKSPACE_ID")
             .env_remove("RUST_LOG")
             .env_remove("VISUAL")
             .env_remove("TWR_CODEX_BIN")

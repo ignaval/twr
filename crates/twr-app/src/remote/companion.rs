@@ -47,9 +47,12 @@ impl Companion {
         events: mpsc::Sender<Value>,
     ) -> Result<Self> {
         let mut command = tokio::process::Command::new(&binary.program);
+        // `workspace` is the id the gateway resolved: served by id alone
+        // ([`twr_core::paths::WORKSPACE_ID_ENV`]).
         command
             .args(&binary.args)
             .arg(workspace)
+            .env(twr_core::paths::WORKSPACE_ID_ENV, workspace)
             .env("TWR_CLIENT_NAME", format!("mobile-{device}"));
         command
             .env_remove("TWR_DEVICE_TOKEN")

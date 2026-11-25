@@ -225,6 +225,7 @@ pub use idle_compact::{
 pub use jobs::{AgentJobBy, JobStart, ShellJob, SlotPool};
 pub(crate) use lifecycle::lock_data_dir;
 pub use lifecycle::lock_opened;
+pub use lifecycle::SHUTDOWN_LONGEST;
 pub use model::ModelRequest;
 pub use net::{own_net_probe, probe_targets, NetProbe, NetTiming, Probed};
 pub use project_read::{ReadParams, Tool as ReadTool};
@@ -316,9 +317,22 @@ pub struct HubOptions {
     pub config: Config,
     /// Instance label reported to clients (the CLI uses the `TWR_HOME` directory name).
     pub instance_name: String,
-    /// The named workspace this hub serves (`None`: `default`): reports name it in their
-    /// `twr -w <workspace> attach` command, and an attached CLI gets it as `TWR_WORKSPACE`.
+    /// The id of the named workspace this hub serves (`None`: the root slot, `default`):
+    /// reports name it in their `twr -w <workspace> attach` command, and an attached CLI gets
+    /// it as `TWR_WORKSPACE`. A rename leaves it ([`twr_core::workspaces`]).
     pub workspace: Option<String>,
+    /// The file that holds the workspace's name once it was renamed
+    /// ([`twr_core::workspaces::NAME_FILE`]): read each time the hub says its name, so a
+    /// rename shows without a restart. `None`: its name is its id.
+    pub workspace_name_file: Option<PathBuf>,
+    /// The file that says the root slot's workspace was removed
+    /// ([`twr_core::workspaces::REMOVED_FILE`]): a hub refuses to open there once it has its
+    /// lock, so one that started as `twr ws rm` removed it does not make it again.
+    pub removed_marker: Option<PathBuf>,
+    /// The data directory must exist already (a named workspace's, which only `twr ws new`
+    /// makes): the hub never makes it, so one that starts as `twr ws rm` removes it does not
+    /// make it again. `false`: made when missing (the root's, on first use).
+    pub data_dir_must_exist: bool,
     /// The data directory of the root the hub's workspace is in (the `default` workspace's):
     /// a local thread is never started in another workspace's worktrees
     /// (`<root>/worktrees`, `<root>/workspaces/<name>/worktrees`), which that workspace's hub
@@ -574,6 +588,9 @@ impl HubOptions {
             config,
             instance_name: "default".into(),
             workspace: None,
+            workspace_name_file: None,
+            removed_marker: None,
+            data_dir_must_exist: false,
             workspaces_root: None,
             worktree_namespace: None,
             broadcast_capacity: 1024,
@@ -883,6 +900,8 @@ struct Inner {
     instance_name: String,
     /// [`HubOptions::workspace`].
     workspace: Option<String>,
+    /// [`HubOptions::workspace_name_file`].
+    workspace_name_file: Option<PathBuf>,
     /// [`HubOptions::workspaces_root`].
     workspaces_root: Option<PathBuf>,
     stop_timeout: Duration,
@@ -1001,6 +1020,25 @@ struct Inner {
 }
 
 impl Inner {
+    /// [`Hub::workspace_name`].
+    fn workspace_name(&self) -> String {
+        let id = self
+            .workspace
+            .as_deref()
+            .unwrap_or(twr_core::paths::DEFAULT_WORKSPACE);
+        self.renamed().unwrap_or_else(|| id.to_string())
+    }
+
+    /// The name its workspace was renamed to, as it is now ([`HubOptions::workspace_name_file`]);
+    /// `None` while it has its id for a name.
+    fn renamed(&self) -> Option<String> {
+        self.workspace_name_file
+            .as_ref()
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .and_then(|t| t.lines().next().map(|l| l.trim().to_string()))
+            .filter(|n| twr_core::paths::workspace_name_error(n).is_none())
+    }
+
     fn core(&self) -> MutexGuard<'_, Core> {
         self.core.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -2993,12 +3031,116 @@ impl Hub {
         view
     }
 
-    /// The workspace this hub serves ([`HubOptions::workspace`]; `default` for none).
+    /// The id of the workspace this hub serves ([`HubOptions::workspace`]; `default` for
+    /// none).
     pub fn workspace(&self) -> &str {
         self.inner
             .workspace
             .as_deref()
             .unwrap_or(twr_core::paths::DEFAULT_WORKSPACE)
+    }
+
+    /// `hub.shutdown` with `if_idle` (the TUI's Delete of a workspace whose hub runs): starts
+    /// the shutdown only while nothing would be lost, checked and decided under the core
+    /// lock: no worker threads, an empty trash, an orchestrator that is not at work or waiting
+    /// on the user. From then on the hub refuses new work, as any shutting-down hub does, so
+    /// nothing can start between the check and the stop. `conflict` with why otherwise.
+    pub fn shutdown_if_idle(&self) -> Result<(), RpcError> {
+        use twr_core::proto::codes;
+        let trash = lifecycle::data_dir_of(&self.inner.db_path).join("trash");
+        let mut core = self.inner.core();
+        let views = core.registry.list();
+        let workers: Vec<&str> = views
+            .iter()
+            .filter(|v| !v.is_orchestrator())
+            .map(|v| v.name.as_str())
+            .collect();
+        if !workers.is_empty() {
+            return Err(RpcError::new(
+                codes::CONFLICT,
+                format!(
+                    "the workspace has threads now ({}): delete them first",
+                    workers.join(", ")
+                ),
+            ));
+        }
+        // A turn, or anything left running in the background: a runtime's task, a job, a `!`
+        // command the user runs (none of which its status says).
+        let busy = core.jobs_running()
+            || views
+                .iter()
+                .any(|v| !v.background_tasks.is_empty() || v.attached.is_some())
+            || views.iter().any(|v| {
+                v.is_orchestrator()
+                    && !v.retired
+                    && matches!(
+                        v.status(),
+                        twr_core::reduce::ThreadStatus::Running
+                            | twr_core::reduce::ThreadStatus::Background
+                            | twr_core::reduce::ThreadStatus::Waiting
+                            | twr_core::reduce::ThreadStatus::Attached
+                    )
+            });
+        if busy {
+            return Err(RpcError::new(
+                codes::CONFLICT,
+                "its orchestrator, a job or a `!` command is at work now: wait until it is \
+                 done, or stop it",
+            ));
+        }
+        // Every box's items (a remote one's live on the box), and the local directory's,
+        // which can't be read is not taken for empty.
+        let local = match std::fs::read_dir(&trash) {
+            Ok(d) => d.count(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => {
+                return Err(RpcError::new(
+                    codes::CONFLICT,
+                    format!("its trash can't be read ({e}): nothing was stopped"),
+                ))
+            }
+        };
+        if local > 0 || !core.trash.is_empty() {
+            return Err(RpcError::new(
+                codes::CONFLICT,
+                "its trash holds deleted threads: empty it first",
+            ));
+        }
+        // Threads being made (a spawn the orchestrator asked for, still under way).
+        let spawning: i64 = core
+            .store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM spawn_operations WHERE result IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| RpcError::new(codes::CONFLICT, format!("reading the spawns: {e}")))?;
+        if spawning > 0 || !core.reserved_names.is_empty() {
+            return Err(RpcError::new(
+                codes::CONFLICT,
+                "threads are being made in it now: wait until they are there",
+            ));
+        }
+        // Messages queued for it, which a next hub would send.
+        let queued = core
+            .store
+            .threads_with_pending()
+            .map_err(|e| RpcError::new(codes::CONFLICT, format!("reading the queue: {e:#}")))?;
+        if !queued.is_empty() {
+            return Err(RpcError::new(
+                codes::CONFLICT,
+                "messages are queued for its orchestrator: let them run, or take them back",
+            ));
+        }
+        core.shutting_down = true;
+        Ok(())
+    }
+
+    /// The name of the workspace this hub serves, as it is now
+    /// ([`HubOptions::workspace_name_file`]), else its id.
+    pub fn workspace_name(&self) -> String {
+        self.inner.workspace_name()
     }
 
     /// `hub.info` as a user sees it ([`Hub::info_for`]).
@@ -3021,6 +3163,12 @@ impl Hub {
         let suggest_unavailable = self.suggest_unavailable();
         // (Read once, on the first call: not under the core lock.)
         let build = twr_core::build_id();
+        // Its name as it is now (a file read): not under the core lock either.
+        let renamed = self.inner.renamed();
+        let instance = renamed
+            .clone()
+            .unwrap_or_else(|| self.inner.instance_name.clone());
+        let workspace_name = renamed.unwrap_or_else(|| self.workspace().to_string());
         let core = self.inner.core();
         json!({
             "boxes": boxes,
@@ -3039,8 +3187,9 @@ impl Hub {
             "listening": self.inner.listening.load(std::sync::atomic::Ordering::Relaxed),
             "pid": std::process::id(),
             "db": self.inner.db_path,
-            "instance": self.inner.instance_name,
+            "instance": instance,
             "workspace": self.workspace(),
+            "workspace_name": workspace_name,
             "started_at": self.inner.started_at,
             "threads": core.registry.len(),
             "control_head": core.gseq,

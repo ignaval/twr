@@ -19,6 +19,7 @@ fn command(home: &Path, args: &[&str]) -> Command {
     c.args(args)
         .env("TWR_HOME", home)
         .env_remove("TWR_WORKSPACE")
+        .env_remove("TWR_WORKSPACE_ID")
         .env_remove("TWR_RUNNER_TOKEN")
         .env_remove("RUST_LOG")
         .env("TWR_TEST_USER_TOKEN_FILE", test_token())

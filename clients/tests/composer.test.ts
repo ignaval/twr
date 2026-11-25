@@ -85,8 +85,18 @@ type HostOptions = {
   voiceStatus?: () => Promise<VoiceCaptureStatus>;
   voiceSetup?: () => Promise<VoiceCaptureStatus>;
   inboxSources?: InboxSource[];
-  /** What `connect` answers (`desktop.paths` and how the hub's engine compares). */
-  connect?: Json;
+  /**
+   * How `connect` answers (default: it connects): a function of the workspace asked for, or
+   * what it answers (`desktop.paths` and how the hub's engine compares).
+   */
+  connect?:
+    Json | ((workspace: string, options?: { byId?: boolean }) => Promise<Json>);
+  /** What `twr ws list --json` lists (default: the views' workspaces). */
+  listing?: Json[];
+  /** What the bootstrap says of the workspace (default: `default`, an id). */
+  boot?: { workspace: string; typed?: boolean };
+  /** No live view arrives at start (the first connection failed). */
+  noLive?: boolean;
   /** The running workspaces' hubs on another engine (`engineHubs`). */
   engineHubs?: EngineHub[];
   /** The CLI's commands (`catalog`). */
@@ -149,6 +159,7 @@ function fakeHost(options: HostOptions = {}) {
     secureDelete: async (key: string) => void secure.delete(key),
     bootstrap: async () => ({
       workspace: "default",
+      ...options.boot,
       hostId: "composer-test",
       platform: "linux",
       home: "/home/test",
@@ -156,7 +167,12 @@ function fakeHost(options: HostOptions = {}) {
       theme: null,
       terminals: [],
     }),
-    connect: async () => options.connect || {},
+    connect:
+      typeof options.connect === "function"
+        ? options.connect
+        : async () => options.connect || {},
+    /** The CLI commands run, joined. */
+    cliCalls: [] as string[],
     engineHubs: options.engineHubs
       ? async () => options.engineHubs || []
       : undefined,
@@ -184,10 +200,16 @@ function fakeHost(options: HostOptions = {}) {
       }
       return {};
     },
-    cli: async (args: string[]) =>
-      args.join(" ") === "ws list --json"
-        ? { stdout: JSON.stringify(Object.keys(views)), stderr: "", code: 0 }
-        : { stdout: "", stderr: "", code: 0 },
+    cli: async (args: string[]) => {
+      host.cliCalls.push(args.join(" "));
+      return args.join(" ") === "ws list --json"
+        ? {
+            stdout: JSON.stringify(options.listing || Object.keys(views)),
+            stderr: "",
+            code: 0,
+          }
+        : { stdout: "", stderr: "", code: 0 };
+    },
     catalog: async () => options.catalog || [],
     configRead: async () => ({
       content: "",
@@ -279,7 +301,7 @@ async function mount(
   };
   await act(async () => root.render(createElement(App)));
   await settle();
-  await live("default");
+  if (!options.noLive) await live("default");
   const all = (selector: string) => document.querySelectorAll(selector);
   const find = (selector: string, text?: string) => {
     const node = all(selector).find(
@@ -345,6 +367,70 @@ async function mount(
 
 let mounted: Mounted;
 const app = () => mounted;
+
+describe("a workspace that cannot be opened at start", () => {
+  it("still lists the workspaces, so another can be picked", async () => {
+    const app = await mount({
+      connect: async () => {
+        throw new Error(
+          "Workspace does not exist; create it before connecting",
+        );
+      },
+      listing: [{ id: "a", name: "acme", default: false, hub: "stopped" }],
+    });
+    expect(app.host.cliCalls).toContain("ws list --json");
+    expect(app.find("[data-workspace=a]").textContent).toContain("acme");
+    await app.unmount();
+    // (The file's first mount loads the whole app: more than the default 5 s under load.)
+  }, 30_000);
+});
+
+describe("a workspace the app holds the id of", () => {
+  it("is connected by that id alone: the bootstrap's, and a listed one's", async () => {
+    const calls: [string, { byId?: boolean } | undefined][] = [];
+    const app = await mount({
+      connect: async (workspace: string, options?: { byId?: boolean }) => {
+        calls.push([workspace, options]);
+        return { workspace };
+      },
+      listing: [
+        { id: "default", name: "default", default: true, hub: "running" },
+        { id: "b", name: "acme", default: false, hub: "stopped" },
+      ],
+    });
+    await app.click(app.find("[data-workspace=b] .workspace-orchestrator"));
+    expect(calls).toEqual([
+      ["default", { byId: true }],
+      ["b", { byId: true }],
+    ]);
+    await app.unmount();
+  }, 30_000);
+});
+
+describe("a workspace given by name", () => {
+  it("is asked for by name again on Reconnect, once its first connection failed", async () => {
+    const calls: [string, { byId?: boolean } | undefined][] = [];
+    const app = await mount({
+      // The desktop app started with `TWR_WORKSPACE=acme`, `client-x`'s new name.
+      boot: { workspace: "acme", typed: true },
+      noLive: true,
+      connect: async (workspace: string, options?: { byId?: boolean }) => {
+        calls.push([workspace, options]);
+        if (calls.length === 1) throw new Error("config.toml: invalid TOML");
+        return { workspace };
+      },
+      listing: [
+        { id: "client-x", name: "acme", default: true, hub: "stopped" },
+      ],
+    });
+    await app.click(app.find("button", "Reconnect"));
+    expect(calls).toEqual([
+      ["acme", { byId: false }],
+      ["client-x", { byId: false }],
+    ]);
+    await app.unmount();
+  }, 30_000);
+});
 
 describe("the latest user message above conversation history", () => {
   afterEach(async () => {

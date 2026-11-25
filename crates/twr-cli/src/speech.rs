@@ -76,13 +76,24 @@ pub fn workspace_sockets(
 ) -> anyhow::Result<Vec<(String, PathBuf)>> {
     let root = paths.root();
     let mut wanted: Vec<String> = if all {
-        let mut v = vec![DEFAULT_WORKSPACE.to_string()];
-        v.extend(root.named_workspaces().context("listing the workspaces")?);
-        v
+        root.workspace_ids().context("listing the workspaces")?
     } else if names.is_empty() {
-        vec![paths.workspace_name().to_string()]
+        vec![paths.workspace_id().to_string()]
     } else {
-        names.to_vec()
+        // Each by its id, whichever name it was given by, and once (`a acme` where `acme` is
+        // `a`'s new name are one workspace), in the order given.
+        let mut ids: Vec<String> = Vec::new();
+        for name in names {
+            let ws = root.find_workspace(name)?;
+            if !ws.exists() {
+                anyhow::bail!("there is no workspace {name} (`twr ws` lists them)");
+            }
+            let id = ws.workspace_id().to_string();
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
     };
     wanted.dedup();
     let config = Config::load_from(&root).unwrap_or_default();
@@ -670,17 +681,15 @@ fn speak_link(args: &Speak, paths: &Paths) -> anyhow::Result<LinkSpec> {
         // own speaker: live reading is per workspace anyway, and a speaker kept to one would
         // keep this device's other speakers from the rest (one speaks for a machine's hubs).
         None => match &args.workspace {
-            Some(ws) => {
-                let one = paths.root().workspace(ws)?;
-                if !one.exists() {
-                    anyhow::bail!(
-                        "there is no workspace {ws}: create it with `twr ws new {ws}` (`twr ws` \
-                         lists them)"
-                    );
+            // The workspace `run` resolved `-w` to (by id alone when another process of twr
+            // held it), by its id, which a rename leaves as it is.
+            Some(_) => {
+                if !paths.exists() {
+                    anyhow::bail!("{}", crate::missing_workspace_why(paths, ""));
                 }
                 LinkSpec::Local {
                     paths: paths.root(),
-                    workspaces: Workspaces::One(ws.clone()),
+                    workspaces: Workspaces::One(paths.workspace_id().to_string()),
                 }
             }
             None => LinkSpec::Local {
@@ -1272,6 +1281,24 @@ pub async fn remote(args: Remote, paths: &Paths) -> anyhow::Result<std::process:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `twr speech feed a b acme`, where `acme` is `a`'s new name, feeds `a` once, in the
+    /// order given.
+    #[test]
+    fn a_workspace_named_twice_is_fed_once() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        twr_core::workspaces::create(&root, "a").unwrap();
+        twr_core::workspaces::create(&root, "b").unwrap();
+        twr_core::workspaces::rename(&root, "a", "acme").unwrap();
+        let names: Vec<String> = ["a", "b", "acme"].map(String::from).to_vec();
+        let fed: Vec<String> = workspace_sockets(&root, &names, false)
+            .unwrap()
+            .into_iter()
+            .map(|(w, _)| w)
+            .collect();
+        assert_eq!(fed, ["a", "b"]);
+    }
 
     fn words(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
