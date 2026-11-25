@@ -142,15 +142,30 @@ describe("a renamed workspace", () => {
   });
 
   it("leaves a desktop whose workspace could not be opened able to list and make others", () => {
-    expect(runsWithoutWorkspace(["ws", "list", "--json"])).toBe(true);
-    expect(runsWithoutWorkspace(["ws", "list", "--json", "--detail"])).toBe(
-      true,
-    );
-    expect(runsWithoutWorkspace(["ws"])).toBe(true);
-    expect(runsWithoutWorkspace(["ws", "new", "b"])).toBe(true);
-    // Not what changes or removes one, nor anything else.
-    expect(runsWithoutWorkspace(["ws", "rm", "b"])).toBe(false);
-    expect(runsWithoutWorkspace(["ws", "rename", "a", "b"])).toBe(false);
-    expect(runsWithoutWorkspace(["thread", "list"])).toBe(false);
+    for (const everConnected of [false, true]) {
+      expect(
+        runsWithoutWorkspace(["ws", "list", "--json"], everConnected),
+      ).toBe(true);
+      expect(
+        runsWithoutWorkspace(
+          ["ws", "list", "--json", "--detail"],
+          everConnected,
+        ),
+      ).toBe(true);
+      expect(runsWithoutWorkspace(["ws"], everConnected)).toBe(true);
+      // Not what changes or removes one, nor anything else.
+      expect(runsWithoutWorkspace(["ws", "rm", "b"], everConnected)).toBe(
+        false,
+      );
+      expect(
+        runsWithoutWorkspace(["ws", "rename", "a", "b"], everConnected),
+      ).toBe(false);
+      expect(runsWithoutWorkspace(["thread", "list"], everConnected)).toBe(
+        false,
+      );
+    }
+    // Making one: while none was ever connected (stuck at start), not after a failed switch.
+    expect(runsWithoutWorkspace(["ws", "new", "b"], false)).toBe(true);
+    expect(runsWithoutWorkspace(["ws", "new", "b"], true)).toBe(false);
   });
 });

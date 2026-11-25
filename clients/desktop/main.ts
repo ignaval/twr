@@ -115,6 +115,8 @@ let startSettled = !!process.env.TWR_WORKSPACE;
 // `workspace` is `TWR_WORKSPACE` as a person gave it (a name, maybe), until a connection says
 // the id it serves.
 let workspaceTyped = !!process.env.TWR_WORKSPACE;
+// A workspace was connected in this session ({@link runsWithoutWorkspace}).
+let workspaceEverConnected = false;
 let binaries: { twr: string; bridge: string; gateway: string };
 let quitting = false;
 let quitRequested = false;
@@ -381,7 +383,7 @@ async function loadLoginEnvironment() {
 }
 async function cli(args: unknown) {
   const words = nonInteractiveArgs(args);
-  if (!workspaceReady && !runsWithoutWorkspace(words))
+  if (!workspaceReady && !runsWithoutWorkspace(words, workspaceEverConnected))
     throw new Error(
       "Connect to the selected workspace before running CLI commands",
     );
@@ -464,6 +466,7 @@ async function connectWorkspace(
         : next;
     workspaceTyped = false;
     workspaceReady = true;
+    workspaceEverConnected = true;
     emit({ type: "connection", connected: true });
     void current
       .call("notify.looking", { looking: window?.isFocused() || false })
