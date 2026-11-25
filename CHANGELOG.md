@@ -4,9 +4,11 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ## [Unreleased]
 
-Pair a phone with a hub on any computer, a server over SSH included, with no certificate or domain: `twr phone` shows a QR code, and the phone pins the hub's own key.
+## [0.7.0] - 2026-11-25
 
-Upgrading: a gateway started without `--tls-cert` no longer refuses to start; it serves its own key and listens on all addresses (`0.0.0.0:47321` and `[::]:47321`). Pairing codes have 12 characters, so a code from an older gateway doesn't pair with a new one (codes last five minutes anyway). A desktop app older than this release can't pair phones through a hub installed with this release's command line, whose codes have 12 characters: update both. A hub still running from an older twr makes 10-character codes and can't prove typed codes; `twr phone`, the TUI's `/phone` and the gateway say so, and to restart it (`twr hub stop`, then run twr again). Gateways with a certificate keep `/health` protocol 1, so released desktop apps keep working with them; pairing by key needs this release's apps.
+Pair a phone with a hub on any computer, a server over SSH included, with no certificate or domain: `twr phone` shows a QR code, and the phone pins the hub's own key. Rename or delete any workspace, `default` included, and choose which one is the default, from the command line or the TUI's new workspace menu. The hub tells you when its machine loses its internet connection instead of calling its threads stalled. `twr relay serve` runs a twr relay, which hubs and phones will use in a later release. Also text-size shortcuts and a working cursor in the desktop and phone apps, workers' updates drawn in their own boxes, and shorter delete cards.
+
+Upgrading: the runner and client protocols (8 and 2), the database schema (9) and the checkpoint format are those of 0.6.0, so 0.6.0 boxes and clients keep working with a 0.7.0 hub, and the 0.6.0 desktop app updates itself. A gateway started without `--tls-cert` no longer refuses to start; it serves its own key and listens on all addresses (`0.0.0.0:47321` and `[::]:47321`). Pairing codes have 12 characters, so a code from an older gateway doesn't pair with a new one (codes last five minutes anyway). A desktop app older than this release can't pair phones through a hub installed with this release's command line, whose codes have 12 characters: update both. A hub still running from an older twr makes 10-character codes and can't prove typed codes; `twr phone`, the TUI's `/phone` and the gateway say so, and to restart it (`twr hub stop`, then run twr again). Gateways with a certificate keep `/health` protocol 1, so released desktop apps keep working with them; pairing by key needs this release's apps.
 
 ### Added
 
@@ -36,9 +38,6 @@ Upgrading: a gateway started without `--tls-cert` no longer refuses to start; it
 ### Fixed
 
 - In the desktop and phone apps' conversation, the working cursor on its own line and the shortcut to your preceding message start at the conversation's text column instead of the pane's left edge, and the shortcut row is as wide as that column. A line scrolled up under the shortcut row fades out instead of looking cut through by it ([desktop.md](docs/desktop.md)).
-
-### Fixed
-
 - The desktop app now notices a hub running another build of its own version, such as one left running from before a distribution package rebuilt from a later commit was installed: it compared versions only, so the notice with **Stop hub…** never showed. It compares `hub.info`'s `build` with the build id of the engine it bundles, says "a different build of twr 0.6.0 (463a2ed0) than this hub runs (85ab7b43)" when the versions are equal, and also names the other running workspaces whose hubs differ, with **Stop all hubs…** (`twr hub stop --all`). `twr ws list --json` now gives each running hub's `version` and `build`, which is where the app reads them ([desktop.md](docs/desktop.md)).
 - In a short, narrow desktop window, a notice that wrapped (such as that one) no longer leaves a waiting request in the conversation 3 pixels tall, with its answers under the conversation: while a request waits, the notices keep to two lines and scroll.
 
